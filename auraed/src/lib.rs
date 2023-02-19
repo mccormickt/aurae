@@ -61,6 +61,26 @@
 )]
 #![warn(clippy::unwrap_used)]
 
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
+use anyhow::Context;
+use once_cell::sync::OnceCell;
+use tokio::io::AsyncRead;
+use tokio::io::AsyncWrite;
+use tonic::transport::server::Connected;
+use tonic::transport::{Certificate, Identity, Server, ServerTlsConfig};
+use tracing::{error, info, trace, warn};
+
+use proto::vms::vm_service_server::VmServiceServer;
+use proto::{
+    cells::cell_service_server::CellServiceServer,
+    cri::runtime_service_server::RuntimeServiceServer,
+    discovery::discovery_service_server::DiscoveryServiceServer,
+    observe::observe_service_server::ObserveServiceServer,
+};
+
+use crate::vms::vm_service::VmService;
 use crate::{
     cells::CellService,
     cri::oci::AuraeOCIBuilder,
@@ -75,21 +95,6 @@ use crate::{
     observe::ObserveService,
     spawn::spawn_auraed_oci_to,
 };
-use anyhow::Context;
-use once_cell::sync::OnceCell;
-use proto::{
-    cells::cell_service_server::CellServiceServer,
-    cri::runtime_service_server::RuntimeServiceServer,
-    discovery::discovery_service_server::DiscoveryServiceServer,
-    observe::observe_service_server::ObserveServiceServer,
-};
-use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use tokio::io::AsyncRead;
-use tokio::io::AsyncWrite;
-use tonic::transport::server::Connected;
-use tonic::transport::{Certificate, Identity, Server, ServerTlsConfig};
-use tracing::{error, info, trace, warn};
 
 mod cells;
 mod cri;
@@ -277,9 +282,9 @@ pub async fn run(
             .set_serving::<RuntimeServiceServer<RuntimeService>>()
             .await;
 
-        // let vm_service = VmService::new();
-        // let vm_service_server = VmServiceServer::new(vm_service.clone());
-        // health_reporter.set_serving::<VmServiceServer<VmService>>().await;
+        let vm_service = VmService::new();
+        let vm_service_server = VmServiceServer::new(vm_service.clone());
+        health_reporter.set_serving::<VmServiceServer<VmService>>().await;
 
         let graceful_shutdown = graceful_shutdown::GracefulShutdown::new(
             health_reporter,
@@ -298,7 +303,7 @@ pub async fn run(
                 .add_service(observe_service_server)
                 // .add_service(pod_service_server)
                 .add_service(runtime_service_server)
-                // .add_service(vm_service_server)
+                .add_service(vm_service_server)
                 .serve_with_incoming_shutdown(socket_stream, async {
                     let mut graceful_shutdown_signal = graceful_shutdown_signal;
                     let _ = graceful_shutdown_signal.changed().await;

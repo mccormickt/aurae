@@ -36,27 +36,42 @@ use vmm::resources::VmResources;
 use vmm::seccomp_filters::SeccompConfig;
 use vmm::vmm_config::instance_info::{InstanceInfo, VmState};
 
-#[derive(Debug, Default)]
-pub struct VirtualMachine {
-    id: String,
-    name: String,
-    spec: VirtualMachineSpec,
-    state: VmState,
-}
+use crate::vms::error::VmServiceError;
 
-#[derive(Debug, Default)]
-pub struct VirtualMachineSpec {
-    instance_info: InstanceInfo,
-    vm_resources: VmResources,
+pub type Result<T> = std::result::Result<T, VmServiceError>;
+
+#[derive(Default)]
+pub struct VirtualMachine {
+    pub id: String,
+    pub name: String,
+    pub spec: VirtualMachineSpec,
+    pub state: VmState,
     vmm: Option<Arc<Mutex<Vmm>>>,
 }
 
+#[derive(Default)]
+pub struct VirtualMachineSpec {
+    pub kernel_image_path: String,
+    pub kernel_args: Vec<String>,
+    pub rootfs_path: String,
+    pub mac_address: String,
+    pub host_dev_name: String,
+    pub vcpus: u32,
+    pub memory_mb: u32,
+}
+
 impl VirtualMachine {
-    pub fn new(name: String, kernel_image_path: String, rootfs_path: String, vcpus: u32, memory_mb: u32) -> Self {
+    pub fn new(name: String, spec: VirtualMachineSpec) -> Self {
         let id = uuid::Uuid::new_v4().to_string();
+        Self { id, name, state: VmState::NotStarted, spec, vmm: None }
+    }
+    pub fn allocate(&mut self) -> Result<()> {
+        let VmState::NotStarted = &self.state else {
+            return Err(VmServiceError::VmExists { vm_id: self.id.clone() });
+        };
         let instance_info = InstanceInfo {
-            id: id.clone(),
-            app_name: name.clone(),
+            id: self.id.clone(),
+            app_name: self.name.clone(),
             state: VmState::NotStarted,
             vmm_version: "".to_string(),
         };
@@ -65,7 +80,7 @@ impl VirtualMachine {
             r#"{{
                 "boot-source": {{
                     "kernel_image_path": "{}",
-                    "boot_args": "console=ttyS0 reboot=k panic=1 pci=off"
+                    "boot_args": "{}"
                 }},
                 "drives": [
                     {{
@@ -83,48 +98,81 @@ impl VirtualMachine {
                 "network-interfaces": [
                     {{
                         "iface_id": "eth0",
-                        "host_dev_name": "aurae0"
+                        "guest_mac": "{}",
+                        "host_dev_name": "{}"
                     }}
                 ],
+                "vsock": {{
+                    "guest_cid": 3,
+                    "uds_path": "/run/aurae/aurae.vsock",
+                    "vsock_id": "vsock0"
+                }},
                 "mmds-config": {{
                     "version": "V2",
                     "ipv4_address": "169.254.42.2",
                     "network_interfaces": ["eth0"]
                 }}
             }}"#,
-            kernel_image_path,
-            rootfs_path,
-            vcpus,
-            memory_mb,
+            self.spec.kernel_image_path,
+            self.spec.kernel_args.join(" "),
+            self.spec.rootfs_path,
+            self.spec.vcpus,
+            self.spec.memory_mb,
+            self.spec.mac_address,
+            self.spec.host_dev_name,
         );
-
         let vm_resources =
             VmResources::from_json(config.as_str(), &instance_info, 4096, None)
                 .expect("creating vm resources");
 
-        Self { id, name, spec: VirtualMachineSpec { instance_info, vm_resources, vmm: None }, state: VmState::NotStarted }
-    }
-    pub fn allocate(&mut self, event_manager: &mut EventManager) -> Result<(), FcExitCode> {
-        let VmState::NotStarted = &self.state else {
-            return Err(FcExitCode::Ok);
-        };
-
         // Initialize the VM
-        let (res, vm) =
-            build_microvm(
-                event_manager,
-                &self.spec.instance_info,
-                &self.spec.vm_resources,
-            ).expect("building microvm");
-        self.spec.vmm = vm;
+        let mut event_manager =
+            EventManager::new().expect("Unable to create EventManager");
+        let vmm =
+            build_microvm(&mut event_manager, &instance_info, &vm_resources)
+                .expect("building microvm");
+        self.vmm = Some(vmm);
 
-        info!("Started vm {} with id {} ", self.name, self.id);
-        debug!(
-            "cpu: {} memory: {}",
-            res.vm_config().vcpu_count,
-            res.vm_config().mem_size_mib
-        );
+        info!("Started vm {} with id {} ", self.name, self.id.clone());
+        debug!("cpu: {} memory: {}", self.spec.vcpus, self.spec.memory_mb);
 
+        Ok(())
+    }
+
+    pub fn free(&mut self) -> Result<()> {
+        // TODO: Do we need to free resources? Are there methods for this?
+        let vmm = self.vmm.as_ref().expect("retrieve vmm ref to free");
+        let vm = vmm.lock().expect("retireve lock for vmm");
+        self.stop()
+    }
+
+    pub fn start(&mut self) -> Result<()> {
+        if self.state == VmState::Running {
+            return Ok(());
+        }
+        let vmm = self.vmm.as_ref().expect("retrieve vmm ref to start");
+        let mut vm = vmm.lock().expect("retrieve lock for vmm");
+        self.state = VmState::Running;
+        match vm.resume_vm() {
+            Ok(_) => {
+                Ok(())
+            }
+            Err(_) => {
+                Err(VmServiceError::VmNotFound { vm_id: self.id.clone() })
+            }
+        }
+    }
+
+    pub fn stop(&mut self) -> Result<()> {
+        if self.state != VmState::Running {
+            return Err(VmServiceError::KillError {
+                vm_id: self.id.clone(),
+                error: "vm is not running".to_string(),
+            });
+        }
+        let vmm = self.vmm.as_ref().expect("retrieve vmm ref to stop");
+        vmm.lock().expect("retrieve lock for vmm").stop(FcExitCode::Ok);
+        self.state = VmState::NotStarted;
         Ok(())
     }
 }
@@ -133,8 +181,8 @@ fn build_microvm(
     event_manager: &mut EventManager,
     instance_info: &InstanceInfo,
     vm_resources: &VmResources,
-) -> Result<Arc<Mutex<Vmm>>, FcExitCode> {
-    let seccomp_filters = seccomp_filters::get_filters(SeccompConfig::Advanced)
+) -> std::result::Result<Arc<Mutex<Vmm>>, FcExitCode> {
+    let seccomp_filters = seccomp_filters::get_filters(SeccompConfig::None)
         .expect("setting seccomp filters for VM");
 
     // Build microvm from configuration
@@ -143,14 +191,18 @@ fn build_microvm(
         vm_resources,
         event_manager,
         &seccomp_filters,
-    ).map_err(|err| {
-        error!("Building VMM failed: {:?}", err);
-        FcExitCode::BadConfiguration
-    })?;
+    )
+        .map_err(|err| {
+            error!("Building VMM failed: {:?}", err);
+            FcExitCode::BadConfiguration
+        })?;
 
     // Pause VM after creation
     // TODO: Allow for us to create a VM without starting it as firecracker doesn't seem to
-    vmm.lock().unwrap().pause_vm().expect("pausing allocated vm");
+    vmm.lock()
+        .expect("retrieve vmm lock")
+        .pause_vm()
+        .expect("pausing allocated vm");
     info!("Successfully built microvm");
 
     Ok(vmm)
@@ -158,20 +210,22 @@ fn build_microvm(
 
 #[cfg(test)]
 mod test {
-    use vmm::EventManager;
-
-    use crate::vms::vm::VirtualMachine;
+    use crate::vms::vm::{VirtualMachine, VirtualMachineSpec};
 
     #[test]
     fn test_vm_allocate() {
         let mut vm = VirtualMachine::new(
             "aurae-vm-test".to_string(),
-            "/home/jan0ski/aurae-runtime/aurae/auraed/hack/hello-vmlinux.bin".to_string(),
-            "/home/jan0ski/aurae-runtime/aurae/auraed/hack/hello-rootfs.ext4".to_string(),
-            1,
-            2048,
+            VirtualMachineSpec {
+                kernel_image_path: "/home/jan0ski/aurae-runtime/aurae/auraed/hack/hello-vmlinux.bin".to_string(),
+                kernel_args: vec!["console=ttyS0".to_string(), "reboot=k".to_string(), "panic=1".to_string(), "pci=off".to_string()],
+                rootfs_path: "/home/jan0ski/aurae-runtime/aurae/auraed/hack/hello-rootfs.ext4".to_string(),
+                mac_address: "deadbeef::1234".to_string(),
+                host_dev_name: "aurae0".to_string(),
+                vcpus: 1,
+                memory_mb: 2048,
+            },
         );
-        let mut event_manager = EventManager::new().expect("Unable to create EventManager");
-        assert!(vm.allocate(&mut event_manager).is_ok())
+        assert!(vm.allocate().is_ok())
     }
 }

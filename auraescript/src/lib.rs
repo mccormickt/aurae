@@ -39,17 +39,20 @@
     while_true
 )]
 #![warn(missing_debug_implementations,
-    // TODO: missing_docs,
-    trivial_casts,
-    trivial_numeric_casts,
-    unused_extern_crates,
-    unused_import_braces,
-    unused_qualifications,
-    unused_results
+// TODO: missing_docs,
+trivial_casts,
+trivial_numeric_casts,
+unused_extern_crates,
+unused_import_braces,
+unused_qualifications,
+unused_results
 )]
 #![warn(clippy::unwrap_used)]
 // TODO: need to figure out how to get tonic to allow this without allowing for whole crate
 #![allow(unused_qualifications)]
+
+use std::pin::Pin;
+use std::rc::Rc;
 
 use anyhow::{anyhow, bail, Error};
 use deno_ast::{MediaType, ParseParams, SourceTextInfo};
@@ -58,8 +61,6 @@ use deno_core::{
     resolve_import, Extension, JsRuntime, ModuleLoader, ModuleSource,
     ModuleSourceFuture, ModuleSpecifier, ModuleType, OpDecl, RuntimeOptions,
 };
-use std::pin::Pin;
-use std::rc::Rc;
 
 mod builtin;
 mod cells;
@@ -67,6 +68,7 @@ mod cri;
 mod discovery;
 mod health;
 mod observe;
+mod vms;
 
 pub fn init() -> JsRuntime {
     let extension = Extension::builder().ops(stdlib()).build();
@@ -95,6 +97,7 @@ fn stdlib() -> Vec<OpDecl> {
     ops.extend(discovery::op_decls());
     ops.extend(health::op_decls());
     ops.extend(observe::op_decls());
+    ops.extend(vms::op_decls());
     ops
 }
 

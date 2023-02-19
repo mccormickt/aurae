@@ -56,20 +56,23 @@ message VmServiceAllocateResponse{
   string vm_id = 1;
 }
 
-message VmServiceFreeRequest{}
-message VmServiceFreeResponse{
+message VmServiceFreeRequest{
   string vm_id = 1;
 }
+
+message VmServiceFreeResponse{}
 
 message VmServiceStartRequest{
   string vm_id = 1;
   string executable = 2;
 }
+
 message VmServiceStartResponse{}
 
 message VmServiceStopRequest{
   string vm_id = 1;
 }
+
 message VmServiceStopResponse{}
 
 

@@ -1,3 +1,4 @@
+#!/usr/bin/env auraescript
 /* -------------------------------------------------------------------------- *\
  *        Apache 2.0 License Copyright © 2022-2023 The Aurae Authors          *
  *                                                                            *
@@ -27,57 +28,50 @@
  *   limitations under the License.                                           *
  *                                                                            *
 \* -------------------------------------------------------------------------- */
+import * as helpers from "../auraescript/gen/helpers.ts";
+import * as runtime from "../auraescript/gen/vms.ts";
 
-// Lint groups: https://doc.rust-lang.org/rustc/lints/groups.html
-#![warn(future_incompatible, nonstandard_style, unused)]
-#![warn(
-    improper_ctypes,
-    non_shorthand_field_patterns,
-    no_mangle_generic_items,
-    unconditional_recursion,
-    unused_comparisons,
-    while_true
-)]
-#![warn(missing_debug_implementations,
-// TODO: missing_docs,
-trivial_casts,
-trivial_numeric_casts,
-unused_extern_crates,
-unused_import_braces,
-unused_qualifications,
-unused_results
-)]
-#![warn(clippy::unwrap_used)]
+let vms = new runtime.VmServiceClient();
+const vmID = "ae-vm";
 
-use deno_core::resolve_path;
+// [ Allocate ]
+let allocated = await vms.allocate(<runtime.VmServiceAllocateRequest>{
+    machine: runtime.VirtualMachine.fromPartial({
+        id: vmID,
+        memSizeMb: 2048,
+        vcpuCount: 1,
+        kernelArgs: ["console=ttyS0", "reboot=k", "panic=1", "pci=off"],
+        kernelImgPath: "/home/jan0ski/aurae-runtime/aurae/auraed/hack/hello-vmlinux.bin",
+        rootDrive: runtime.RootDrive.fromPartial({
+            hostPath: "/home/jan0ski/aurae-runtime/aurae/auraed/hack/hello-rootfs.ext4",
+            isWriteable: false,
+        }),
+        driveMounts: [
+            runtime.DriveMount.fromPartial({
+                hostPath: "/tmp/",
+                vmPath: "/mnt/storage",
+                fsType: "ext4",
+                isWriteable: false,
+            }),
+        ],
+        networkInterfaces: [
+            runtime.NetworkInterface.fromPartial({
+                macAddress: "06:00:c0:a8:00:02",
+                hostDevName: "aurae0",
+            }),
+        ],
+    })
+})
+helpers.print(allocated)
 
-use auraescript::*;
+// [ Start ]
+let started = await vms.start(<runtime.VmServiceStartRequest>{
+    vmId: vmID,
+})
+helpers.print(started)
 
-fn main() -> anyhow::Result<()> {
-    let args: Vec<String> = std::env::args().collect();
-
-    // only supports a single script for now
-    if args.len() != 2 {
-        println!("Usage: auraescript <path_to_module>");
-        std::process::exit(1);
-    }
-
-    let mut js_runtime = init();
-
-    let _ = js_runtime.execute_script("", "Deno.core.initializeAsyncOps();")?;
-
-    let main_module = resolve_path(&args[1].clone())?;
-
-    let future = async move {
-        let mod_id = js_runtime.load_main_module(&main_module, None).await?;
-        let result = js_runtime.mod_evaluate(mod_id);
-        js_runtime.run_event_loop(false).await?;
-        result.await?
-    };
-
-    tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .expect("failed to initialize tokio runtime")
-        .block_on(future)
-}
+// [ Stop ]
+//let stopped = await vms.stop(<runtime.VmServiceStopRequest>{
+//    vmId: vmID,
+//})
+//helpers.print(stopped)
