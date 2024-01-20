@@ -69,7 +69,7 @@ use deno_ast::{MediaType, ParseParams, SourceTextInfo};
 use deno_runtime::{
     deno_core::{
         self, error::AnyError, futures::FutureExt, resolve_import, url::Url,
-        FastString, ModuleLoader, ModuleSource, ModuleSourceCode,
+        Extension, FastString, ModuleLoader, ModuleSource, ModuleSourceCode,
         ModuleSourceFuture, ModuleSpecifier, ModuleType, ResolutionKind,
         Snapshot,
     },
@@ -110,7 +110,7 @@ pub fn init(main_module: Url) -> MainWorker {
                 args: vec![],
                 cpu_count: 1,
                 locale: deno_core::v8::icu::get_language_tag(),
-                log_level: WorkerLogLevel::Debug,
+                log_level: WorkerLogLevel::Info,
                 no_color: false,
                 is_tty: false,
                 unstable: true,
