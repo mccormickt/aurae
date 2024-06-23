@@ -32,7 +32,7 @@
 
 #![allow(clippy::derive_partial_eq_without_eq)]
 #![allow(clippy::empty_docs)]
-#![allow(clippy::match_single_binding)]
+#![allow(clippy::single_binding)]
 
 pub mod cells {
     include!("../gen/aurae.cells.v0.rs");

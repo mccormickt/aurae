@@ -65,13 +65,13 @@
 #![allow(unused_qualifications)]
 
 use anyhow::{anyhow, bail, Error};
-use deno_ast::{MediaType, ParseParams, SourceTextInfo};
+use deno_ast::{EmitOptions, MediaType, ParseParams, SourceTextInfo};
 use deno_runtime::{
     deno_core::{
-        self, error::AnyError, futures::FutureExt, resolve_import, url::Url,
-        FastString, ModuleLoader, ModuleSource, ModuleSourceCode,
-        ModuleSourceFuture, ModuleSpecifier, ModuleType, ResolutionKind,
-        Snapshot,
+        self, error::AnyError, futures::FutureExt, resolve_import,
+        snapshot::CreateSnapshotOutput, url::Url, FastString, ModuleLoader,
+        ModuleSource, ModuleSourceCode, ModuleSourceFuture, ModuleSpecifier,
+        ModuleType, ResolutionKind,
     },
     permissions::PermissionsContainer,
     worker::{MainWorker, WorkerOptions},
@@ -105,7 +105,9 @@ pub fn init(main_module: Url) -> MainWorker {
             extensions: vec![auraescript::init_ops()],
             module_loader: Rc::new(TypescriptModuleLoader),
             get_error_class_fn: Some(&get_error_class_name),
-            startup_snapshot: Some(Snapshot::Static(RUNTIME_SNAPSHOT)),
+            startup_snapshot: Some(CreateSnapshotOutput::Static(
+                RUNTIME_SNAPSHOT,
+            )),
             bootstrap: BootstrapOptions {
                 args: vec![],
                 cpu_count: 1,
@@ -114,7 +116,6 @@ pub fn init(main_module: Url) -> MainWorker {
                 location: None,
                 log_level: WorkerLogLevel::Info,
                 no_color: false,
-                is_tty: false,
                 unstable: true,
                 user_agent: "".to_string(),
                 inspect: false,
@@ -199,7 +200,9 @@ impl ModuleLoader for TypescriptModuleLoader {
                     scope_analysis: false,
                     maybe_syntax: None,
                 })?;
-                parsed.transpile(&Default::default())?.text
+                parsed
+                    .transpile(&Default::default(), &EmitOptions::default())?
+                    .text
             } else {
                 code
             };
@@ -208,6 +211,7 @@ impl ModuleLoader for TypescriptModuleLoader {
                 ModuleSourceCode::String(FastString::Owned(code.into())),
                 &module_specifier,
                 &module_specifier,
+                None,
             );
             Ok(module)
         }
