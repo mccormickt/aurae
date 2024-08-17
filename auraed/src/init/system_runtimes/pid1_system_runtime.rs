@@ -15,10 +15,30 @@
 
 use super::{SocketStream, SystemRuntime, SystemRuntimeError};
 use crate::init::{
-    fs::MountSpec, logging, network, power::spawn_thread_power_button_listener,
-    system_runtimes::create_tcp_socket_stream, BANNER,
+    fileio::show_dir,
+    fs::{
+        FsError, MountSpec, CGROUP_MNT_FLAGS, CHMOD_0555, CHMOD_0755,
+        COMMON_MNT_FLAGS,
+    },
+    logging, network,
+    power::spawn_thread_power_button_listener,
+    system_runtimes::create_tcp_socket_stream,
+    BANNER,
 };
-use std::{net::SocketAddr, path::Path};
+use libc::execve;
+use nix::{
+    mount::MsFlags,
+    sys::stat::Mode,
+    unistd::{mkdir, symlinkat},
+};
+use std::{
+    fs,
+    io::{self, Write},
+    net::SocketAddr,
+    path::Path,
+    process::Command,
+    thread,
+};
 use tonic::async_trait;
 use tracing::{error, info, trace};
 
@@ -62,20 +82,24 @@ impl SystemRuntime for Pid1SystemRuntime {
         info!("Running as pid 1");
         trace!("Configure filesystem");
 
-        // NOTE: THESE TODOS WERE ALL HERE, BUT...
-        //       if you are here, you are auraed is true pid 1
-        //       Container -> use container_system_runtime.rs
-        //       Cell -> use cell_system_runtime.rs
-
-        // TODO We need to determine how we want to handle mountings these filesystems.
-        // TODO From within the context of a container (cgroup trailing / in cgroup namespace)
-        // TODO We likely to do not need to mount these filesystems.
-        // TODO Do we want to have a way to "try" these mounts and continue without erroring?
+        mkdir("/dev/pts", *CHMOD_0755).map_err(FsError::FileCreationFailure)?;
+        MountSpec {
+            source: Some("devpts"),
+            target: "/dev/pts",
+            fstype: Some("devpts"),
+            flags: MsFlags::MS_NOEXEC
+                | MsFlags::MS_NOSUID
+                | MsFlags::MS_NOATIME,
+            data: Some("mode=0620,gid=5,ptmxmode=666"),
+        }
+        .mount()?;
 
         MountSpec {
             source: Some("sysfs"),
             target: "/sys",
             fstype: Some("sysfs"),
+            flags: *COMMON_MNT_FLAGS,
+            data: None,
         }
         .mount()?;
 
@@ -83,6 +107,35 @@ impl SystemRuntime for Pid1SystemRuntime {
             source: Some("proc"),
             target: "/proc",
             fstype: Some("proc"),
+            flags: *COMMON_MNT_FLAGS,
+            data: None,
+        }
+        .mount()?;
+
+        MountSpec {
+            source: Some("run"),
+            target: "/run",
+            fstype: Some("tmpfs"),
+            flags: MsFlags::MS_NOSUID | MsFlags::MS_NODEV,
+            data: Some("mode=0755"),
+        }
+        .mount()?;
+
+        symlinkat("/proc/self/fd", None, "/dev/fd")
+            .map_err(FsError::FileCreationFailure)?;
+        symlinkat("/proc/self/fd/0", None, "/dev/stdin")
+            .map_err(FsError::FileCreationFailure)?;
+        symlinkat("/proc/self/fd/1", None, "/dev/stdout")
+            .map_err(FsError::FileCreationFailure)?;
+        symlinkat("/proc/self/fd/2", None, "/dev/stderr")
+            .map_err(FsError::FileCreationFailure)?;
+
+        MountSpec {
+            source: Some("cgroup2"),
+            target: "/sys/fs/cgroup",
+            fstype: Some("cgroup2"),
+            flags: *CGROUP_MNT_FLAGS,
+            data: None,
         }
         .mount()?;
 
@@ -90,11 +143,12 @@ impl SystemRuntime for Pid1SystemRuntime {
             source: Some("debugfs"),
             target: "/sys/kernel/debug",
             fstype: Some("debugfs"),
+            flags: *COMMON_MNT_FLAGS,
+            data: None,
         }
         .mount()?;
 
         trace!("Configure network");
-        // show_dir("/sys/class/net/", false); // Show available network interfaces
         let network = network::Network::connect()?;
         network.init().await?;
         network.show_network_info().await;
