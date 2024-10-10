@@ -42,6 +42,8 @@
  *                                                                            *
 \* -------------------------------------------------------------------------- */
 
+mod cell_service;
 pub use cell_service::CellServiceCommands;
 
-mod cell_service;
+mod vm_service;
+pub use vm_service::VmServiceCommands;

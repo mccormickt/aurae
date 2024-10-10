@@ -76,7 +76,7 @@ message VirtualMachineSummary {
   string root_dir_path = 6;
 
   // Auraed server address of the VM
-  string auraed_address = 7;
+  optional string auraed_address = 7;
 }
 
 message VmServiceAllocateRequest{
@@ -127,9 +127,6 @@ message VirtualMachine {
 
   // Additional drive mount configs
   repeated DriveMount drive_mounts = 7;
-
-  // Auraed server address of the VM
-  string auraed_address = 8;
 }
 
 // Message to specify the root filesystem config for a  VM

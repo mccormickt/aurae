@@ -49,7 +49,6 @@ async fn vms_with_auraed() {
                         read_only: false,
                     }),
                     drive_mounts: vec![],
-                    auraed_address: String::new()
                 }),
             })
             .await
@@ -79,11 +78,13 @@ async fn vms_with_auraed() {
             .into_iter()
             .find(|m| m.id == vm_id)
             .expect("vm not found");
-        if vm.auraed_address.is_empty() || vm.status != "Running" {
+        if vm.auraed_address.is_none() || vm.status != "Running" {
             tokio::time::sleep(std::time::Duration::from_secs(1)).await;
             continue;
         }
-        remote_client = remote_auraed_client(vm.auraed_address).await;
+        if let Some(auraed_address) = vm.auraed_address {
+            remote_client = remote_auraed_client(auraed_address).await;
+        }
         tokio::time::sleep(std::time::Duration::from_secs(1)).await;
     }
 

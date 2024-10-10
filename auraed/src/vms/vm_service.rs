@@ -179,10 +179,7 @@ impl VmService {
                         .host_path
                         .to_string_lossy()
                         .to_string(),
-                    auraed_address: m
-                        .tap()
-                        .map(|t| t.to_string())
-                        .unwrap_or_default(),
+                    auraed_address: m.tap().map(|t| t.to_string()),
                     status: m.status.to_string(),
                 })
                 .collect(),
