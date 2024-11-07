@@ -27,7 +27,6 @@ use tracing::info_span;
 
 // TODO: decide if we're going to use the description or not.  Remove if not.
 #[allow(dead_code)]
-
 #[derive(Debug)]
 pub struct Executable {
     pub name: ExecutableName,
@@ -146,7 +145,8 @@ impl Executable {
 
     /// Returns the [Pid] while [Executable] is running, otherwise returns [None].
     pub fn pid(&self) -> io::Result<Option<Pid>> {
-        let ExecutableState::Started { child: process, .. } = &self.state else {
+        let ExecutableState::Started { child: process, .. } = &self.state
+        else {
             return Ok(None);
         };
 
