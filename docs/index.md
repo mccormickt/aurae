@@ -103,19 +103,20 @@ let started = await cells.start(<runtime.StartExecutableRequest>{
 
 ---
 
-<!--
 # **Getting Started**
-## **Building Aurae from Source**
-### **Dependencies**
-### **Prepare the Environment**
-## **Aurae Quick Start**
-### **Running the Daemon**
-### **Running your first Cell**
-## **Developing on an M1**
-### **Environment**
-### **VM Setup**
-### **CLion Setup**
-### **Back to the VM (setting up Aurae)** -->
+
+Ready to try Aurae? Follow these guides to get started:
+
+- [**Getting Started Guide**](docs/getting-started.md) - Complete step-by-step instructions
+- [**Building from Source**](docs/build.md) - Detailed build instructions
+- [**Quick Start**](docs/quickstart.md) - Run your first workload quickly
+- [**Architecture Overview**](docs/architecture.md) - Understand how Aurae works
+
+## **Key Components**
+
+- [**Aurae Daemon (auraed)**](auraed/README.md) - The core runtime daemon
+- [**AuraeScript**](docs/auraescript/index.md) - Interact with Aurae using TypeScript
+- [**Development Environments**](docs/development-environments/index.md) - Setup your dev environment
 
 <!-- All the links!! -->
 <!-- +Footnotes
