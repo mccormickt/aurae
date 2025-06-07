@@ -23,7 +23,10 @@ use super::{
         ValidatedCellServiceStartRequest, ValidatedCellServiceStopRequest,
     },
 };
-use crate::{cells::cell_service::cells::CellsError, observe::ObserveService};
+use crate::{
+    cells::cell_service::{cells::CellsError, executables::ExecutablesError},
+    observe::ObserveService,
+};
 use ::validation::ValidatedType;
 use backoff::backoff::Backoff;
 use client::{Client, ClientError, cells::cell_service::CellServiceClient};
@@ -40,8 +43,8 @@ use proto::{
     observe::LogChannelType,
 };
 use std::os::unix::fs::MetadataExt;
+use std::sync::Arc;
 use std::time::Duration;
-use std::{process::ExitStatus, sync::Arc};
 use tokio::sync::Mutex;
 use tonic::{Code, Request, Response, Status};
 use tracing::{info, instrument, trace, warn};
@@ -290,44 +293,82 @@ impl CellService {
         assert!(cell_name.is_none());
         info!("CellService: stop() executable_name={:?}", executable_name,);
 
-        let pid = {
+        let (pid_option, stop_result) = {
             let mut executables = self.executables.lock().await;
 
             // Retrieve the process ID (PID) of the executable to be stopped
-            let pid = executables
+            let exe = executables
                 .get(&executable_name)
-                .map_err(CellsServiceError::ExecutablesError)?
-                .pid()
-                .map_err(CellsServiceError::Io)?
-                .expect("pid")
-                .as_raw();
-
-            // Stop the executable and handle any errors
-            let _: ExitStatus = executables
-                .stop(&executable_name)
-                .await
                 .map_err(CellsServiceError::ExecutablesError)?;
 
-            pid
+
+            // Retrieve the process ID (PID) of the executable to be stopped
+            let pid_option = match exe.pid() {
+                Ok(pid) => pid.map(|p| p.as_raw()),
+                Err(e) => {
+                    warn!("Error getting PID for {executable_name:?}: {e}");
+                    None
+                }
+            };
+
+            // Stop the executable
+            let result = executables.stop(&executable_name).await;
+
+            (pid_option, result)
         };
 
-        // Remove the executable's logs from the observe service.
-        if let Err(e) = self
-            .observe_service
-            .unregister_sub_process_channel(pid, LogChannelType::Stdout)
-            .await
-        {
-            warn!("failed to unregister stdout channel for pid {pid}: {e}");
-        }
-        if let Err(e) = self
-            .observe_service
-            .unregister_sub_process_channel(pid, LogChannelType::Stderr)
-            .await
-        {
-            warn!("failed to unregister stderr channel for pid {pid}: {e}");
+
+
+        // Cleanup the observe_service regardless of stop result
+        if let Some(pid) = pid_option {
+            // Remove the executable's logs from the observe service.
+            if let Err(e) = self
+                .observe_service
+                .unregister_sub_process_channel(pid, LogChannelType::Stdout)
+                .await
+            {
+                warn!("failed to unregister stdout channel for pid {pid}: {e}");
+            }
+            if let Err(e) = self
+                .observe_service
+                .unregister_sub_process_channel(pid, LogChannelType::Stderr)
+                .await
+            {
+                warn!("failed to unregister stderr channel for pid {pid}: {e}");
+            }
         }
 
-        Ok(Response::new(CellServiceStopResponse::default()))
+        // Check the stop result
+        match stop_result {
+            Ok(_) => {
+                info!("Successfully stopped executable {executable_name:?}");
+                Ok(Response::new(CellServiceStopResponse::default()))
+            }
+            Err(e) => {
+                if let ExecutablesError::FailedToStopExecutable {
+                    executable_name: _,
+                    source,
+                } = &e
+                {
+                    if source.kind() == std::io::ErrorKind::NotFound
+                        || source.raw_os_error() == Some(libc::ESRCH)
+                        || source.raw_os_error() == Some(libc::ECHILD)
+                    {
+                        // Process not found error - the process already exited
+                        info!("Process for {executable_name:?} already exited");
+                        return Ok(Response::new(
+                            CellServiceStopResponse::default(),
+                        ));
+                    }
+                }
+
+                // For other errors, propagate them
+                Err(Status::internal(format!(
+                    "executable '{}' failed to stop: {}",
+                    executable_name, e
+                )))
+            }
+        }
     }
 
     #[tracing::instrument(skip(self))]

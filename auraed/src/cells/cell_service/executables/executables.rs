@@ -98,7 +98,7 @@ impl Executables {
             });
         };
 
-        let _ = self.cache.remove(executable_name).ok_or_else(|| {
+        let _ = self.cache.remove(executable_name).ok_or({
             // get_mut would have already thrown this error, so we should never reach here
             ExecutablesError::ExecutableNotFound {
                 executable_name: executable_name.clone(),

@@ -32,7 +32,7 @@ use std::{
     os::unix::process::{CommandExt, ExitStatusExt},
     process::{Command, ExitStatus},
 };
-use tracing::{error, info, trace};
+use tracing::{debug, error, info, instrument, trace};
 
 #[derive(Debug)]
 pub struct NestedAuraed {
@@ -169,6 +169,7 @@ impl NestedAuraed {
     }
 
     /// Sends a graceful shutdown signal to the nested process.
+    #[instrument(skip(self))]
     pub fn shutdown(&mut self) -> io::Result<ExitStatus> {
         // TODO: Here, SIGTERM works when using auraescript, but hangs(?) during unit tests.
         //       SIGKILL, however, works. The hang is avoided if the process is not isolated.
@@ -178,6 +179,7 @@ impl NestedAuraed {
     }
 
     /// Sends a [SIGKILL] signal to the nested process.
+    #[instrument(skip_all)]
     pub fn kill(&mut self) -> io::Result<ExitStatus> {
         self.do_kill(Some(SIGKILL))?;
         self.wait()
@@ -189,10 +191,19 @@ impl NestedAuraed {
     ) -> io::Result<()> {
         let signal = signal.into();
         let pid = Pid::from_raw(self.process.pid);
-        nix::sys::signal::kill(pid, signal)?;
-        Ok(())
+
+        match nix::sys::signal::kill(pid, signal) {
+            Ok(()) => Ok(()),
+            Err(nix::errno::Errno::ESRCH) => {
+                // Process doesn't exist - it's already dead, which is fine
+                debug!("Pid {pid} already gone (ESRCH) when sending signal");
+                Ok(())
+            }
+            Err(e) => e?,
+        }
     }
 
+    #[instrument(skip_all)]
     fn wait(&mut self) -> io::Result<ExitStatus> {
         let pid = Pid::from_raw(self.process.pid);
 
@@ -200,6 +211,11 @@ impl NestedAuraed {
             match waitpid(pid, None) {
                 Ok(status) => break status,
                 Err(Errno::EINTR) => continue,
+                Err(Errno::ECHILD) => {
+                    // Process already exited and was reaped (or was never our child)
+                    debug!("Pid {pid} already exited (ECHILD)");
+                    return Ok(ExitStatus::from_raw(0));
+                }
                 Err(e) => return Err(e.into()),
             }
         };

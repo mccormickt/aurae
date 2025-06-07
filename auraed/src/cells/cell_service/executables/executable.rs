@@ -26,8 +26,7 @@ use tokio::task::JoinHandle;
 use tracing::info_span;
 
 // TODO: decide if we're going to use the description or not.  Remove if not.
-#[allow(dead_code)]
-#[derive(Debug)]
+#[allow(dead_code)] #[derive(Debug)]
 pub struct Executable {
     pub name: ExecutableName,
     pub description: String,
@@ -77,7 +76,7 @@ impl Executable {
             .kill_on_drop(true)
             .current_dir("/")
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
+             .stderr(Stdio::piped());
         if let Some(uid) = uid {
             command = command.uid(uid);
         }
