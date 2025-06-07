@@ -12,9 +12,9 @@
  * Copyright 2022 - 2024, the aurae contributors                              *
  * SPDX-License-Identifier: Apache-2.0                                        *
 \* -------------------------------------------------------------------------- */
-use tracing::{info, Level};
+use tracing::{Level, info};
 use tracing_subscriber::{
-    layer::SubscriberExt, util::SubscriberInitExt, EnvFilter, Layer,
+    EnvFilter, Layer, layer::SubscriberExt, util::SubscriberInitExt,
 };
 
 #[derive(thiserror::Error, Debug)]
@@ -40,7 +40,7 @@ pub(crate) fn init(verbose: bool, container: bool) -> Result<(), LoggingError> {
     //
     // Normal mode: Info, Warn, Error
     // Verbose mode: Debug, Trace, Info, Warn, Error
-    let tracing_level = if verbose { Level::TRACE } else { Level::INFO };
+    let tracing_level = if verbose { Level::TRACE } else { Level::DEBUG };
 
     if container {
         init_container_logging(tracing_level)

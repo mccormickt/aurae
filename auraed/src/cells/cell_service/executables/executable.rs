@@ -77,7 +77,9 @@ impl Executable {
             .kill_on_drop(true)
             .current_dir("/")
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
+            .stderr(Stdio::piped())
+            // Create a new process group so we can kill all child processes
+            .process_group(0);
         if uid.is_some() {
             command = command.uid(uid.expect("uid"));
         }

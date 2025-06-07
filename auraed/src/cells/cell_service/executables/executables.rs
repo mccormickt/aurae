@@ -13,9 +13,12 @@
  * SPDX-License-Identifier: Apache-2.0                                        *
 \* -------------------------------------------------------------------------- */
 
+use tracing::{debug, error};
+
 use super::{
     Executable, ExecutableName, ExecutableSpec, ExecutablesError, Result,
 };
+use std::os::unix::process::ExitStatusExt;
 use std::{collections::HashMap, process::ExitStatus};
 
 type Cache = HashMap<ExecutableName, Executable>;
@@ -76,34 +79,53 @@ impl Executables {
         &mut self,
         executable_name: &ExecutableName,
     ) -> Result<ExitStatus> {
+        use std::io::ErrorKind;
+
         let Some(executable) = self.cache.get_mut(executable_name) else {
             return Err(ExecutablesError::ExecutableNotFound {
                 executable_name: executable_name.clone(),
             });
         };
 
-        let exit_status = executable.kill().await.map_err(|e| {
-            ExecutablesError::FailedToStopExecutable {
-                executable_name: executable_name.clone(),
-                source: e,
-            }
-        })?;
+        // Try to kill the process and handle possible errors
+        let exit_status_result = executable.kill().await;
 
-        let Some(exit_status) = exit_status else {
-            // Exes that never started return None
-            let executable =
-                self.cache.remove(executable_name).expect("exe in cache");
-            return Err(ExecutablesError::ExecutableNotFound {
-                executable_name: executable.name,
-            });
-        };
+        // Remove the executable from cache regardless of kill result
+        // This ensures we clean up our cache even if kill fails
+        let executable = self
+            .cache
+            .remove(executable_name)
+            .expect("executable should be in cache since we just got it");
 
-        let _ = self.cache.remove(executable_name).ok_or_else(|| {
-            // get_mut would have already thrown this error, so we should never reach here
-            ExecutablesError::ExecutableNotFound {
-                executable_name: executable_name.clone(),
+        // Now handle the kill result
+        let exit_status = match exit_status_result {
+            Ok(Some(status)) => {
+                // Successfully killed and got exit status
+                Ok(status)
             }
-        })?;
+            Ok(None) => {
+                // Process was never started
+                Err(ExecutablesError::ExecutableNotFound {
+                    executable_name: executable.name,
+                })
+            }
+            Err(e)
+                if e.kind() == ErrorKind::NotFound
+                    || e.raw_os_error() == Some(libc::ESRCH)
+                    || e.raw_os_error() == Some(libc::ECHILD) =>
+            {
+                // Process already exited or doesn't exist anymore
+                // Create a simulated exit status since we can't get the real one
+                Ok(ExitStatus::from_raw(0))
+            }
+            Err(e) => {
+                // Other errors
+                Err(ExecutablesError::FailedToStopExecutable {
+                    executable_name: executable_name.clone(),
+                    source: e,
+                })
+            }
+        }?;
 
         Ok(exit_status)
     }
@@ -112,7 +134,24 @@ impl Executables {
     pub async fn broadcast_stop(&mut self) {
         let mut names = vec![];
         for exe in self.cache.values_mut() {
-            let _ = exe.kill().await;
+            let pid_info = exe.pid().ok().and_then(|p| p.map(|p| p.as_raw()));
+            match exe.kill().await {
+                Ok(Some(status)) => {
+                    debug!(
+                        "Process {} (PID: {:?}) was successfully killed with status: {:?}",
+                        exe.name, pid_info, status
+                    );
+                }
+                Ok(None) => {
+                    debug!("Process {} was never started", exe.name);
+                }
+                Err(e) => {
+                    error!(
+                        "Failed to stop executable {} (PID: {:?}): {}",
+                        exe.name, pid_info, e
+                    );
+                }
+            }
             names.push(exe.name.clone())
         }
 

@@ -18,7 +18,8 @@ use super::{
     CellsCache, CellsError, Result,
 };
 use client::AuraeSocket;
-use tracing::info;
+use std::os::unix::process::ExitStatusExt;
+use tracing::{info, warn};
 
 // TODO https://github.com/aurae-runtime/aurae/issues/199 &&
 //      aurae.io/signals, which is more accurate
@@ -35,14 +36,25 @@ macro_rules! do_free {
         {
             $(children.$children_call($($children_call_arg),*));*;
 
-            let _exit_status = nested_auraed
+            let _exit_status = match nested_auraed
                 .$nested_auraed_call($($nested_auraed_call_arg),*)
-                .map_err(|e| {
-                    CellsError::FailedToKillCellChildren {
-                        cell_name: $self.cell_name.clone(),
-                        source: e,
+            {
+                Ok(status) => status,
+                Err(e) => {
+                    // Handle "No child processes" error gracefully - it means children are already gone
+                    if e.raw_os_error() == Some(libc::ECHILD) || 
+                       e.raw_os_error() == Some(libc::ESRCH) {
+                        warn!("Cell {} children already gone when freeing: {}", $self.cell_name, e);
+                        // Continue with cell cleanup - use a synthetic exit status
+                        std::process::ExitStatus::from_raw(0)
+                    } else {
+                        return Err(CellsError::FailedToKillCellChildren {
+                            cell_name: $self.cell_name.clone(),
+                            source: e,
+                        });
                     }
-                })?;
+                }
+            };
 
             cgroup.delete().map_err(|e| CellsError::FailedToFreeCell {
                 cell_name: $self.cell_name.clone(),

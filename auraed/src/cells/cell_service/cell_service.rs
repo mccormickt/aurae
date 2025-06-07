@@ -14,6 +14,7 @@
 \* -------------------------------------------------------------------------- */
 
 use super::{
+    Result,
     cells::{CellName, Cells, CellsCache},
     error::CellsServiceError,
     executables::Executables,
@@ -21,27 +22,26 @@ use super::{
         ValidatedCellServiceAllocateRequest, ValidatedCellServiceFreeRequest,
         ValidatedCellServiceStartRequest, ValidatedCellServiceStopRequest,
     },
-    Result,
 };
 use crate::{cells::cell_service::cells::CellsError, observe::ObserveService};
 use ::validation::ValidatedType;
 use backoff::backoff::Backoff;
-use client::{cells::cell_service::CellServiceClient, Client, ClientError};
+use client::{Client, ClientError, cells::cell_service::CellServiceClient};
 use proto::{
     cells::{
-        cell_service_server, Cell, CellGraphNode, CellServiceAllocateRequest,
+        Cell, CellGraphNode, CellServiceAllocateRequest,
         CellServiceAllocateResponse, CellServiceFreeRequest,
         CellServiceFreeResponse, CellServiceListRequest,
         CellServiceListResponse, CellServiceStartRequest,
         CellServiceStartResponse, CellServiceStopRequest,
         CellServiceStopResponse, CpuController, CpusetController,
-        MemoryController,
+        MemoryController, cell_service_server,
     },
     observe::LogChannelType,
 };
 use std::os::unix::fs::MetadataExt;
+use std::sync::Arc;
 use std::time::Duration;
-use std::{process::ExitStatus, sync::Arc};
 use tokio::sync::Mutex;
 use tonic::{Code, Request, Response, Status};
 use tracing::{info, trace, warn};
@@ -291,38 +291,67 @@ impl CellService {
 
         let mut executables = self.executables.lock().await;
 
-        // Retrieve the process ID (PID) of the executable to be stopped
-        let pid = executables
+        // Check if the executable exists in our cache first
+        let exe = executables
             .get(&executable_name)
-            .map_err(CellsServiceError::ExecutablesError)?
-            .pid()
-            .map_err(CellsServiceError::Io)?
-            .expect("pid")
-            .as_raw();
-
-        // Stop the executable and handle any errors
-        let _: ExitStatus = executables
-            .stop(&executable_name)
-            .await
             .map_err(CellsServiceError::ExecutablesError)?;
 
-        // Remove the executable's logs from the observe service.
-        if let Err(e) = self
-            .observe_service
-            .unregister_sub_process_channel(pid, LogChannelType::Stdout)
-            .await
-        {
-            warn!("failed to unregister stdout channel for pid {pid}: {e}");
-        }
-        if let Err(e) = self
-            .observe_service
-            .unregister_sub_process_channel(pid, LogChannelType::Stderr)
-            .await
-        {
-            warn!("failed to unregister stderr channel for pid {pid}: {e}");
+        // Retrieve the process ID (PID) of the executable to be stopped
+        let pid_option = match exe.pid() {
+            Ok(pid) => pid.map(|p| p.as_raw()),
+            Err(e) => {
+                warn!("Error getting PID for {executable_name:?}: {e}");
+                None
+            }
+        };
+
+        // Stop the executable
+        let result = executables.stop(&executable_name).await;
+
+        // Cleanup the observe_service regardless of stop result
+        if let Some(pid) = pid_option {
+            // Remove the executable's logs from the observe service.
+            if let Err(e) = self
+                .observe_service
+                .unregister_sub_process_channel(pid, LogChannelType::Stdout)
+                .await
+            {
+                warn!("failed to unregister stdout channel for pid {pid}: {e}");
+            }
+            if let Err(e) = self
+                .observe_service
+                .unregister_sub_process_channel(pid, LogChannelType::Stderr)
+                .await
+            {
+                warn!("failed to unregister stderr channel for pid {pid}: {e}");
+            }
         }
 
-        Ok(Response::new(CellServiceStopResponse::default()))
+        // Check the stop result
+        match result {
+            Ok(_) => {
+                info!("Successfully stopped executable {executable_name:?}");
+                Ok(Response::new(CellServiceStopResponse::default()))
+            }
+            Err(e) => {
+                // Convert the error to make the API friendlier
+                if let super::executables::ExecutablesError::FailedToStopExecutable { executable_name: _, source } = &e {
+                    if source.kind() == std::io::ErrorKind::NotFound ||
+                       source.raw_os_error() == Some(libc::ESRCH) ||
+                       source.raw_os_error() == Some(libc::ECHILD) {
+                        // Process not found error - the process already exited
+                        info!("Process for {executable_name:?} already exited");
+                        return Ok(Response::new(CellServiceStopResponse::default()));
+                    }
+                }
+
+                // For other errors, propagate them
+                Err(Status::internal(format!(
+                    "executable '{}' failed to stop: {}",
+                    executable_name, e
+                )))
+            }
+        }
     }
 
     #[tracing::instrument(skip(self))]
@@ -523,7 +552,24 @@ impl cell_service_server::CellService for CellService {
         if request.cell_name.is_none() {
             let request =
                 ValidatedCellServiceStopRequest::validate(request, None)?;
-            Ok(self.stop(request).await?)
+
+            // Try to stop the executable, but handle "no child processes" error gracefully
+            match self.stop(request).await {
+                Ok(response) => Ok(response),
+                Err(status) => {
+                    if status.message().contains("No child process") {
+                        // This specific error indicates the process is already gone
+                        warn!(
+                            "Process already gone when stopping, treating as success: {}",
+                            status.message()
+                        );
+                        Ok(Response::new(CellServiceStopResponse::default()))
+                    } else {
+                        // For other errors, propagate them
+                        Err(status)
+                    }
+                }
+            }
         } else {
             // Validate the request is valid
             let validated = ValidatedCellServiceStopRequest::validate(
@@ -559,6 +605,7 @@ impl cell_service_server::CellService for CellService {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{AURAED_RUNTIME, AuraedRuntime};
     use crate::{
         cells::cell_service::validation::{
             ValidatedCell, ValidatedCpuController, ValidatedCpusetController,
@@ -566,7 +613,6 @@ mod tests {
         },
         logging::log_channel::LogChannel,
     };
-    use crate::{AuraedRuntime, AURAED_RUNTIME};
     use iter_tools::Itertools;
     use test_helpers::*;
 
@@ -587,26 +633,26 @@ mod tests {
 
         // Allocate a parent cell for testing
         let parent_cell_name = format!("ae-test-{}", uuid::Uuid::new_v4());
-        assert!(service
-            .allocate(allocate_request(&parent_cell_name))
-            .await
-            .is_ok());
+        assert!(
+            service.allocate(allocate_request(&parent_cell_name)).await.is_ok()
+        );
 
         // Allocate a nested cell within the parent cell for testing
         let nested_cell_name =
             format!("{}/ae-test-{}", &parent_cell_name, uuid::Uuid::new_v4());
-        assert!(service
-            .allocate(allocate_request(&nested_cell_name))
-            .await
-            .is_ok());
+        assert!(
+            service.allocate(allocate_request(&nested_cell_name)).await.is_ok()
+        );
 
         // Allocate a cell without children for testing
         let cell_without_children_name =
             format!("ae-test-{}", uuid::Uuid::new_v4());
-        assert!(service
-            .allocate(allocate_request(&cell_without_children_name))
-            .await
-            .is_ok());
+        assert!(
+            service
+                .allocate(allocate_request(&cell_without_children_name))
+                .await
+                .is_ok()
+        );
 
         // List all cells and verify the result
         let result = service.list().await;

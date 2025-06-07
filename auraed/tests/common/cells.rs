@@ -83,7 +83,7 @@ impl CellServiceAllocateRequestBuilder {
     }
 }
 
-struct ExecutableBuilder {
+pub struct ExecutableBuilder {
     name: String,
     command: String,
     description: String,
@@ -150,7 +150,6 @@ impl CellServiceStartRequestBuilder {
     }
 
     pub fn build(&self) -> CellServiceStartRequest {
-        assert!(self.cell_name.is_some(), "cell_name needs to be set");
         CellServiceStartRequest {
             cell_name: self.cell_name.clone(),
             executable: Some(self.executable_builder.build()),

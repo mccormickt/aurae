@@ -305,8 +305,12 @@ impl From<ValidatedExecutable> for super::executables::ExecutableSpec {
     fn from(x: ValidatedExecutable) -> Self {
         let ValidatedExecutable { name, command, description } = x;
 
+        // Use "exec" to replace the shell with the command process
+        // This ensures the PID we track is associated with the actual command
+        let exec_command = OsString::from(format!("exec {}", command.to_string_lossy()));
+        tracing::debug!("Executing command: sh -c '{}'", exec_command.to_string_lossy());
         let mut c = Command::new("sh");
-        let _ = c.args([OsString::from("-c"), command]);
+        let _ = c.args([OsString::from("-c"), exec_command]);
 
         // We are checking that command has an arg to assure ourselves that `command.arg`
         // mutates command, and is not making a clone to return
