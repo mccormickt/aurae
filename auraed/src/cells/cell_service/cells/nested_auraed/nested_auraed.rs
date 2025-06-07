@@ -28,7 +28,7 @@ use std::{
     os::unix::process::{CommandExt, ExitStatusExt},
     process::{Command, ExitStatus},
 };
-use tracing::{error, info, trace};
+use tracing::{debug, error, info, instrument, trace};
 
 #[derive(Debug)]
 pub struct NestedAuraed {
@@ -167,6 +167,7 @@ impl NestedAuraed {
     }
 
     /// Sends a graceful shutdown signal to the nested process.
+    #[instrument(skip(self))]
     pub fn shutdown(&mut self) -> io::Result<ExitStatus> {
         // TODO: Here, SIGTERM works when using auraescript, but hangs(?) during unit tests.
         //       SIGKILL, however, works. The hang is avoided if the process is not isolated.
@@ -176,6 +177,7 @@ impl NestedAuraed {
     }
 
     /// Sends a [SIGKILL] signal to the nested process.
+    #[instrument(skip_all)]
     pub fn kill(&mut self) -> io::Result<ExitStatus> {
         self.do_kill(Some(SIGKILL))?;
         self.wait()
@@ -188,10 +190,18 @@ impl NestedAuraed {
         let signal = signal.into();
         let pid = Pid::from_raw(self.process.pid);
 
-        nix::sys::signal::kill(pid, signal)
-            .map_err(|e| io::Error::from_raw_os_error(e as i32))
+        match nix::sys::signal::kill(pid, signal) {
+            Ok(()) => Ok(()),
+            Err(nix::errno::Errno::ESRCH) => {
+                // Process doesn't exist - it's already dead, which is fine
+                debug!("Pid {pid} already gone (ESRCH) when sending signal");
+                Ok(())
+            }
+            Err(e) => Err(io::Error::from_raw_os_error(e as i32)),
+        }
     }
 
+    #[instrument(skip_all)]
     fn wait(&mut self) -> io::Result<ExitStatus> {
         let pid = Pid::from_raw(self.process.pid);
 
@@ -204,7 +214,15 @@ impl NestedAuraed {
                 let err = io::Error::last_os_error();
                 match err.kind() {
                     ErrorKind::Interrupted => continue,
-                    _ => break Err(err),
+                    _ => {
+                        // Handle ECHILD (No child processes) - this means the process already exited
+                        if err.raw_os_error() == Some(libc::ECHILD) {
+                            debug!("Pid {pid} already exited (ECHILD)");
+                            // Return a synthetic exit status indicating the process is gone
+                            return Ok(ExitStatus::from_raw(0));
+                        }
+                        break Err(err);
+                    }
                 }
             }
 
