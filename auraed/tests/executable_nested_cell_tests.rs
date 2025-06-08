@@ -1,7 +1,20 @@
+/* -------------------------------------------------------------------------- *\
+ *                |   █████╗ ██╗   ██╗██████╗  █████╗ ███████╗ |              *
+ *                |  ██╔══██╗██║   ██║██╔══██╗██╔══██╗██╔════╝ |              *
+ *                |  ███████║██║   ██║██████╔╝███████║█████╗   |              *
+ *                |  ██╔══██║██║   ██║██╔══██╗██╔══██║██╔══╝   |              *
+ *                |  ██║  ██║╚██████╔╝██║  ██║██║  ██║███████╗ |              *
+ *                |  ╚═╝  ╚═╝ ╚═════╝ ╚═╝  ╚═╝╚═╝  ╚═╝╚══════╝ |              *
+ *                +--------------------------------------------+              *
+ *                                                                            *
+ *                         Distributed Systems Runtime                        *
+ * -------------------------------------------------------------------------- *
+ * Copyright 2022 - 2024, the aurae contributors                              *
+ * SPDX-License-Identifier: Apache-2.0                                        *
+\* -------------------------------------------------------------------------- */
 use client::cells::cell_service::CellServiceClient;
-use test_helpers::*;
 use std::time::Duration;
-// use tokio::time::timeout; // Removed as timeout wrapper is not needed with retry! macro
+use test_helpers::*;
 
 mod common;
 
@@ -33,10 +46,11 @@ async fn nested_cell_executable_basic() {
         .cell_name(cell_name.clone())
         .executable_name("nested-basic-exe".to_string())
         .build();
-    
-    let start_response = retry!(client.start(req.clone()).await).unwrap().into_inner();
+
+    let start_response =
+        retry!(client.start(req.clone()).await).unwrap().into_inner();
     println!("Started nested executable with PID: {}", start_response.pid);
-    
+
     // Small delay to ensure process is running
     tokio::time::sleep(Duration::from_millis(100)).await;
 
@@ -49,13 +63,17 @@ async fn nested_cell_executable_basic() {
             })
             .await
     );
-    
+
     match stop_result {
         Ok(_) => println!("✓ Nested executable stopped successfully"),
         Err(status) => {
-            if status.message().contains("No child process") || 
-               status.message().contains("could not kill children") {
-                println!("✓ Nested executable already gone (acceptable): {}", status.message());
+            if status.message().contains("No child process")
+                || status.message().contains("could not kill children")
+            {
+                println!(
+                    "✓ Nested executable already gone (acceptable): {}",
+                    status.message()
+                );
             } else {
                 panic!("✗ Failed to stop nested executable: {}", status);
             }
@@ -70,13 +88,17 @@ async fn nested_cell_executable_basic() {
             })
             .await
     );
-    
+
     match free_result {
         Ok(_) => println!("✓ Nested cell deleted successfully"),
         Err(status) => {
-            if status.message().contains("No child process") || 
-               status.message().contains("could not kill children") {
-                println!("✓ Nested cell deleted with warning: {}", status.message());
+            if status.message().contains("No child process")
+                || status.message().contains("could not kill children")
+            {
+                println!(
+                    "✓ Nested cell deleted with warning: {}",
+                    status.message()
+                );
             } else {
                 panic!("✗ Failed to delete nested cell: {}", status);
             }
@@ -113,19 +135,23 @@ async fn nested_cell_multiple_executables() {
     // Start multiple executables in the nested cell
     for i in 1..=3 {
         let exe_name = format!("nested-multi-{}", i);
-        
+
         let req = common::cells::CellServiceStartRequestBuilder::new()
             .cell_name(cell_name.clone())
             .executable_name(exe_name.clone())
             .build();
-        
-        let start_response = retry!(client.start(req.clone()).await).unwrap().into_inner();
-        println!("Started nested executable {} with PID: {}", exe_name, start_response.pid);
-        
+
+        let start_response =
+            retry!(client.start(req.clone()).await).unwrap().into_inner();
+        println!(
+            "Started nested executable {} with PID: {}",
+            exe_name, start_response.pid
+        );
+
         exe_names.push(exe_name);
         pids.push(start_response.pid);
     }
-    
+
     // Give them time to start
     tokio::time::sleep(Duration::from_millis(200)).await;
 
@@ -139,15 +165,26 @@ async fn nested_cell_multiple_executables() {
                 })
                 .await
         );
-        
+
         match stop_result {
-            Ok(_) => println!("✓ Nested executable {} stopped successfully", exe_name),
+            Ok(_) => println!(
+                "✓ Nested executable {} stopped successfully",
+                exe_name
+            ),
             Err(status) => {
-                if status.message().contains("No child process") || 
-                   status.message().contains("could not kill children") {
-                    println!("✓ Nested executable {} already gone (acceptable): {}", exe_name, status.message());
+                if status.message().contains("No child process")
+                    || status.message().contains("could not kill children")
+                {
+                    println!(
+                        "✓ Nested executable {} already gone (acceptable): {}",
+                        exe_name,
+                        status.message()
+                    );
                 } else {
-                    panic!("✗ Failed to stop nested executable {}: {}", exe_name, status);
+                    panic!(
+                        "✗ Failed to stop nested executable {}: {}",
+                        exe_name, status
+                    );
                 }
             }
         }
@@ -161,13 +198,19 @@ async fn nested_cell_multiple_executables() {
             })
             .await
     );
-    
+
     match free_result {
-        Ok(_) => println!("✓ Nested cell with multiple executables deleted successfully"),
+        Ok(_) => println!(
+            "✓ Nested cell with multiple executables deleted successfully"
+        ),
         Err(status) => {
-            if status.message().contains("No child process") || 
-               status.message().contains("could not kill children") {
-                println!("✓ Nested cell deleted with warning: {}", status.message());
+            if status.message().contains("No child process")
+                || status.message().contains("could not kill children")
+            {
+                println!(
+                    "✓ Nested cell deleted with warning: {}",
+                    status.message()
+                );
             } else {
                 panic!("✗ Failed to delete nested cell: {}", status);
             }
@@ -203,10 +246,14 @@ async fn nested_cell_long_running_process() {
         .cell_name(cell_name.clone())
         .executable_name("nested-long-running".to_string())
         .build();
-    
-    let start_response = retry!(client.start(req.clone()).await).unwrap().into_inner();
-    println!("Started nested long-running process with PID: {}", start_response.pid);
-    
+
+    let start_response =
+        retry!(client.start(req.clone()).await).unwrap().into_inner();
+    println!(
+        "Started nested long-running process with PID: {}",
+        start_response.pid
+    );
+
     // Let it run for a while
     tokio::time::sleep(Duration::from_millis(300)).await;
 
@@ -219,15 +266,22 @@ async fn nested_cell_long_running_process() {
             })
             .await
     );
-    
+
     match stop_result {
         Ok(_) => println!("✓ Nested long-running process stopped successfully"),
         Err(status) => {
-            if status.message().contains("No child process") || 
-               status.message().contains("could not kill children") {
-                println!("✓ Nested long-running process already gone (acceptable): {}", status.message());
+            if status.message().contains("No child process")
+                || status.message().contains("could not kill children")
+            {
+                println!(
+                    "✓ Nested long-running process already gone (acceptable): {}",
+                    status.message()
+                );
             } else {
-                panic!("✗ Failed to stop nested long-running process: {}", status);
+                panic!(
+                    "✗ Failed to stop nested long-running process: {}",
+                    status
+                );
             }
         }
     }
@@ -241,13 +295,17 @@ async fn nested_cell_long_running_process() {
             })
             .await
     );
-    
+
     match free_result {
         Ok(_) => println!("✓ Nested cell deleted successfully"),
         Err(status) => {
-            if status.message().contains("No child process") || 
-               status.message().contains("could not kill children") {
-                println!("✓ Nested cell deleted with warning: {}", status.message());
+            if status.message().contains("No child process")
+                || status.message().contains("could not kill children")
+            {
+                println!(
+                    "✓ Nested cell deleted with warning: {}",
+                    status.message()
+                );
             } else {
                 panic!("✗ Failed to delete nested cell: {}", status);
             }
@@ -266,12 +324,13 @@ async fn nested_cell_rapid_lifecycle() {
 
     for cycle in 1..=5 {
         println!("Nested cycle {}", cycle);
-        
+
         // Allocate a cell
         let cell_name = retry!(
             client
                 .allocate(
-                    common::cells::CellServiceAllocateRequestBuilder::new().build()
+                    common::cells::CellServiceAllocateRequestBuilder::new()
+                        .build()
                 )
                 .await
         )
@@ -285,14 +344,16 @@ async fn nested_cell_rapid_lifecycle() {
             .cell_name(cell_name.clone())
             .executable_name(exe_name.clone())
             .build();
-        
+
         let start_response = match retry!(client.start(req.clone()).await) {
             Ok(response) => response.into_inner(),
-            Err(e) => panic!("✗ Nested rapid test {}: Failed to start: {}", cycle, e),
+            Err(e) => {
+                panic!("✗ Nested rapid test {}: Failed to start: {}", cycle, e)
+            }
         };
-        
+
         println!("Nested cycle {}: Started PID {}", cycle, start_response.pid);
-        
+
         // Brief run time
         tokio::time::sleep(Duration::from_millis(50)).await;
 
@@ -305,15 +366,25 @@ async fn nested_cell_rapid_lifecycle() {
                 })
                 .await
         );
-        
+
         match stop_result {
-            Ok(_) => println!("✓ Nested rapid test {}: Stopped successfully", cycle),
+            Ok(_) => {
+                println!("✓ Nested rapid test {}: Stopped successfully", cycle)
+            }
             Err(status) => {
-                if status.message().contains("No child process") || 
-                   status.message().contains("could not kill children") {
-                    println!("✓ Nested rapid test {}: Already gone (acceptable): {}", cycle, status.message());
+                if status.message().contains("No child process")
+                    || status.message().contains("could not kill children")
+                {
+                    println!(
+                        "✓ Nested rapid test {}: Already gone (acceptable): {}",
+                        cycle,
+                        status.message()
+                    );
                 } else {
-                    panic!("✗ Nested rapid test {}: Unexpected stop error: {}", cycle, status);
+                    panic!(
+                        "✗ Nested rapid test {}: Unexpected stop error: {}",
+                        cycle, status
+                    );
                 }
             }
         }
@@ -327,19 +398,27 @@ async fn nested_cell_rapid_lifecycle() {
                 })
                 .await
         );
-    
+
         match free_result {
             Ok(_) => println!("✓ Nested rapid test cell deleted successfully"),
             Err(status) => {
-                if status.message().contains("No child process") || 
-                   status.message().contains("could not kill children") {
-                    println!("✓ Nested cycle {}: Cell deleted with warning: {}", cycle, status.message());
+                if status.message().contains("No child process")
+                    || status.message().contains("could not kill children")
+                {
+                    println!(
+                        "✓ Nested cycle {}: Cell deleted with warning: {}",
+                        cycle,
+                        status.message()
+                    );
                 } else {
-                    panic!("✗ Nested cycle {}: Failed to delete cell: {}", cycle, status);
+                    panic!(
+                        "✗ Nested cycle {}: Failed to delete cell: {}",
+                        cycle, status
+                    );
                 }
             }
         }
-        
+
         // Brief pause between cycles
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
@@ -373,10 +452,11 @@ async fn nested_cell_complex_commands() {
         .cell_name(cell_name.clone())
         .executable_name("nested-complex".to_string())
         .build();
-    
-    let start_response = retry!(client.start(req.clone()).await).unwrap().into_inner();
+
+    let start_response =
+        retry!(client.start(req.clone()).await).unwrap().into_inner();
     println!("Started nested complex command with PID: {}", start_response.pid);
-    
+
     // Let it run for a bit
     tokio::time::sleep(Duration::from_millis(400)).await;
 
@@ -389,13 +469,17 @@ async fn nested_cell_complex_commands() {
             })
             .await
     );
-    
+
     match stop_result {
         Ok(_) => println!("✓ Nested complex command stopped successfully"),
         Err(status) => {
-            if status.message().contains("No child process") || 
-               status.message().contains("could not kill children") {
-                println!("✓ Nested complex command already gone (acceptable): {}", status.message());
+            if status.message().contains("No child process")
+                || status.message().contains("could not kill children")
+            {
+                println!(
+                    "✓ Nested complex command already gone (acceptable): {}",
+                    status.message()
+                );
             } else {
                 panic!("✗ Failed to stop nested complex command: {}", status);
             }
@@ -410,13 +494,19 @@ async fn nested_cell_complex_commands() {
             })
             .await
     );
-    
+
     match free_result {
-        Ok(_) => println!("✓ Nested cell with complex command deleted successfully"),
+        Ok(_) => {
+            println!("✓ Nested cell with complex command deleted successfully")
+        }
         Err(status) => {
-            if status.message().contains("No child process") || 
-               status.message().contains("could not kill children") {
-                println!("✓ Nested cell deleted with warning: {}", status.message());
+            if status.message().contains("No child process")
+                || status.message().contains("could not kill children")
+            {
+                println!(
+                    "✓ Nested cell deleted with warning: {}",
+                    status.message()
+                );
             } else {
                 panic!("✗ Failed to delete nested cell: {}", status);
             }
@@ -441,7 +531,8 @@ async fn nested_cell_stress_test() {
         let cell_name = retry!(
             client
                 .allocate(
-                    common::cells::CellServiceAllocateRequestBuilder::new().build()
+                    common::cells::CellServiceAllocateRequestBuilder::new()
+                        .build()
                 )
                 .await
         )
@@ -456,14 +547,18 @@ async fn nested_cell_stress_test() {
     // Start executables in each cell
     for (i, cell_name) in cell_names.iter().enumerate() {
         let exe_name = format!("stress-nested-{}", i + 1);
-        
+
         let req = common::cells::CellServiceStartRequestBuilder::new()
             .cell_name(cell_name.clone())
             .executable_name(exe_name.clone())
             .build();
-        
-        let start_response = retry!(client.start(req.clone()).await).unwrap().into_inner();
-        println!("Started stress executable {} in cell {} with PID: {}", exe_name, cell_name, start_response.pid);
+
+        let start_response =
+            retry!(client.start(req.clone()).await).unwrap().into_inner();
+        println!(
+            "Started stress executable {} in cell {} with PID: {}",
+            exe_name, cell_name, start_response.pid
+        );
     }
 
     // Let them run
@@ -472,7 +567,7 @@ async fn nested_cell_stress_test() {
     // Stop all executables and free all cells
     for (i, cell_name) in cell_names.iter().enumerate() {
         let exe_name = format!("stress-nested-{}", i + 1);
-        
+
         // Stop executable
         let stop_result = retry!(
             client
@@ -482,15 +577,26 @@ async fn nested_cell_stress_test() {
                 })
                 .await
         );
-        
+
         match stop_result {
-            Ok(_) => println!("✓ Stress executable {} stopped successfully", exe_name),
+            Ok(_) => println!(
+                "✓ Stress executable {} stopped successfully",
+                exe_name
+            ),
             Err(status) => {
-                if status.message().contains("No child process") || 
-                   status.message().contains("could not kill children") {
-                    println!("✓ Stress executable {} already gone (acceptable): {}", exe_name, status.message());
+                if status.message().contains("No child process")
+                    || status.message().contains("could not kill children")
+                {
+                    println!(
+                        "✓ Stress executable {} already gone (acceptable): {}",
+                        exe_name,
+                        status.message()
+                    );
                 } else {
-                    println!("✗ Failed to stop stress executable {}: {}", exe_name, status);
+                    println!(
+                        "✗ Failed to stop stress executable {}: {}",
+                        exe_name, status
+                    );
                 }
             }
         }
@@ -503,15 +609,25 @@ async fn nested_cell_stress_test() {
                 })
                 .await
         );
-        
+
         match free_result {
-            Ok(_) => println!("✓ Stress cell {} deleted successfully", cell_name),
+            Ok(_) => {
+                println!("✓ Stress cell {} deleted successfully", cell_name)
+            }
             Err(status) => {
-                if status.message().contains("No child process") || 
-                   status.message().contains("could not kill children") {
-                    println!("✓ Stress cell {} deleted with warning: {}", cell_name, status.message());
+                if status.message().contains("No child process")
+                    || status.message().contains("could not kill children")
+                {
+                    println!(
+                        "✓ Stress cell {} deleted with warning: {}",
+                        cell_name,
+                        status.message()
+                    );
                 } else {
-                    println!("✗ Failed to delete stress cell {}: {}", cell_name, status);
+                    println!(
+                        "✗ Failed to delete stress cell {}: {}",
+                        cell_name, status
+                    );
                 }
             }
         }
