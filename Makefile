@@ -232,9 +232,9 @@ $(foreach p,$(PROGS),$(eval $(call AURAE_template,$(p),$(if $(findstring auraed,
 .PHONY: auraed-start
 auraed-start: ## Starts the installed auraed executable
 ifeq ($(uid), 0)
-	$(HOME)/.cargo/bin/auraed
+	$(HOME)/.cargo/bin/auraed --verbose
 else
-	sudo -E $(HOME)/.cargo/bin/auraed
+	sudo -E $(HOME)/.cargo/bin/auraed --verbose
 endif
 
 #------------------------------------------------------------------------------#

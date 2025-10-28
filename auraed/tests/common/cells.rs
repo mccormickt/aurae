@@ -83,7 +83,7 @@ impl CellServiceAllocateRequestBuilder {
     }
 }
 
-pub struct ExecutableBuilder {
+struct ExecutableBuilder {
     name: String,
     command: String,
     description: String,

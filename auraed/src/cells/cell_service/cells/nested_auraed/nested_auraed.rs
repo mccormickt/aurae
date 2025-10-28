@@ -167,7 +167,7 @@ impl NestedAuraed {
     }
 
     /// Sends a graceful shutdown signal to the nested process.
-    #[instrument(skip(self))]
+    #[instrument(skip_all)]
     pub fn shutdown(&mut self) -> io::Result<ExitStatus> {
         // TODO: Here, SIGTERM works when using auraescript, but hangs(?) during unit tests.
         //       SIGKILL, however, works. The hang is avoided if the process is not isolated.
@@ -190,15 +190,8 @@ impl NestedAuraed {
         let signal = signal.into();
         let pid = Pid::from_raw(self.process.pid);
 
-        match nix::sys::signal::kill(pid, signal) {
-            Ok(()) => Ok(()),
-            Err(nix::errno::Errno::ESRCH) => {
-                // Process doesn't exist - it's already dead, which is fine
-                debug!("Pid {pid} already gone (ESRCH) when sending signal");
-                Ok(())
-            }
-            Err(e) => Err(io::Error::from_raw_os_error(e as i32)),
-        }
+        nix::sys::signal::kill(pid, signal)
+            .map_err(|e| io::Error::from_raw_os_error(e as i32))
     }
 
     #[instrument(skip_all)]

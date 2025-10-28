@@ -39,8 +39,8 @@ pub(crate) fn init(verbose: bool, container: bool) -> Result<(), LoggingError> {
     // or it's not.
     //
     // Normal mode: Info, Warn, Error
-    // Verbose mode: Debug, Trace, Info, Warn, Error
-    let tracing_level = if verbose { Level::TRACE } else { Level::DEBUG };
+    // Verbose mode: Debug, Info, Warn, Error
+    let tracing_level = if verbose { Level::DEBUG } else { Level::INFO };
 
     if container {
         init_container_logging(tracing_level)
