@@ -77,7 +77,9 @@ impl Executable {
             .kill_on_drop(true)
             .current_dir("/")
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
+            .stderr(Stdio::piped())
+            .process_group(0);
+
         if let Some(uid) = uid {
             command = command.uid(uid);
         }
@@ -143,7 +145,7 @@ impl Executable {
         Ok(match &mut self.state {
             ExecutableState::Init { .. } => None,
             ExecutableState::Started { child, stdout, stderr, .. } => {
-                child.kill().await?;
+                child.start_kill()?;
                 let exit_status = child.wait().await?;
                 let _ = tokio::join!(stdout, stderr);
                 self.state = ExecutableState::Stopped(exit_status);

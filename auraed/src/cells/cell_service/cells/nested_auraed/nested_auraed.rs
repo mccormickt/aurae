@@ -60,21 +60,23 @@ impl NestedAuraed {
             auraed_runtime.auraed.clone().try_into().expect("path to auraed");
         let mut command = Command::new(auraed_path);
 
-        let _ = command.args([
-            "--socket",
-            &socket_path,
-            "--nested", // NOTE: for now, the nested flag only signals for the code in the init module to not trigger (i.e., don't run the pid 1 code, run the non pid 1 code)
-            "--server-crt",
-            &auraed_runtime.server_crt.to_string_lossy(),
-            "--server-key",
-            &auraed_runtime.server_key.to_string_lossy(),
-            "--ca-crt",
-            &auraed_runtime.ca_crt.to_string_lossy(),
-            "--runtime-dir",
-            &auraed_runtime.runtime_dir.to_string_lossy(),
-            "--library-dir",
-            &auraed_runtime.library_dir.to_string_lossy(),
-        ]);
+        let _ = command
+            .args([
+                "--socket",
+                &socket_path,
+                "--nested", // NOTE: for now, the nested flag only signals for the code in the init module to not trigger (i.e., don't run the pid 1 code, run the non pid 1 code)
+                "--server-crt",
+                &auraed_runtime.server_crt.to_string_lossy(),
+                "--server-key",
+                &auraed_runtime.server_key.to_string_lossy(),
+                "--ca-crt",
+                &auraed_runtime.ca_crt.to_string_lossy(),
+                "--runtime-dir",
+                &auraed_runtime.runtime_dir.to_string_lossy(),
+                "--library-dir",
+                &auraed_runtime.library_dir.to_string_lossy(),
+            ])
+            .process_group(0);
 
         // We have a concern that the "command" API make change/break in the future and this
         // test is intended to help safeguard against that!

@@ -277,7 +277,7 @@ pub struct ValidatedExecutable {
     pub name: ExecutableName,
 
     #[field_type(String)]
-    pub command: OsString,
+    pub command: String,
 
     // TODO: `#[validate(none)] is used to skip validation. Actually validate when restrictions are known.
     #[validate(none)]
@@ -289,14 +289,14 @@ impl ExecutableTypeValidator for ExecutableValidator {
         command: String,
         field_name: &str,
         parent_name: Option<&str>,
-    ) -> Result<OsString, ValidationError> {
+    ) -> Result<String, ValidationError> {
         let command = validation::required_not_empty(
             Some(command),
             field_name,
             parent_name,
         )?;
 
-        Ok(OsString::from(command))
+        Ok(command)
     }
 }
 
@@ -305,7 +305,10 @@ impl From<ValidatedExecutable> for super::executables::ExecutableSpec {
         let ValidatedExecutable { name, command, description } = x;
 
         let mut c = Command::new("sh");
-        let _ = c.args([OsString::from("-c"), command]);
+        let _ = c.args([
+            OsString::from("-c"),
+            OsString::from(format!("exec {command}")),
+        ]);
 
         // We are checking that command has an arg to assure ourselves that `command.arg`
         // mutates command, and is not making a clone to return
@@ -518,7 +521,7 @@ mod tests {
             ValidatedExecutable {
                 name: ExecutableName::new(String::from("name")),
                 description: String::from("description"),
-                command: OsString::from("command"),
+                command: String::from("command"),
             },
         );
     }
@@ -543,6 +546,6 @@ mod tests {
             Some("parent"),
         );
         assert!(validated.is_ok());
-        assert_eq!(validated.unwrap(), OsString::from("command"));
+        assert_eq!(validated.unwrap(), String::from("command"));
     }
 }
