@@ -14,7 +14,7 @@
 \* -------------------------------------------------------------------------- */
 use std::collections::HashMap;
 use std::ffi::OsString;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use tracing::warn;
 use walkdir::DirEntryExt;
 use walkdir::WalkDir;
@@ -25,15 +25,15 @@ use walkdir::WalkDir;
 /// we should think if inode wraparound is a potential issue. We could look at
 /// how the Linux inode cache is implemented:
 /// https://elixir.bootlin.com/linux/latest/source/fs/inode.c
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(crate) struct CgroupCache {
     root: OsString,
-    cache: Mutex<HashMap<u64, OsString>>,
+    cache: Arc<Mutex<HashMap<u64, OsString>>>,
 }
 
 impl CgroupCache {
     pub fn new(root: OsString) -> Self {
-        Self { root, cache: Mutex::new(HashMap::new()) }
+        Self { root, cache: Arc::new(Mutex::new(HashMap::new())) }
     }
 
     pub fn get(&self, ino: u64) -> Option<OsString> {

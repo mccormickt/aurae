@@ -16,7 +16,6 @@ use super::{cgroup_cache::CgroupCache, proc_cache::ProcCache};
 use crate::ebpf::tracepoint::PerfEventBroadcast;
 use aurae_ebpf_shared::{HasCgroup, HasHostPid};
 use proto::observe::WorkloadType;
-use std::sync::Arc;
 use tokio::sync::mpsc::{self, Receiver};
 use tonic::Status;
 
@@ -27,8 +26,8 @@ const CGROUPFS_ROOT: &str = "/sys/fs/cgroup";
 pub struct ObservedEventStream<'a, T> {
     source: &'a PerfEventBroadcast<T>,
     workload_filter: Option<(WorkloadType, String)>,
-    proc_cache: Option<Arc<ProcCache>>,
-    cgroup_cache: Arc<CgroupCache>,
+    proc_cache: Option<ProcCache>,
+    cgroup_cache: CgroupCache,
 }
 
 impl<'a, T: HasCgroup + HasHostPid + Clone + Send + Sync + 'static>
@@ -39,7 +38,7 @@ impl<'a, T: HasCgroup + HasHostPid + Clone + Send + Sync + 'static>
             source,
             workload_filter: None,
             proc_cache: None,
-            cgroup_cache: Arc::new(CgroupCache::new(CGROUPFS_ROOT.into())),
+            cgroup_cache: CgroupCache::new(CGROUPFS_ROOT.into()),
         }
     }
 
@@ -51,7 +50,7 @@ impl<'a, T: HasCgroup + HasHostPid + Clone + Send + Sync + 'static>
         self
     }
 
-    pub fn map_pids(&mut self, proc_cache: Arc<ProcCache>) -> &mut Self {
+    pub fn map_pids(&mut self, proc_cache: ProcCache) -> &mut Self {
         self.proc_cache = Some(proc_cache);
         self
     }

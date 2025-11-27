@@ -44,7 +44,7 @@ use std::time::Duration;
 use std::{process::ExitStatus, sync::Arc};
 use tokio::sync::Mutex;
 use tonic::{Code, Request, Response, Status};
-use tracing::{info, trace, warn};
+use tracing::{info, instrument, trace, warn};
 
 /**
  * Macro to perform an operation within a cell.
@@ -58,6 +58,7 @@ macro_rules! do_in_cell {
         let client_socket = cells
             .get(&$cell_name, |cell| cell.client_socket())
             .map_err(CellsServiceError::CellsError)?;
+        drop(cells);
 
         // Initialize the exponential backoff strategy for retrying the operation
         let mut retry_strategy = backoff::ExponentialBackoffBuilder::new()
@@ -297,6 +298,7 @@ impl CellService {
             .stop(&executable_name)
             .await
             .map_err(CellsServiceError::ExecutablesError)?;
+        drop(executables);
 
         // Remove the executable's logs from the observe service.
         if let Err(e) = self
@@ -462,6 +464,7 @@ impl cell_service_server::CellService for CellService {
         Ok(Response::new(self.allocate(request).await?))
     }
 
+    #[instrument(skip(self))]
     async fn free(
         &self,
         request: Request<CellServiceFreeRequest>,
@@ -475,6 +478,7 @@ impl cell_service_server::CellService for CellService {
         Ok(Response::new(self.free(request).await?))
     }
 
+    #[instrument(skip(self))]
     async fn start(
         &self,
         request: Request<CellServiceStartRequest>,
@@ -503,6 +507,7 @@ impl cell_service_server::CellService for CellService {
         }
     }
 
+    #[instrument(skip(self))]
     async fn stop(
         &self,
         request: Request<CellServiceStopRequest>,
@@ -576,7 +581,7 @@ mod tests {
 
         // Create a new instance of CellService for testing
         let service = CellService::new(ObserveService::new(
-            Arc::new(LogChannel::new(String::from("test"))),
+            LogChannel::new(String::from("test")),
             (None, None, None),
         ));
 
@@ -675,7 +680,7 @@ mod tests {
     #[tokio::test]
     async fn start_registers_log_channels_and_returns_uid_gid() {
         let observe_service = ObserveService::new(
-            Arc::new(LogChannel::new(String::from("test"))),
+            LogChannel::new(String::from("test")),
             (None, None, None),
         );
         let service = CellService::new(observe_service.clone());
