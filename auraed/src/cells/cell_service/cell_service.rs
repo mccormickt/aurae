@@ -227,28 +227,20 @@ impl CellService {
             .as_raw();
 
         // Register the stdout log channel for the executable's PID
-        if let Err(e) = self
-            .observe_service
-            .register_sub_process_channel(
-                pid,
-                LogChannelType::Stdout,
-                executable.stdout.clone(),
-            )
-            .await
-        {
+        if let Err(e) = self.observe_service.register_sub_process_channel(
+            pid,
+            LogChannelType::Stdout,
+            executable.stdout.clone(),
+        ) {
             warn!("failed to register stdout channel for pid {pid}: {e}");
         }
 
         // Register the stderr log channel for the executable's PID
-        if let Err(e) = self
-            .observe_service
-            .register_sub_process_channel(
-                pid,
-                LogChannelType::Stderr,
-                executable.stderr.clone(),
-            )
-            .await
-        {
+        if let Err(e) = self.observe_service.register_sub_process_channel(
+            pid,
+            LogChannelType::Stderr,
+            executable.stderr.clone(),
+        ) {
             warn!("failed to register stderr channel for pid {pid}: {e}");
         }
 
@@ -310,14 +302,12 @@ impl CellService {
         if let Err(e) = self
             .observe_service
             .unregister_sub_process_channel(pid, LogChannelType::Stdout)
-            .await
         {
             warn!("failed to unregister stdout channel for pid {pid}: {e}");
         }
         if let Err(e) = self
             .observe_service
             .unregister_sub_process_channel(pid, LogChannelType::Stderr)
-            .await
         {
             warn!("failed to unregister stderr channel for pid {pid}: {e}");
         }
@@ -727,15 +717,13 @@ mod tests {
 
         assert!(
             observe_service
-                .has_sub_process_channel(response.pid, LogChannelType::Stdout)
-                .await,
+                .has_sub_process_channel(response.pid, LogChannelType::Stdout),
             "stdout channel should be registered for pid {}",
             response.pid
         );
         assert!(
             observe_service
-                .has_sub_process_channel(response.pid, LogChannelType::Stderr)
-                .await,
+                .has_sub_process_channel(response.pid, LogChannelType::Stderr),
             "stderr channel should be registered for pid {}",
             response.pid
         );
@@ -752,14 +740,12 @@ mod tests {
 
         assert!(
             !observe_service
-                .has_sub_process_channel(response.pid, LogChannelType::Stdout)
-                .await,
+                .has_sub_process_channel(response.pid, LogChannelType::Stdout),
             "stdout channel should be removed after stop"
         );
         assert!(
             !observe_service
-                .has_sub_process_channel(response.pid, LogChannelType::Stderr)
-                .await,
+                .has_sub_process_channel(response.pid, LogChannelType::Stderr),
             "stderr channel should be removed after stop"
         );
     }

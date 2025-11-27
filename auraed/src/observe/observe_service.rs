@@ -31,19 +31,19 @@ use proto::observe::{
     LogItem, Signal as PosixSignal, WorkloadType, observe_service_server,
 };
 use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use std::{ffi::OsString, sync::Arc};
+use tokio::sync::broadcast::Receiver;
 use tokio::sync::mpsc;
-use tokio::sync::{Mutex, broadcast::Receiver};
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status};
-use tracing::info;
+use tracing::{debug, info, instrument};
 
 #[derive(Debug, Clone)]
 pub struct ObserveService {
     aurae_logger: Arc<LogChannel>,
-    cgroup_cache: Arc<Mutex<CgroupCache>>,
-    proc_cache: Option<Arc<Mutex<ProcCache>>>,
+    cgroup_cache: Arc<CgroupCache>,
+    proc_cache: Option<Arc<ProcCache>>,
     posix_signals: Option<PerfEventBroadcast<Signal>>,
     sub_process_consumer_list:
         Arc<Mutex<HashMap<i32, HashMap<LogChannelType, LogChannel>>>>,
@@ -58,74 +58,66 @@ type PerfEvents = (
 impl ObserveService {
     pub fn new(aurae_logger: Arc<LogChannel>, perf_events: PerfEvents) -> Self {
         let proc_cache = match perf_events {
-            (Some(f), Some(e), _) => {
-                Some(Arc::new(Mutex::new(ProcCache::new(
-                    Duration::from_secs(60),
-                    Duration::from_secs(60),
-                    f,
-                    e,
-                    ProcfsProcessInfo {},
-                ))))
-            }
+            (Some(f), Some(e), _) => Some(Arc::new(ProcCache::new(
+                Duration::from_secs(60),
+                Duration::from_secs(60),
+                f,
+                e,
+                ProcfsProcessInfo {},
+            ))),
             _ => None,
         };
         Self {
             aurae_logger,
-            cgroup_cache: Arc::new(Mutex::new(CgroupCache::new(
-                OsString::from("/sys/fs/cgroup"),
-            ))),
+            cgroup_cache: Arc::new(CgroupCache::new("/sys/fs/cgroup".into())),
             proc_cache,
             posix_signals: perf_events.2,
-            sub_process_consumer_list: Arc::new(Mutex::new(HashMap::new())),
+            sub_process_consumer_list: Default::default(),
         }
     }
 
-    pub async fn register_sub_process_channel(
+    #[instrument(skip(self, channel))]
+    pub fn register_sub_process_channel(
         &self,
         pid: i32,
         channel_type: LogChannelType,
         channel: LogChannel,
     ) -> Result<(), ObserveServiceError> {
         info!("Registering channel for pid {pid} {channel_type:?}");
-        let mut consumer_list = self.sub_process_consumer_list.lock().await;
-        if consumer_list.get(&pid).is_none() {
-            let _ = consumer_list.insert(pid, HashMap::new());
-        }
-        if consumer_list
-            .get(&pid)
-            .expect("pid channels")
-            .get(&channel_type)
-            .is_some()
-        {
+        let mut consumer_list = self
+            .sub_process_consumer_list
+            .lock()
+            .expect("Failed to lock consumer list");
+        let channels = consumer_list.entry(pid).or_default();
+        if channels.contains_key(&channel_type) {
             return Err(ObserveServiceError::ChannelAlreadyRegistered {
                 pid,
                 channel_type,
             });
         }
-        let _ = consumer_list
-            .get_mut(&pid)
-            .expect("pid channels")
-            .insert(channel_type, channel);
+        let _ = channels.insert(channel_type, channel);
         Ok(())
     }
 
-    pub async fn unregister_sub_process_channel(
+    #[instrument(skip(self))]
+    pub fn unregister_sub_process_channel(
         &self,
         pid: i32,
         channel_type: LogChannelType,
     ) -> Result<(), ObserveServiceError> {
         info!("Unregistering for pid {pid} {channel_type:?}");
-        let mut consumer_list = self.sub_process_consumer_list.lock().await;
-        if let Some(channels) = consumer_list.get_mut(&pid) {
-            if channels.remove(&channel_type).is_none() {
-                return Err(ObserveServiceError::ChannelNotRegistered {
-                    pid,
-                    channel_type,
-                });
-            }
-        } else {
-            return Err(ObserveServiceError::NoChannelsForPid { pid });
-        }
+        let mut consumer_list = self
+            .sub_process_consumer_list
+            .lock()
+            .expect("Failed to lock consumer list");
+
+        let channels = consumer_list
+            .get_mut(&pid)
+            .ok_or(ObserveServiceError::NoChannelsForPid { pid })?;
+
+        let _ = channels.remove(&channel_type).ok_or(
+            ObserveServiceError::ChannelNotRegistered { pid, channel_type },
+        )?;
         Ok(())
     }
 
@@ -133,7 +125,7 @@ impl ObserveService {
         self.aurae_logger.subscribe()
     }
 
-    async fn get_posix_signals_stream(
+    fn get_posix_signals_stream(
         &self,
         filter: Option<(WorkloadType, String)>,
     ) -> ReceiverStream<Result<GetPosixSignalsStreamResponse, Status>> {
@@ -160,12 +152,15 @@ fn map_get_posix_signals_stream_response(
 
 #[cfg(test)]
 impl ObserveService {
-    pub async fn has_sub_process_channel(
+    pub fn has_sub_process_channel(
         &self,
         pid: i32,
         channel_type: LogChannelType,
     ) -> bool {
-        let consumer_list = self.sub_process_consumer_list.lock().await;
+        let consumer_list = self
+            .sub_process_consumer_list
+            .lock()
+            .expect("failed to acquire lock");
         consumer_list
             .get(&pid)
             .and_then(|channels| channels.get(&channel_type))
@@ -178,6 +173,7 @@ impl observe_service_server::ObserveService for ObserveService {
     type GetAuraeDaemonLogStreamStream =
         ReceiverStream<Result<GetAuraeDaemonLogStreamResponse, Status>>;
 
+    #[instrument(skip(self))]
     async fn get_aurae_daemon_log_stream(
         &self,
         _request: Request<GetAuraeDaemonLogStreamRequest>,
@@ -208,6 +204,7 @@ impl observe_service_server::ObserveService for ObserveService {
     type GetSubProcessStreamStream =
         ReceiverStream<Result<GetSubProcessStreamResponse, Status>>;
 
+    #[instrument(skip(self))]
     async fn get_sub_process_stream(
         &self,
         request: Request<GetSubProcessStreamRequest>,
@@ -218,11 +215,14 @@ impl observe_service_server::ObserveService for ObserveService {
             })?;
         let pid: i32 = request.get_ref().process_id;
 
-        println!("Requested Channel {channel:?}");
-        println!("Requested Process ID {pid}");
+        debug!("Requested Channel {channel:?}");
+        debug!("Requested Process ID {pid}");
 
         let mut log_consumer = {
-            let mut consumer_list = self.sub_process_consumer_list.lock().await;
+            let mut consumer_list = self
+                .sub_process_consumer_list
+                .lock()
+                .expect("failed to acquire lock");
             consumer_list
                 .get_mut(&pid)
                 .ok_or(ObserveServiceError::NoChannelsForPid { pid })?
@@ -236,7 +236,7 @@ impl observe_service_server::ObserveService for ObserveService {
         .subscribe();
 
         let (tx, rx) =
-            mpsc::channel::<Result<GetSubProcessStreamResponse, Status>>(4);
+            mpsc::channel::<Result<GetSubProcessStreamResponse, Status>>(1024);
 
         // TODO: error handling. Warning: recursively logging if error message is also send to this grpc api endpoint
         //  .. thus disabled logging here.
@@ -259,6 +259,7 @@ impl observe_service_server::ObserveService for ObserveService {
     type GetPosixSignalsStreamStream =
         ReceiverStream<Result<GetPosixSignalsStreamResponse, Status>>;
 
+    #[instrument(skip(self))]
     async fn get_posix_signals_stream(
         &self,
         request: Request<GetPosixSignalsStreamRequest>,
@@ -269,15 +270,9 @@ impl observe_service_server::ObserveService for ObserveService {
             ));
         }
 
-        Ok(Response::new(
-            self.get_posix_signals_stream(
-                request
-                    .into_inner()
-                    .workload
-                    .map(|w| (w.workload_type(), w.id)),
-            )
-            .await,
-        ))
+        Ok(Response::new(self.get_posix_signals_stream(
+            request.into_inner().workload.map(|w| (w.workload_type(), w.id)),
+        )))
     }
 }
 
@@ -288,8 +283,8 @@ mod tests {
     use proto::observe::LogChannelType;
     use std::sync::Arc;
 
-    #[tokio::test]
-    async fn test_register_sub_process_channel_success() {
+    #[test]
+    fn test_register_sub_process_channel_success() {
         let svc = ObserveService::new(
             Arc::new(LogChannel::new(String::from("auraed"))),
             (None, None, None),
@@ -300,15 +295,14 @@ mod tests {
                 LogChannelType::Stdout,
                 LogChannel::new(String::from("foo"))
             )
-            .await
             .is_ok()
         );
 
-        svc.sub_process_consumer_list.lock().await.clear();
+        svc.sub_process_consumer_list.lock().unwrap().clear();
     }
 
-    #[tokio::test]
-    async fn test_register_sub_process_channel_duplicate_error() {
+    #[test]
+    fn test_register_sub_process_channel_duplicate_error() {
         let svc = ObserveService::new(
             Arc::new(LogChannel::new(String::from("auraed"))),
             (None, None, None),
@@ -319,7 +313,6 @@ mod tests {
                 LogChannelType::Stdout,
                 LogChannel::new(String::from("foo"))
             )
-            .await
             .is_ok()
         );
         assert!(
@@ -328,15 +321,14 @@ mod tests {
                 LogChannelType::Stdout,
                 LogChannel::new(String::from("bar"))
             )
-            .await
             .is_err()
         );
 
-        svc.sub_process_consumer_list.lock().await.clear();
+        svc.sub_process_consumer_list.lock().unwrap().clear();
     }
 
-    #[tokio::test]
-    async fn test_unregister_sub_process_channel_success() {
+    #[test]
+    fn test_unregister_sub_process_channel_success() {
         let svc = ObserveService::new(
             Arc::new(LogChannel::new(String::from("auraed"))),
             (None, None, None),
@@ -347,35 +339,32 @@ mod tests {
                 LogChannelType::Stdout,
                 LogChannel::new(String::from("foo"))
             )
-            .await
             .is_ok()
         );
         assert!(
             svc.unregister_sub_process_channel(42, LogChannelType::Stdout)
-                .await
                 .is_ok()
         );
 
-        svc.sub_process_consumer_list.lock().await.clear();
+        svc.sub_process_consumer_list.lock().unwrap().clear();
     }
 
-    #[tokio::test]
-    async fn test_unregister_sub_process_channel_no_pid_error() {
+    #[test]
+    fn test_unregister_sub_process_channel_no_pid_error() {
         let svc = ObserveService::new(
             Arc::new(LogChannel::new(String::from("auraed"))),
             (None, None, None),
         );
         assert!(
             svc.unregister_sub_process_channel(42, LogChannelType::Stdout)
-                .await
                 .is_err()
         );
 
-        svc.sub_process_consumer_list.lock().await.clear();
+        svc.sub_process_consumer_list.lock().unwrap().clear();
     }
 
-    #[tokio::test]
-    async fn test_unregister_sub_process_channel_no_channel_type_error() {
+    #[test]
+    fn test_unregister_sub_process_channel_no_channel_type_error() {
         let svc = ObserveService::new(
             Arc::new(LogChannel::new(String::from("auraed"))),
             (None, None, None),
@@ -386,15 +375,13 @@ mod tests {
                 LogChannelType::Stdout,
                 LogChannel::new(String::from("foo"))
             )
-            .await
             .is_ok()
         );
         assert!(
             svc.unregister_sub_process_channel(42, LogChannelType::Stderr)
-                .await
                 .is_err()
         );
 
-        svc.sub_process_consumer_list.lock().await.clear();
+        svc.sub_process_consumer_list.lock().unwrap().clear();
     }
 }
