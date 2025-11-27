@@ -12,37 +12,9 @@
  * Copyright 2022 - 2024, the aurae contributors                              *
  * SPDX-License-Identifier: Apache-2.0                                        *
 \* -------------------------------------------------------------------------- */
-/* -------------------------------------------------------------------------- *\
- *          Apache 2.0 License Copyright © 2022-2023 The Aurae Authors        *
- *                                                                            *
- *                +--------------------------------------------+              *
- *                |   █████╗ ██╗   ██╗██████╗  █████╗ ███████╗ |              *
- *                |  ██╔══██╗██║   ██║██╔══██╗██╔══██╗██╔════╝ |              *
- *                |  ███████║██║   ██║██████╔╝███████║█████╗   |              *
- *                |  ██╔══██║██║   ██║██╔══██╗██╔══██║██╔══╝   |              *
- *                |  ██║  ██║╚██████╔╝██║  ██║██║  ██║███████╗ |              *
- *                |  ╚═╝  ╚═╝ ╚═════╝ ╚═╝  ╚═╝╚═╝  ╚═╝╚══════╝ |              *
- *                +--------------------------------------------+              *
- *                                                                            *
- *                         Distributed Systems Runtime                        *
- *                                                                            *
- * -------------------------------------------------------------------------- *
- *                                                                            *
- *   Licensed under the Apache License, Version 2.0 (the "License");          *
- *   you may not use this file except in compliance with the License.         *
- *   You may obtain a copy of the License at                                  *
- *                                                                            *
- *       http://www.apache.org/licenses/LICENSE-2.0                           *
- *                                                                            *
- *   Unless required by applicable law or agreed to in writing, software      *
- *   distributed under the License is distributed on an "AS IS" BASIS,        *
- *   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. *
- *   See the License for the specific language governing permissions and      *
- *   limitations under the License.                                           *
- *                                                                            *
-\* -------------------------------------------------------------------------- */
 use std::collections::HashMap;
 use std::ffi::OsString;
+use std::sync::Mutex;
 use tracing::warn;
 use walkdir::DirEntryExt;
 use walkdir::WalkDir;
@@ -56,27 +28,30 @@ use walkdir::WalkDir;
 #[derive(Debug)]
 pub(crate) struct CgroupCache {
     root: OsString,
-    cache: HashMap<u64, OsString>,
+    cache: Mutex<HashMap<u64, OsString>>,
 }
 
 impl CgroupCache {
     pub fn new(root: OsString) -> Self {
-        Self { root, cache: HashMap::new() }
+        Self { root, cache: Mutex::new(HashMap::new()) }
     }
 
-    pub fn get(&mut self, ino: u64) -> Option<OsString> {
-        if let Some(path) = self.cache.get(&ino) {
+    pub fn get(&self, ino: u64) -> Option<OsString> {
+        let cache = self.cache.lock().expect("Failed to lock cache");
+        if let Some(path) = cache.get(&ino) {
             Some(path.clone())
         } else {
             self.refresh_cache();
-            self.cache.get(&ino).cloned()
+            cache.get(&ino).cloned()
         }
     }
 
-    fn refresh_cache(&mut self) {
+    fn refresh_cache(&self) {
         WalkDir::new(&self.root).into_iter().for_each(|res| match res {
             Ok(dir_entry) => {
-                _ = self.cache.insert(dir_entry.ino(), dir_entry.path().into());
+                let mut cache =
+                    self.cache.lock().expect("Failed to lock cache");
+                _ = cache.insert(dir_entry.ino(), dir_entry.path().into());
             }
             Err(e) => {
                 warn!("could not read from {:?}: {}", self.root, e);
@@ -95,14 +70,14 @@ mod test {
 
     #[test]
     fn get_must_return_none_when_file_doesnt_exist() {
-        let mut cache = CgroupCache::new(OsString::from("/tmp"));
+        let cache = CgroupCache::new(OsString::from("/tmp"));
 
         assert_eq!(cache.get(123), None);
     }
 
     #[test]
     fn get_must_return_file_for_ino() {
-        let mut cache = CgroupCache::new(OsString::from("/tmp"));
+        let cache = CgroupCache::new(OsString::from("/tmp"));
 
         let file_name1 = uuid::Uuid::new_v4().to_string();
         let ino1 = create_file(&OsString::from(&file_name1));

@@ -12,45 +12,14 @@
  * Copyright 2022 - 2024, the aurae contributors                              *
  * SPDX-License-Identifier: Apache-2.0                                        *
 \* -------------------------------------------------------------------------- */
-/* -------------------------------------------------------------------------- *\
- *          Apache 2.0 License Copyright © 2022-2023 The Aurae Authors        *
- *                                                                            *
- *                +--------------------------------------------+              *
- *                |   █████╗ ██╗   ██╗██████╗  █████╗ ███████╗ |              *
- *                |  ██╔══██╗██║   ██║██╔══██╗██╔══██╗██╔════╝ |              *
- *                |  ███████║██║   ██║██████╔╝███████║█████╗   |              *
- *                |  ██╔══██║██║   ██║██╔══██╗██╔══██║██╔══╝   |              *
- *                |  ██║  ██║╚██████╔╝██║  ██║██║  ██║███████╗ |              *
- *                |  ╚═╝  ╚═╝ ╚═════╝ ╚═╝  ╚═╝╚═╝  ╚═╝╚══════╝ |              *
- *                +--------------------------------------------+              *
- *                                                                            *
- *                         Distributed Systems Runtime                        *
- *                                                                            *
- * -------------------------------------------------------------------------- *
- *                                                                            *
- *   Licensed under the Apache License, Version 2.0 (the "License");          *
- *   you may not use this file except in compliance with the License.         *
- *   You may obtain a copy of the License at                                  *
- *                                                                            *
- *       http://www.apache.org/licenses/LICENSE-2.0                           *
- *                                                                            *
- *   Unless required by applicable law or agreed to in writing, software      *
- *   distributed under the License is distributed on an "AS IS" BASIS,        *
- *   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. *
- *   See the License for the specific language governing permissions and      *
- *   limitations under the License.                                           *
- *                                                                            *
-\* -------------------------------------------------------------------------- */
-
 use crate::ebpf::tracepoint::PerfEventBroadcast;
 use aurae_ebpf_shared::{ForkedProcess, ProcessExit};
 use std::time::SystemTime;
 use std::{
     collections::{HashMap, VecDeque},
-    sync::Arc,
+    sync::{Arc, Mutex},
     time::Duration,
 };
-use tokio::sync::Mutex;
 
 #[cfg(not(test))]
 pub fn now() -> SystemTime {
@@ -122,8 +91,9 @@ impl ProcCache {
         let _ignored = tokio::spawn(async move {
             while let Ok(e) = process_fork_rx.recv().await {
                 if let Some(nspid) = proc_info.get_nspid(e.child_pid) {
-                    let mut guard =
-                        cache_for_fork_event_processing.lock().await;
+                    let mut guard = cache_for_fork_event_processing
+                        .lock()
+                        .expect("Failed to lock cache");
                     let _ = guard.insert(e.child_pid, nspid);
                 }
             }
@@ -134,8 +104,9 @@ impl ProcCache {
             res.eviction_queue.clone();
         let _ignored = tokio::spawn(async move {
             while let Ok(e) = process_exit_rx.recv().await {
-                let mut guard =
-                    eviction_queue_for_exit_event_processing.lock().await;
+                let mut guard = eviction_queue_for_exit_event_processing
+                    .lock()
+                    .expect("Failed to lock eviction queue");
                 guard.push_back(Eviction {
                     pid: e.pid,
                     evict_at: now()
@@ -148,23 +119,24 @@ impl ProcCache {
         res
     }
 
-    pub async fn get(&self, pid: i32) -> Option<i32> {
+    pub fn get(&self, pid: i32) -> Option<i32> {
         if self
             .last_eviction
             .checked_add(self.evict_every)
             .expect("SystemTime overflow")
             <= now()
         {
-            self.evict_expired().await;
+            self.evict_expired();
         }
 
-        let guard = self.cache.lock().await;
+        let guard = self.cache.lock().expect("Failed to lock cache");
         guard.get(&pid).copied()
     }
 
-    async fn evict_expired(&self) {
+    fn evict_expired(&self) {
         let now = now();
-        let mut queue_guard = self.eviction_queue.lock().await;
+        let mut queue_guard =
+            self.eviction_queue.lock().expect("Failed to lock eviction queue");
         let mut evict = Vec::with_capacity(64);
         while let Some(_v) = queue_guard.front().filter(|v| v.evict_at <= now) {
             evict.push(queue_guard.pop_front().expect(
@@ -172,15 +144,16 @@ impl ProcCache {
             ))
         }
         drop(queue_guard);
-        let mut cache_guard = self.cache.lock().await;
+        let mut cache_guard = self.cache.lock().expect("Failed to lock cache");
         for e in evict {
             _ = cache_guard.remove(&e.pid);
         }
     }
 
     #[cfg(test)]
-    async fn eviction_queue(&self) -> VecDeque<Eviction> {
-        let guard = self.eviction_queue.lock().await;
+    fn eviction_queue(&self) -> VecDeque<Eviction> {
+        let guard =
+            self.eviction_queue.lock().expect("Failed to lock eviction queue");
         guard.clone()
     }
 }
@@ -191,8 +164,7 @@ mod test {
     use crate::ebpf::tracepoint::PerfEventBroadcast;
     use crate::observe::proc_cache::ForkedProcess;
     use serial_test::serial;
-    use test_helpers::assert_eventually_eq;
-    use test_helpers::mock_time;
+    use test_helpers::{assert_eventually_eq, mock_time};
     use tokio::sync::broadcast::{Sender, channel};
 
     struct TestProcessInfo {
@@ -223,7 +195,7 @@ mod test {
             vec![],
         );
 
-        assert_eq!(cache.get(123).await, None);
+        assert_eq!(cache.get(123), None);
     }
 
     #[tokio::test]
@@ -239,7 +211,7 @@ mod test {
             .send(ForkedProcess { parent_pid: 1, child_pid: 42 })
             .expect("error sending msg");
 
-        assert_eventually_eq!(cache.get(42).await, Some(2));
+        assert_eventually_eq!(cache.get(42), Some(2));
     }
 
     #[tokio::test]
@@ -258,14 +230,14 @@ mod test {
 
         let _ = exit_tx.send(ProcessExit { pid: 42 });
         // Wait for process to be cached
-        assert_eventually_eq!(cache.get(42).await, Some(2));
+        assert_eventually_eq!(cache.get(42), Some(2));
 
         mock_time::advance_time(Duration::from_secs(5));
 
         let _ = exit_tx.send(ProcessExit { pid: 44 });
 
         assert_eventually_eq!(
-            cache.eviction_queue().await,
+            cache.eviction_queue(),
             vec![
                 Eviction { pid: 42, evict_at: seconds_after_unix_epoch(5) },
                 Eviction { pid: 44, evict_at: seconds_after_unix_epoch(10) }
@@ -290,7 +262,7 @@ mod test {
 
         let _ = exit_tx.send(ProcessExit { pid: 42 });
         assert_eventually_eq!(
-            cache.eviction_queue().await,
+            cache.eviction_queue(),
             vec![Eviction { pid: 42, evict_at: seconds_after_unix_epoch(5) }],
         );
 
@@ -298,7 +270,7 @@ mod test {
 
         let _ = exit_tx.send(ProcessExit { pid: 44 });
         assert_eventually_eq!(
-            cache.eviction_queue().await,
+            cache.eviction_queue(),
             vec![
                 Eviction { pid: 42, evict_at: seconds_after_unix_epoch(5) }, // T(event) = 0 -> T(evict) = 5
                 Eviction { pid: 44, evict_at: seconds_after_unix_epoch(7) }, // T(event) = 2 -> T(evict) = 7
@@ -310,7 +282,7 @@ mod test {
         let _ = exit_tx.send(ProcessExit { pid: 45 });
 
         assert_eventually_eq!(
-            cache.eviction_queue().await,
+            cache.eviction_queue(),
             vec![
                 Eviction { pid: 42, evict_at: seconds_after_unix_epoch(5) }, // T(event) = 0 -> T(evict) = 5
                 Eviction { pid: 44, evict_at: seconds_after_unix_epoch(7) }, // T(event) = 2 -> T(evict) = 7
@@ -318,10 +290,10 @@ mod test {
             ],
         );
 
-        assert_eq!(cache.get(42).await, None); // expired
-        assert_eq!(cache.get(43).await, Some(3)); // never exited
-        assert_eq!(cache.get(44).await, None); // expired
-        assert_eq!(cache.get(45).await, Some(5)); // still queued for eviction
+        assert_eq!(cache.get(42), None); // expired
+        assert_eq!(cache.get(43), Some(3)); // never exited
+        assert_eq!(cache.get(44), None); // expired
+        assert_eq!(cache.get(45), Some(5)); // still queued for eviction
     }
 
     #[tokio::test]
@@ -334,21 +306,21 @@ mod test {
             vec![(42, 2), (43, 3), (44, 4), (45, 5)],
         );
 
-        let _ = cache.get(1).await; // trigger eviction
+        let _ = cache.get(1); // trigger eviction
         let _ = fork_tx.send(ForkedProcess { parent_pid: 1, child_pid: 42 }); // register process
         let _ = exit_tx.send(ProcessExit { pid: 42 }); // schedule for eviction
 
         assert_eventually_eq!(
-            cache.eviction_queue().await,
+            cache.eviction_queue(),
             vec![Eviction { pid: 42, evict_at: seconds_after_unix_epoch(5) }],
         );
 
         mock_time::advance_time(Duration::from_secs(6)); // advance time beyond eviction time but within the evict interval
 
-        let _ = cache.get(1).await; // trigger a second eviction withiin the evict interval
+        let _ = cache.get(1); // trigger a second eviction withiin the evict interval
 
         assert_eventually_eq!(
-            cache.eviction_queue().await,
+            cache.eviction_queue(),
             vec![Eviction { pid: 42, evict_at: seconds_after_unix_epoch(5) }]
         ); // assert that eviction didn't happen yet
     }
