@@ -174,7 +174,11 @@ message CellServiceStopRequest {
 
 message CellServiceStopResponse {}
 
-message CellServiceListRequest {}
+message CellServiceListRequest {
+  // Optional target for listing cells. Enables listing cells across VMs,
+  // nested cells, and combinations. If not set, lists local cells.
+  optional aurae.common.v0.ExecutionTarget execution_target = 1;
+}
 
 message CellServiceListResponse {
   repeated CellGraphNode cells = 1;

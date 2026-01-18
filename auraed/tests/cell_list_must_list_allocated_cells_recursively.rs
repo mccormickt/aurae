@@ -74,9 +74,11 @@ async fn cells_list_must_list_allocated_cells_recursively() {
     .cell_name;
 
     // List all cells
-    let list_response = retry!(client.list(CellServiceListRequest {}).await)
-        .unwrap()
-        .into_inner();
+    let list_response = retry!(
+        client.list(CellServiceListRequest { execution_target: None }).await
+    )
+    .unwrap()
+    .into_inner();
 
     // The expected response
     let mut expected = CellServiceListResponse {
