@@ -1,0 +1,56 @@
+/* -------------------------------------------------------------------------- *\
+ *        Apache 2.0 License Copyright © 2022-2023 The Aurae Authors          *
+ *                                                                            *
+ *                +--------------------------------------------+              *
+ *                |   █████╗ ██╗   ██╗██████╗  █████╗ ███████╗ |              *
+ *                |  ██╔══██╗██║   ██║██╔══██╗██╔══██╗██╔════╝ |              *
+ *                |  ███████║██║   ██║██████╔╝███████║█████╗   |              *
+ *                |  ██╔══██║██║   ██║██╔══██╗██╔══██║██╔══╝   |              *
+ *                |  ██║  ██║╚██████╔╝██║  ██║██║  ██║███████╗ |              *
+ *                |  ╚═╝  ╚═╝ ╚═════╝ ╚═╝  ╚═╝╚═╝  ╚═╝╚══════╝ |              *
+ *                +--------------------------------------------+              *
+ *                                                                            *
+ *                         Distributed Systems Runtime                        *
+ *                                                                            *
+ * -------------------------------------------------------------------------- *
+ *                                                                            *
+ *   Licensed under the Apache License, Version 2.0 (the "License");          *
+ *   you may not use this file except in compliance with the License.         *
+ *   You may obtain a copy of the License at                                  *
+ *                                                                            *
+ *       http://www.apache.org/licenses/LICENSE-2.0                           *
+ *                                                                            *
+ *   Unless required by applicable law or agreed to in writing, software      *
+ *   distributed under the License is distributed on an "AS IS" BASIS,        *
+ *   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. *
+ *   See the License for the specific language governing permissions and      *
+ *   limitations under the License.                                           *
+ *                                                                            *
+\* -------------------------------------------------------------------------- */
+
+syntax = "proto3";
+
+package aurae.common.v0;
+
+option go_package = "github.com/aurae-runtime/ae/client/pkg/api/v0/common;commonv0";
+
+// ExecutionTarget specifies where a workload should be executed.
+// This enables unified routing across cells, VMs, and nested combinations.
+//
+// The target is resolved in order:
+// 1. If vm_id is set, the request is forwarded to the auraed inside the VM
+// 2. If cell_path is set, the request is forwarded to the nested cell
+// 3. If neither is set, execution happens locally
+//
+// When both vm_id and cell_path are set, the request is first forwarded
+// to the VM, then to the cell within that VM.
+message ExecutionTarget {
+  // VM to target. If set, request forwards to auraed inside this VM first.
+  // The VM must already be started and have an auraed address available.
+  optional string vm_id = 1;
+
+  // Cell path relative to the current context. Supports hierarchical naming
+  // (e.g., "parent/child/grandchild"). If vm_id is also set, the path is
+  // relative to the VM's auraed; otherwise, it's relative to the local auraed.
+  optional string cell_path = 2;
+}

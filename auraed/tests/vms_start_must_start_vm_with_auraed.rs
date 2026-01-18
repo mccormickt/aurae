@@ -130,6 +130,7 @@ async fn vms_with_auraed() {
         CellServiceStopRequest {
             cell_name: Some(cell_name.clone()),
             executable_name: "sleeper".into(),
+            execution_target: None,
         },
     )
     .await
@@ -137,7 +138,7 @@ async fn vms_with_auraed() {
 
     CellServiceClient::free(
         &remote_client,
-        CellServiceFreeRequest { cell_name },
+        CellServiceFreeRequest { cell_name, parent_target: None },
     )
     .await
     .expect("failed to free cell");

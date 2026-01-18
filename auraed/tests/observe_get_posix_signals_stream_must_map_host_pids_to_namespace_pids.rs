@@ -79,6 +79,7 @@ async fn observe_get_posix_signal_stream_must_map_host_pids_to_namespace_pids()
             .stop(CellServiceStopRequest {
                 cell_name: Some(cell_name.clone()),
                 executable_name: exe_name.clone(),
+                execution_target: None,
             })
             .await
     );

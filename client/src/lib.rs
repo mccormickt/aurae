@@ -13,7 +13,9 @@
  * SPDX-License-Identifier: Apache-2.0                                        *
 \* -------------------------------------------------------------------------- */
 pub use crate::client::{Client, ClientError};
-pub use config::{AuraeConfig, AuraeSocket, AuthConfig, SystemConfig};
+pub use config::{
+    AuraeConfig, AuraeSocket, AuthConfig, CertMaterial, SystemConfig,
+};
 
 pub mod cells;
 mod client;

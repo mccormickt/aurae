@@ -23,7 +23,17 @@
 #![allow(clippy::doc_overindented_list_items)]
 
 pub mod cells {
-    include!("../gen/aurae.cells.v0.rs");
+    pub mod v0 {
+        include!("../gen/aurae.cells.v0.rs");
+    }
+    pub use v0::*;
+}
+
+pub mod common {
+    pub mod v0 {
+        include!("../gen/aurae.common.v0.rs");
+    }
+    pub use v0::*;
 }
 
 pub mod discovery {

@@ -32,6 +32,8 @@ syntax = "proto3";
 
 package aurae.cells.v0;
 
+import "v0/common/execution_target.proto";
+
 option go_package = "github.com/aurae-runtime/ae/client/pkg/api/v0/cells;cellsv0";
 
 // Cells
@@ -96,6 +98,11 @@ service CellService {
 message CellServiceAllocateRequest {
   // A smaller resource constrained section of the system.
   Cell cell = 1;
+
+  // Parent target where the cell should be created. If set, the cell will be
+  // created in the specified VM or nested cell. If not set, the cell is
+  // created locally.
+  optional aurae.common.v0.ExecutionTarget parent_target = 2;
 }
 
 // The response after a cell has been allocated.
@@ -110,6 +117,10 @@ message CellServiceAllocateResponse {
 // Used to remove or free a cell after it has been allocated.
 message CellServiceFreeRequest {
   string cell_name = 1;
+
+  // Parent target where the cell exists. If set, the cell will be freed in
+  // the specified VM or nested cell. If not set, the cell is freed locally.
+  optional aurae.common.v0.ExecutionTarget parent_target = 2;
 }
 
 // Response after removing or freeing a cell.
@@ -121,10 +132,17 @@ message CellServiceFreeResponse {}
 // Here you can define shell commands, and meta information about the command.
 // An executable is started synchronously.
 message CellServiceStartRequest {
+  // Deprecated: Use execution_target.cell_path instead for new code.
+  // Retained for backward compatibility.
   optional string cell_name = 1;
   Executable executable = 2;
   optional uint32 uid = 3;
   optional uint32 gid = 4;
+
+  // Target for execution routing. Enables workload execution across cells,
+  // VMs, and nested combinations. If not set, falls back to cell_name for
+  // backward compatibility.
+  optional aurae.common.v0.ExecutionTarget execution_target = 5;
 }
 
 // The response after starting an executable within a Cell.
@@ -143,8 +161,15 @@ message CellServiceStartResponse {
 
 // Request to stop an executable at runtime.
 message CellServiceStopRequest {
+  // Deprecated: Use execution_target.cell_path instead for new code.
+  // Retained for backward compatibility.
   optional string cell_name = 1;
   string executable_name = 2;
+
+  // Target for execution routing. Enables workload execution across cells,
+  // VMs, and nested combinations. If not set, falls back to cell_name for
+  // backward compatibility.
+  optional aurae.common.v0.ExecutionTarget execution_target = 3;
 }
 
 message CellServiceStopResponse {}
