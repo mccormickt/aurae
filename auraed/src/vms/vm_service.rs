@@ -206,6 +206,23 @@ impl VmService {
         }
         Ok(())
     }
+
+    /// Get the socket address for connecting to auraed inside a VM.
+    ///
+    /// This is used by CellService to forward requests to VMs.
+    ///
+    /// # Arguments
+    /// * `vm_id` - The ID of the VM to get the socket for
+    ///
+    /// # Returns
+    /// The socket address if the VM exists and is running, None otherwise.
+    pub async fn get_vm_socket(
+        &self,
+        vm_id: &str,
+    ) -> Option<std::net::SocketAddr> {
+        let vms = self.vms.lock().await;
+        vms.get_socket(vm_id)
+    }
 }
 
 #[tonic::async_trait]

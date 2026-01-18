@@ -252,7 +252,16 @@ pub async fn run(
         let observe_service_server =
             ObserveServiceServer::new(observe_service.clone());
 
-        let cell_service = CellService::new(observe_service.clone());
+        // Create VmService first so it can be shared with CellService
+        let vm_service = VmService::new();
+        let vm_service_server = VmServiceServer::new(vm_service.clone());
+        health_reporter.set_serving::<VmServiceServer<VmService>>().await;
+
+        // Create CellService with VmService reference for VM target support
+        let cell_service = CellService::new_with_vm_service(
+            observe_service.clone(),
+            vm_service.clone(),
+        );
         let cell_service_server = CellServiceServer::new(cell_service.clone());
         health_reporter.set_serving::<CellServiceServer<CellService>>().await;
 
@@ -276,10 +285,6 @@ pub async fn run(
         health_reporter
             .set_serving::<RuntimeServiceServer<RuntimeService>>()
             .await;
-
-        let vm_service = VmService::new();
-        let vm_service_server = VmServiceServer::new(vm_service.clone());
-        health_reporter.set_serving::<VmServiceServer<VmService>>().await;
 
         let graceful_shutdown = graceful_shutdown::GracefulShutdown::new(
             health_reporter,

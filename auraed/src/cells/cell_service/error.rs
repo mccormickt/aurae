@@ -34,6 +34,12 @@ pub(crate) enum CellsServiceError {
     ClientError(#[from] ClientError),
     #[error(transparent)]
     ObserveServiceError(#[from] ObserveServiceError),
+    #[error("VM not found: {vm_id}")]
+    VmNotFound { vm_id: String },
+    #[error("VM not running or no auraed address available: {vm_id}")]
+    VmNotRunning { vm_id: String },
+    #[error("{0}")]
+    Other(String),
 }
 
 impl From<CellsServiceError> for Status {
@@ -77,6 +83,11 @@ impl From<CellsServiceError> for Status {
                 ClientError::Other(_) => Status::unknown(msg),
             },
             CellsServiceError::ObserveServiceError(e) => e.into(),
+            CellsServiceError::VmNotFound { .. } => Status::not_found(msg),
+            CellsServiceError::VmNotRunning { .. } => {
+                Status::failed_precondition(msg)
+            }
+            CellsServiceError::Other(_) => Status::internal(msg),
         }
     }
 }

@@ -21,10 +21,13 @@ use super::cells::{
 };
 use super::executables::ExecutableName;
 use crate::cells::cell_service::cells::CellName;
-use proto::cells::{
-    Cell, CellServiceAllocateRequest, CellServiceFreeRequest,
-    CellServiceStartRequest, CellServiceStopRequest, CpuController,
-    CpusetController, Executable, MemoryController,
+use proto::{
+    cells::{
+        Cell, CellServiceAllocateRequest, CellServiceFreeRequest,
+        CellServiceStartRequest, CellServiceStopRequest, CpuController,
+        CpusetController, Executable, MemoryController,
+    },
+    common::ExecutionTarget,
 };
 use std::ffi::OsString;
 use tokio::process::Command;
@@ -40,6 +43,8 @@ use validation_macros::ValidatedType;
 pub struct ValidatedCellServiceAllocateRequest {
     #[field_type(Option<Cell>)]
     pub cell: ValidatedCell,
+    #[validate(none)]
+    pub parent_target: Option<ExecutionTarget>,
 }
 
 impl CellServiceAllocateRequestTypeValidator
@@ -226,6 +231,8 @@ pub struct ValidatedCellServiceFreeRequest {
     #[field_type(String)]
     #[validate]
     pub cell_name: CellName,
+    #[validate(none)]
+    pub parent_target: Option<ExecutionTarget>,
 }
 
 impl CellServiceFreeRequestTypeValidator for CellServiceFreeRequestValidator {}
@@ -241,6 +248,8 @@ pub struct ValidatedCellServiceStartRequest {
     pub uid: Option<u32>,
     #[validate(none)]
     pub gid: Option<u32>,
+    #[validate(none)]
+    pub execution_target: Option<ExecutionTarget>,
 }
 
 impl CellServiceStartRequestTypeValidator for CellServiceStartRequestValidator {
@@ -266,6 +275,8 @@ pub struct ValidatedCellServiceStopRequest {
     #[field_type(String)]
     #[validate]
     pub executable_name: ExecutableName,
+    #[validate(none)]
+    pub execution_target: Option<ExecutionTarget>,
 }
 
 impl CellServiceStopRequestTypeValidator for CellServiceStopRequestValidator {}

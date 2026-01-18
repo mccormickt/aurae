@@ -139,4 +139,14 @@ impl VirtualMachines {
     pub fn list(&self) -> Vec<VirtualMachine> {
         self.cache.values().cloned().collect()
     }
+
+    /// Get the socket address for a VM by its ID.
+    ///
+    /// Returns the TAP device socket address for connecting to auraed inside the VM.
+    /// Returns None if the VM doesn't exist or doesn't have a TAP address yet
+    /// (e.g., VM not started).
+    pub fn get_socket(&self, vm_id: &str) -> Option<std::net::SocketAddr> {
+        let id = VmID::new(vm_id);
+        self.cache.get(&id).and_then(|vm| vm.tap())
+    }
 }

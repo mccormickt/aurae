@@ -129,6 +129,7 @@ async fn observe_get_posix_signal_stream_must_get_posix_signals_for_a_nested_cel
             .stop(CellServiceStopRequest {
                 cell_name: Some(cell1_name.clone()),
                 executable_name: exe1_name.clone(),
+                execution_target: None,
             })
             .await
     );
@@ -139,6 +140,7 @@ async fn observe_get_posix_signal_stream_must_get_posix_signals_for_a_nested_cel
             .stop(CellServiceStopRequest {
                 cell_name: Some(nested_cell_name.clone()),
                 executable_name: nested_exe_name.clone(),
+                execution_target: None,
             })
             .await
     );
@@ -149,6 +151,7 @@ async fn observe_get_posix_signal_stream_must_get_posix_signals_for_a_nested_cel
             .stop(CellServiceStopRequest {
                 cell_name: Some(cell2_name.clone()),
                 executable_name: exe2_name.clone(),
+                execution_target: None,
             })
             .await
     );

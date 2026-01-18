@@ -86,6 +86,38 @@ impl Client {
         Ok(Self { channel, client_cert_details })
     }
 
+    /// Create a new Client with TLS using provided certificate material.
+    ///
+    /// This is useful for connecting to auraed inside VMs where the socket
+    /// address differs from the default config but TLS is still required.
+    ///
+    /// # Arguments
+    /// * `socket` - The socket address to connect to (e.g., VM's auraed address)
+    /// * `cert_material` - The TLS certificate material for mTLS authentication
+    ///
+    /// Note: A new client is required for every independent execution of this process.
+    pub async fn new_with_tls(
+        socket: AuraeSocket,
+        cert_material: &CertMaterial,
+    ) -> Result<Self> {
+        let client_cert_details =
+            Some(cert_material.get_client_cert_details()?);
+
+        let tls_config = ClientTlsConfig::new()
+            // TODO: get this from the config or the cert information somehow
+            .domain_name("server.unsafe.aurae.io")
+            .ca_certificate(Certificate::from_pem(
+                cert_material.server_root_ca_cert.clone(),
+            ))
+            .identity(Identity::from_pem(
+                cert_material.client_cert.clone(),
+                cert_material.client_key.clone(),
+            ));
+
+        let channel = Self::connect_chan(socket, Some(tls_config)).await?;
+        Ok(Self { channel, client_cert_details })
+    }
+
     async fn connect_chan(
         socket: AuraeSocket,
         tls_config: Option<ClientTlsConfig>,

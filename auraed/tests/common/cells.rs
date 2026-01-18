@@ -79,7 +79,10 @@ impl CellServiceAllocateRequestBuilder {
     }
 
     pub fn build(&self) -> CellServiceAllocateRequest {
-        CellServiceAllocateRequest { cell: Some(self.cell_builder.build()) }
+        CellServiceAllocateRequest {
+            cell: Some(self.cell_builder.build()),
+            parent_target: None,
+        }
     }
 }
 
@@ -156,6 +159,7 @@ impl CellServiceStartRequestBuilder {
             executable: Some(self.executable_builder.build()),
             uid: self.uid,
             gid: self.gid,
+            execution_target: None,
         }
     }
 }

@@ -98,6 +98,7 @@ async fn observe_get_posix_signal_stream_must_get_posix_signals_for_a_cell() {
             .stop(CellServiceStopRequest {
                 cell_name: Some(cell1_name.clone()),
                 executable_name: exe1_name.clone(),
+                execution_target: None,
             })
             .await
     );
@@ -108,6 +109,7 @@ async fn observe_get_posix_signal_stream_must_get_posix_signals_for_a_cell() {
             .stop(CellServiceStopRequest {
                 cell_name: Some(cell2_name.clone()),
                 executable_name: exe2_name.clone(),
+                execution_target: None,
             })
             .await
     );

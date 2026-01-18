@@ -23,10 +23,16 @@ use super::{
         ValidatedCellServiceStartRequest, ValidatedCellServiceStopRequest,
     },
 };
-use crate::{cells::cell_service::cells::CellsError, observe::ObserveService};
-use ::validation::ValidatedType;
+use crate::{
+    cells::cell_service::cells::CellsError, observe::ObserveService,
+    vms::VmService,
+};
+use ::validation::{ValidatedField, ValidatedType};
 use backoff::backoff::Backoff;
-use client::{Client, ClientError, cells::cell_service::CellServiceClient};
+use client::{
+    AuraeSocket, CertMaterial, Client, ClientError,
+    cells::cell_service::CellServiceClient,
+};
 use proto::{
     cells::{
         Cell, CellGraphNode, CellServiceAllocateRequest,
@@ -37,6 +43,7 @@ use proto::{
         CellServiceStopResponse, CpuController, CpusetController,
         MemoryController, cell_service_server,
     },
+    common::ExecutionTarget,
     observe::LogChannelType,
 };
 use std::os::unix::fs::MetadataExt;
@@ -104,12 +111,141 @@ macro_rules! do_in_cell {
     }};
 }
 
+/// Result of resolving an execution target.
+#[derive(Debug)]
+pub enum ResolvedTarget {
+    /// Target is local - execute directly without forwarding.
+    Local,
+    /// Target is a cell - forward via Unix socket (no TLS).
+    Cell { socket: AuraeSocket },
+    /// Target is a VM - forward via network socket with TLS.
+    Vm { socket: AuraeSocket, cell_path: Option<String> },
+}
+
+/// Macro to perform an operation within a target (VM or cell).
+/// It resolves the target, creates the appropriate client, and retries
+/// the operation with an exponential backoff strategy in case of connection errors.
+macro_rules! do_in_target {
+    ($self:ident, $target:expr, $function:ident, $request:ident, $transform_request:expr) => {{
+        let resolved = $self.resolve_target($target).await?;
+
+        match resolved {
+            ResolvedTarget::Local => {
+                // This shouldn't happen - caller should check for local target
+                Err(CellsServiceError::Other(
+                    "do_in_target! called with local target".into(),
+                )
+                .into())
+            }
+            ResolvedTarget::Cell { socket } => {
+                // Same logic as do_in_cell! - no TLS for Unix sockets
+                let mut retry_strategy =
+                    backoff::ExponentialBackoffBuilder::new()
+                        .with_initial_interval(Duration::from_millis(50))
+                        .with_multiplier(10.0)
+                        .with_randomization_factor(0.5)
+                        .with_max_interval(Duration::from_secs(3))
+                        .with_max_elapsed_time(Some(Duration::from_secs(20)))
+                        .build();
+
+                let client = loop {
+                    match Client::new_no_tls(socket.clone()).await {
+                        Ok(client) => break Ok(client),
+                        e @ Err(ClientError::ConnectionError(_)) => {
+                            trace!("aurae client failed to connect: {e:?}");
+                            if let Some(delay) = retry_strategy.next_backoff() {
+                                trace!("retrying in {delay:?}");
+                                tokio::time::sleep(delay).await
+                            } else {
+                                break e;
+                            }
+                        }
+                        e => break e,
+                    }
+                }
+                .map_err(CellsServiceError::from)?;
+
+                let transformed_request = $transform_request($request, None);
+                backoff::future::retry(retry_strategy, || async {
+                    match client.$function(transformed_request.clone()).await {
+                        Ok(res) => Ok(res),
+                        Err(e)
+                            if e.code() == Code::Unknown
+                                && e.message() == "transport error" =>
+                        {
+                            Err(e)?;
+                            unreachable!();
+                        }
+                        Err(e) => Err(backoff::Error::Permanent(e)),
+                    }
+                })
+                .await
+            }
+            ResolvedTarget::Vm { socket, cell_path } => {
+                // VM target - use TLS for network socket
+                let cert_material = $self.load_cert_material().await?;
+
+                let mut retry_strategy =
+                    backoff::ExponentialBackoffBuilder::new()
+                        .with_initial_interval(Duration::from_millis(50))
+                        .with_multiplier(10.0)
+                        .with_randomization_factor(0.5)
+                        .with_max_interval(Duration::from_secs(3))
+                        .with_max_elapsed_time(Some(Duration::from_secs(20)))
+                        .build();
+
+                let client = loop {
+                    match Client::new_with_tls(socket.clone(), &cert_material)
+                        .await
+                    {
+                        Ok(client) => break Ok(client),
+                        e @ Err(ClientError::ConnectionError(_)) => {
+                            trace!(
+                                "aurae client failed to connect to VM: {e:?}"
+                            );
+                            if let Some(delay) = retry_strategy.next_backoff() {
+                                trace!("retrying in {delay:?}");
+                                tokio::time::sleep(delay).await
+                            } else {
+                                break e;
+                            }
+                        }
+                        e => break e,
+                    }
+                }
+                .map_err(CellsServiceError::from)?;
+
+                // Transform request: strip vm_id, keep cell_path as cell_name
+                let transformed_request =
+                    $transform_request($request, cell_path);
+                backoff::future::retry(retry_strategy, || async {
+                    match client.$function(transformed_request.clone()).await {
+                        Ok(res) => Ok(res),
+                        Err(e)
+                            if e.code() == Code::Unknown
+                                && e.message() == "transport error" =>
+                        {
+                            Err(e)?;
+                            unreachable!();
+                        }
+                        Err(e) => Err(backoff::Error::Permanent(e)),
+                    }
+                })
+                .await
+            }
+        }
+    }};
+}
+
 /// CellService struct manages the lifecycle of cells and executables.
 #[derive(Debug, Clone)]
 pub struct CellService {
     cells: Arc<Mutex<Cells>>,
     executables: Arc<Mutex<Executables>>,
     observe_service: ObserveService,
+    /// Reference to VmService for looking up VM socket addresses.
+    /// Used to forward requests to auraed instances running inside VMs.
+    vm_service: Option<VmService>,
 }
 
 impl CellService {
@@ -122,7 +258,102 @@ impl CellService {
             cells: Default::default(),
             executables: Default::default(),
             observe_service,
+            vm_service: None,
         }
+    }
+
+    /// Creates a new instance of CellService with VmService for VM target support.
+    ///
+    /// # Arguments
+    /// * `observe_service` - An instance of ObserveService to manage log channels.
+    /// * `vm_service` - An instance of VmService for looking up VM socket addresses.
+    pub fn new_with_vm_service(
+        observe_service: ObserveService,
+        vm_service: VmService,
+    ) -> Self {
+        CellService {
+            cells: Default::default(),
+            executables: Default::default(),
+            observe_service,
+            vm_service: Some(vm_service),
+        }
+    }
+
+    /// Resolves an execution target to determine where and how to forward a request.
+    ///
+    /// # Arguments
+    /// * `target` - The execution target to resolve.
+    ///
+    /// # Returns
+    /// A `ResolvedTarget` indicating how to handle the request.
+    async fn resolve_target(
+        &self,
+        target: &ExecutionTarget,
+    ) -> Result<ResolvedTarget> {
+        // Check if VM target is specified
+        if let Some(vm_id) = &target.vm_id {
+            let vm_service = self.vm_service.as_ref().ok_or_else(|| {
+                CellsServiceError::Other(
+                    "VM targeting not available (VmService not configured)"
+                        .into(),
+                )
+            })?;
+
+            // Look up the VM's socket address
+            let socket_addr =
+                vm_service.get_vm_socket(vm_id).await.ok_or_else(|| {
+                    CellsServiceError::VmNotRunning { vm_id: vm_id.clone() }
+                })?;
+
+            return Ok(ResolvedTarget::Vm {
+                socket: AuraeSocket::Addr(socket_addr),
+                cell_path: target.cell_path.clone(),
+            });
+        }
+
+        // Check if cell path is specified
+        if let Some(cell_path) = &target.cell_path {
+            let cell_name =
+                CellName::validate(Some(cell_path.clone()), "cell_path", None)
+                    .map_err(|e| {
+                        CellsServiceError::Other(format!(
+                            "Invalid cell path: {}",
+                            e
+                        ))
+                    })?;
+            let mut cells = self.cells.lock().await;
+
+            // Retrieve the client socket for the specified cell
+            let client_socket = cells
+                .get(&cell_name, |cell| cell.client_socket())
+                .map_err(CellsServiceError::CellsError)?;
+
+            return Ok(ResolvedTarget::Cell { socket: client_socket });
+        }
+
+        // Neither VM nor cell specified - local execution
+        Ok(ResolvedTarget::Local)
+    }
+
+    /// Loads certificate material for TLS connections to VMs.
+    ///
+    /// This uses the default certificate paths from /etc/aurae/pki/.
+    async fn load_cert_material(&self) -> Result<CertMaterial> {
+        use client::AuthConfig;
+
+        // Use default paths - same as the auraed runtime
+        let auth_config = AuthConfig {
+            ca_crt: "/etc/aurae/pki/ca.crt".to_string(),
+            client_crt: "/etc/aurae/pki/_signed.client.nova.crt".to_string(),
+            client_key: "/etc/aurae/pki/client.nova.key".to_string(),
+        };
+
+        auth_config.to_cert_material().await.map_err(|e| {
+            CellsServiceError::Other(format!(
+                "Failed to load certificate material: {}",
+                e
+            ))
+        })
     }
 
     /// Allocates a new cell based on the provided request.
@@ -139,7 +370,7 @@ impl CellService {
         request: ValidatedCellServiceAllocateRequest,
     ) -> Result<CellServiceAllocateResponse> {
         // Initialize the cell
-        let ValidatedCellServiceAllocateRequest { cell } = request;
+        let ValidatedCellServiceAllocateRequest { cell, .. } = request;
 
         let cell_name = cell.name.clone();
         let cell_spec = cell.into();
@@ -166,7 +397,7 @@ impl CellService {
         &self,
         request: ValidatedCellServiceFreeRequest,
     ) -> Result<CellServiceFreeResponse> {
-        let ValidatedCellServiceFreeRequest { cell_name } = request;
+        let ValidatedCellServiceFreeRequest { cell_name, .. } = request;
 
         info!("CellService: free() cell_name={cell_name:?}");
 
@@ -208,6 +439,7 @@ impl CellService {
             executable,
             uid,
             gid,
+            ..
         } = request;
 
         assert!(cell_name.is_none());
@@ -284,8 +516,9 @@ impl CellService {
         &self,
         request: ValidatedCellServiceStopRequest,
     ) -> std::result::Result<Response<CellServiceStopResponse>, Status> {
-        let ValidatedCellServiceStopRequest { cell_name, executable_name } =
-            request;
+        let ValidatedCellServiceStopRequest {
+            cell_name, executable_name, ..
+        } = request;
 
         assert!(cell_name.is_none());
         info!("CellService: stop() executable_name={:?}", executable_name,);
@@ -337,6 +570,92 @@ impl CellService {
         request: CellServiceStopRequest,
     ) -> std::result::Result<Response<CellServiceStopResponse>, Status> {
         do_in_cell!(self, cell_name, stop, request)
+    }
+
+    /// Starts an executable in a target (VM or cell) using the unified targeting mechanism.
+    #[tracing::instrument(skip(self))]
+    async fn start_in_target(
+        &self,
+        target: &ExecutionTarget,
+        request: CellServiceStartRequest,
+    ) -> std::result::Result<Response<CellServiceStartResponse>, Status> {
+        // Transform function for the request - strips vm_id, sets cell_name from cell_path
+        let transform_request = |req: CellServiceStartRequest,
+                                 cell_path: Option<String>|
+         -> CellServiceStartRequest {
+            CellServiceStartRequest {
+                cell_name: cell_path,
+                executable: req.executable,
+                uid: req.uid,
+                gid: req.gid,
+                execution_target: None, // Clear execution_target for forwarded request
+            }
+        };
+
+        do_in_target!(self, target, start, request, transform_request)
+    }
+
+    /// Stops an executable in a target (VM or cell) using the unified targeting mechanism.
+    #[tracing::instrument(skip(self))]
+    async fn stop_in_target(
+        &self,
+        target: &ExecutionTarget,
+        request: CellServiceStopRequest,
+    ) -> std::result::Result<Response<CellServiceStopResponse>, Status> {
+        // Transform function for the request - strips vm_id, sets cell_name from cell_path
+        let transform_request = |req: CellServiceStopRequest,
+                                 cell_path: Option<String>|
+         -> CellServiceStopRequest {
+            CellServiceStopRequest {
+                cell_name: cell_path,
+                executable_name: req.executable_name,
+                execution_target: None, // Clear execution_target for forwarded request
+            }
+        };
+
+        do_in_target!(self, target, stop, request, transform_request)
+    }
+
+    /// Allocates a cell in a target (VM or cell) using the unified targeting mechanism.
+    #[tracing::instrument(skip(self))]
+    async fn allocate_in_target(
+        &self,
+        target: &ExecutionTarget,
+        request: CellServiceAllocateRequest,
+    ) -> std::result::Result<Response<CellServiceAllocateResponse>, Status>
+    {
+        // Transform function for the request - strips vm_id, clears parent_target
+        // The cell_path becomes the context where the cell is created
+        let transform_request = |req: CellServiceAllocateRequest,
+                                 _cell_path: Option<String>|
+         -> CellServiceAllocateRequest {
+            CellServiceAllocateRequest {
+                cell: req.cell,
+                parent_target: None, // Clear parent_target for forwarded request
+            }
+        };
+
+        do_in_target!(self, target, allocate, request, transform_request)
+    }
+
+    /// Frees a cell in a target (VM or cell) using the unified targeting mechanism.
+    #[tracing::instrument(skip(self))]
+    async fn free_in_target(
+        &self,
+        target: &ExecutionTarget,
+        request: CellServiceFreeRequest,
+    ) -> std::result::Result<Response<CellServiceFreeResponse>, Status> {
+        // Transform function for the request - strips vm_id, clears parent_target
+        let transform_request = |req: CellServiceFreeRequest,
+                                 _cell_path: Option<String>|
+         -> CellServiceFreeRequest {
+            CellServiceFreeRequest {
+                cell_name: req.cell_name,
+                parent_target: None, // Clear parent_target for forwarded request
+            }
+        };
+
+        do_in_target!(self, target, free, request, transform_request)
     }
 
     #[tracing::instrument(skip(self))]
@@ -467,6 +786,15 @@ impl cell_service_server::CellService for CellService {
     {
         // Extract the inner request from the request
         let request = request.into_inner();
+
+        // Check for parent_target for allocating cell in a VM or nested cell
+        if let Some(ref target) = request.parent_target {
+            if target.vm_id.is_some() || target.cell_path.is_some() {
+                // Forward to VM or cell using the unified mechanism
+                return self.allocate_in_target(&target.clone(), request).await;
+            }
+        }
+
         // Validate the allocate request
         let request = ValidatedCellServiceAllocateRequest::validate(
             request.clone(),
@@ -483,6 +811,15 @@ impl cell_service_server::CellService for CellService {
         request: Request<CellServiceFreeRequest>,
     ) -> std::result::Result<Response<CellServiceFreeResponse>, Status> {
         let request = request.into_inner();
+
+        // Check for parent_target for freeing cell in a VM or nested cell
+        if let Some(ref target) = request.parent_target {
+            if target.vm_id.is_some() || target.cell_path.is_some() {
+                // Forward to VM or cell using the unified mechanism
+                return self.free_in_target(&target.clone(), request).await;
+            }
+        }
+
         // Validate the free request
         let request =
             ValidatedCellServiceFreeRequest::validate(request.clone(), None)?;
@@ -498,7 +835,15 @@ impl cell_service_server::CellService for CellService {
     ) -> std::result::Result<Response<CellServiceStartResponse>, Status> {
         let request = request.into_inner();
 
-        // Execute start if cell_name is none
+        // Check for new execution_target first (Phase 4 unified targeting)
+        if let Some(ref target) = request.execution_target {
+            if target.vm_id.is_some() || target.cell_path.is_some() {
+                // Forward to VM or cell using the new unified mechanism
+                return self.start_in_target(&target.clone(), request).await;
+            }
+        }
+
+        // Fall back to legacy cell_name for backward compatibility
         if request.cell_name.is_none() {
             let request =
                 ValidatedCellServiceStartRequest::validate(request, None)?;
@@ -527,7 +872,15 @@ impl cell_service_server::CellService for CellService {
     ) -> std::result::Result<Response<CellServiceStopResponse>, Status> {
         let request = request.into_inner();
 
-        // Execute stop if cell_name is none
+        // Check for new execution_target first (Phase 4 unified targeting)
+        if let Some(ref target) = request.execution_target {
+            if target.vm_id.is_some() || target.cell_path.is_some() {
+                // Forward to VM or cell using the new unified mechanism
+                return self.stop_in_target(&target.clone(), request).await;
+            }
+        }
+
+        // Fall back to legacy cell_name for backward compatibility
         if request.cell_name.is_none() {
             let request =
                 ValidatedCellServiceStopRequest::validate(request, None)?;
@@ -687,7 +1040,7 @@ mod tests {
             isolate_network: false,
         };
         // Return the validated allocate request
-        ValidatedCellServiceAllocateRequest { cell }
+        ValidatedCellServiceAllocateRequest { cell, parent_target: None }
     }
 
     #[tokio::test]
@@ -709,6 +1062,7 @@ mod tests {
             }),
             uid: None,
             gid: None,
+            execution_target: None,
         };
 
         let validated =
@@ -751,6 +1105,7 @@ mod tests {
         let stop_request = CellServiceStopRequest {
             cell_name: None,
             executable_name: executable_name.clone(),
+            execution_target: None,
         };
         let validated_stop =
             ValidatedCellServiceStopRequest::validate(stop_request, None)
