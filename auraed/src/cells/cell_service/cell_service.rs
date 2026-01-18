@@ -58,58 +58,58 @@ use tracing::{info, instrument, trace, warn};
  * It retries the operation with an exponential backoff strategy in case of connection errors.
  */
 macro_rules! do_in_cell {
-    ($self:ident, $cell_name:ident, $function:ident, $request:ident) => {{
-        // Retrieve the client socket for the specified cell
-        let client_socket = {
-            let mut cells = $self.cells.lock().await;
-            cells
-            .get(&$cell_name, |cell| cell.client_socket())
-            .map_err(CellsServiceError::CellsError)?
-        };
+     ($self:ident, $cell_name:ident, $function:ident, $request:ident) => {{
+         // Retrieve the client socket for the specified cell
+         let client_socket = {
+             let mut cells = $self.cells.lock().await;
+             cells
+             .get(&$cell_name, |cell| cell.client_socket())
+             .map_err(CellsServiceError::CellsError)?
+         };
 
-        // Initialize the exponential backoff strategy for retrying the operation
-        let mut retry_strategy = backoff::ExponentialBackoffBuilder::new()
-            .with_initial_interval(Duration::from_millis(50)) // 1st retry in 50ms
-            .with_multiplier(10.0) // 10x the delay each attempt
-            .with_randomization_factor(0.5) // with a randomness of +/-50%
-            .with_max_interval(Duration::from_secs(3)) // but never delay more than 3s
-            .with_max_elapsed_time(Some(Duration::from_secs(20))) // or 20s total
-            .build();
+         // Initialize the exponential backoff strategy for retrying the operation
+         let mut retry_strategy = backoff::ExponentialBackoffBuilder::new()
+             .with_initial_interval(Duration::from_millis(50)) // 1st retry in 50ms
+             .with_multiplier(10.0) // 10x the delay each attempt
+             .with_randomization_factor(0.5) // with a randomness of +/-50%
+             .with_max_interval(Duration::from_secs(3)) // but never delay more than 3s
+             .with_max_elapsed_time(Some(Duration::from_secs(20))) // or 20s total
+             .build();
 
-        // Attempt to create a new client with retries in case of connection errors
-        let client = loop {
-            match Client::new_no_tls(client_socket.clone()).await {
-                Ok(client) => break Ok(client),
-                e @ Err(ClientError::ConnectionError(_)) => {
-                    trace!("aurae client failed to connect: {e:?}");
-                    if let Some(delay) = retry_strategy.next_backoff() {
-                        trace!("retrying in {delay:?}");
-                        tokio::time::sleep(delay).await
-                    } else {
-                        break e
-                    }
-                }
-                e => break e
-            }
-        }.map_err(CellsServiceError::from)?;
+         // Attempt to create a new client with retries in case of connection errors
+         let client = loop {
+             match Client::new_no_tls(client_socket.clone()).await {
+                 Ok(client) => break Ok(client),
+                 e @ Err(ClientError::ConnectionError(_)) => {
+                     trace!("aurae client failed to connect: {e:?}");
+                     if let Some(delay) = retry_strategy.next_backoff() {
+                         trace!("retrying in {delay:?}");
+                         tokio::time::sleep(delay).await
+                     } else {
+                         break e
+                     }
+                 }
+                 e => break e
+             }
+         }.map_err(CellsServiceError::from)?;
 
-        // Attempt the operation with the backoff strategy
-        backoff::future::retry(
-            retry_strategy,
-            || async {
-                match client.$function($request.clone()).await {
-                    Ok(res) => Ok(res),
-                    Err(e) if e.code() == Code::Unknown && e.message() == "transport error" => {
-                        Err(e)?;
-                        unreachable!();
-                    }
-                    Err(e) => Err(backoff::Error::Permanent(e))
-                }
-            },
-        )
-        .await
-    }};
-}
+         // Attempt the operation with the backoff strategy
+         backoff::future::retry(
+             retry_strategy,
+             || async {
+                 match client.$function($request.clone()).await {
+                     Ok(res) => Ok(res),
+                     Err(e) if e.code() == Code::Unknown && e.message() == "transport error" => {
+                         Err(e)?;
+                         unreachable!();
+                     }
+                     Err(e) => Err(backoff::Error::Permanent(e))
+                 }
+             },
+         )
+         .await
+     }};
+ }
 
 /// Result of resolving an execution target.
 #[derive(Debug)]
@@ -138,7 +138,7 @@ macro_rules! do_in_target {
                 .into())
             }
             ResolvedTarget::Cell { socket } => {
-                // Same logic as do_in_cell! - no TLS for Unix sockets
+                // Cell forwarding uses Unix sockets (no TLS)
                 let mut retry_strategy =
                     backoff::ExponentialBackoffBuilder::new()
                         .with_initial_interval(Duration::from_millis(50))
@@ -496,15 +496,6 @@ impl CellService {
     }
 
     #[tracing::instrument(skip(self))]
-    async fn start_in_cell(
-        &self,
-        cell_name: &CellName,
-        request: CellServiceStartRequest,
-    ) -> std::result::Result<Response<CellServiceStartResponse>, Status> {
-        do_in_cell!(self, cell_name, start, request)
-    }
-
-    #[tracing::instrument(skip(self))]
     /// Handles the stop request.
     ///
     /// # Arguments
@@ -561,15 +552,6 @@ impl CellService {
         }
 
         Ok(Response::new(CellServiceStopResponse::default()))
-    }
-
-    #[tracing::instrument(skip(self))]
-    async fn stop_in_cell(
-        &self,
-        cell_name: &CellName,
-        request: CellServiceStopRequest,
-    ) -> std::result::Result<Response<CellServiceStopResponse>, Status> {
-        do_in_cell!(self, cell_name, stop, request)
     }
 
     /// Starts an executable in a target (VM or cell) using the unified targeting mechanism.
@@ -852,36 +834,36 @@ impl cell_service_server::CellService for CellService {
         &self,
         request: Request<CellServiceStartRequest>,
     ) -> std::result::Result<Response<CellServiceStartResponse>, Status> {
-        let request = request.into_inner();
+        let mut request = request.into_inner();
 
-        // Check for new execution_target first (Phase 4 unified targeting)
-        if let Some(ref target) = request.execution_target {
+        // Convert legacy cell_name to execution_target for unified handling
+        let target = if let Some(ref target) = request.execution_target {
             if target.vm_id.is_some() || target.cell_path.is_some() {
-                // Forward to VM or cell using the new unified mechanism
-                return self.start_in_target(&target.clone(), request).await;
+                Some(target.clone())
+            } else {
+                None
             }
-        }
-
-        // Fall back to legacy cell_name for backward compatibility
-        if request.cell_name.is_none() {
-            let request =
-                ValidatedCellServiceStartRequest::validate(request, None)?;
-            Ok(self.start(request).await?)
+        } else if let Some(ref cell_name) = request.cell_name {
+            // Convert legacy cell_name to ExecutionTarget
+            Some(ExecutionTarget {
+                vm_id: None,
+                cell_path: Some(cell_name.clone()),
+            })
         } else {
-            // We are in a parent cell, or validation will fail
-            let validated = ValidatedCellServiceStartRequest::validate(
-                request.clone(),
-                None,
-            )?;
+            None
+        };
 
-            // Validation has succeeded, so we can make assumptions about the request and use expect
-            let cell_name = validated.cell_name.expect("cell name");
-            let mut request = request;
+        // If we have a target, forward the request
+        if let Some(target) = target {
+            // Clear cell_name for forwarded request (it's now in the target)
             request.cell_name = None;
-
-            // start in the cell
-            self.start_in_cell(&cell_name, request).await
+            return self.start_in_target(&target, request).await;
         }
+
+        // Local execution
+        let request =
+            ValidatedCellServiceStartRequest::validate(request, None)?;
+        Ok(self.start(request).await?)
     }
 
     #[instrument(skip(self))]
@@ -889,36 +871,35 @@ impl cell_service_server::CellService for CellService {
         &self,
         request: Request<CellServiceStopRequest>,
     ) -> std::result::Result<Response<CellServiceStopResponse>, Status> {
-        let request = request.into_inner();
+        let mut request = request.into_inner();
 
-        // Check for new execution_target first (Phase 4 unified targeting)
-        if let Some(ref target) = request.execution_target {
+        // Convert legacy cell_name to execution_target for unified handling
+        let target = if let Some(ref target) = request.execution_target {
             if target.vm_id.is_some() || target.cell_path.is_some() {
-                // Forward to VM or cell using the new unified mechanism
-                return self.stop_in_target(&target.clone(), request).await;
+                Some(target.clone())
+            } else {
+                None
             }
-        }
-
-        // Fall back to legacy cell_name for backward compatibility
-        if request.cell_name.is_none() {
-            let request =
-                ValidatedCellServiceStopRequest::validate(request, None)?;
-            Ok(self.stop(request).await?)
+        } else if let Some(ref cell_name) = request.cell_name {
+            // Convert legacy cell_name to ExecutionTarget
+            Some(ExecutionTarget {
+                vm_id: None,
+                cell_path: Some(cell_name.clone()),
+            })
         } else {
-            // Validate the request is valid
-            let validated = ValidatedCellServiceStopRequest::validate(
-                request.clone(),
-                None,
-            )?;
+            None
+        };
 
-            // Validation has succeeded, so we can make assumptions about the request and use expect
-            let cell_name = validated.cell_name.expect("cell name");
-            let mut request = request;
+        // If we have a target, forward the request
+        if let Some(target) = target {
+            // Clear cell_name for forwarded request (it's now in the target)
             request.cell_name = None;
-
-            // stop the cell
-            self.stop_in_cell(&cell_name, request).await
+            return self.stop_in_target(&target, request).await;
         }
+
+        // Local execution
+        let request = ValidatedCellServiceStopRequest::validate(request, None)?;
+        Ok(self.stop(request).await?)
     }
 
     /// Response with a list of cells
