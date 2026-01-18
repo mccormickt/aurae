@@ -658,6 +658,25 @@ impl CellService {
         do_in_target!(self, target, free, request, transform_request)
     }
 
+    /// Lists cells in a target (VM or cell) using the unified targeting mechanism.
+    #[tracing::instrument(skip(self))]
+    async fn list_in_target(
+        &self,
+        target: &ExecutionTarget,
+        request: CellServiceListRequest,
+    ) -> std::result::Result<Response<CellServiceListResponse>, Status> {
+        // Transform function for the request - clears execution_target for forwarded request
+        let transform_request = |_req: CellServiceListRequest,
+                                 _cell_path: Option<String>|
+         -> CellServiceListRequest {
+            CellServiceListRequest {
+                execution_target: None, // Clear execution_target for forwarded request
+            }
+        };
+
+        do_in_target!(self, target, list, request, transform_request)
+    }
+
     #[tracing::instrument(skip(self))]
     pub(crate) async fn stop_all(&self) -> Result<()> {
         let mut executables = self.executables.lock().await;
@@ -905,14 +924,25 @@ impl cell_service_server::CellService for CellService {
     /// Response with a list of cells
     ///
     /// # Arguments
-    /// * `_request` - A request containing CellServiceListRequest.
+    /// * `request` - A request containing CellServiceListRequest.
     ///
     /// # Returns
     /// A response containing CellServiceListResponse or a Status error.
     async fn list(
         &self,
-        _request: Request<CellServiceListRequest>,
+        request: Request<CellServiceListRequest>,
     ) -> std::result::Result<Response<CellServiceListResponse>, Status> {
+        let request = request.into_inner();
+
+        // Check if we need to forward this request to another target
+        if let Some(ref target) = request.execution_target {
+            // Clone the target before passing request
+            let target = target.clone();
+            // Forward to the target (VM or cell)
+            return self.list_in_target(&target, request).await;
+        }
+
+        // Local execution
         Ok(Response::new(self.list().await?))
     }
 }
