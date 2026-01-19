@@ -442,6 +442,38 @@ fn resolve_fields<'a>(
         .collect()
 }
 
+/// Determines the correct module path for a proto type.
+/// Proto type names look like ".aurae.common.v0.ExecutionTarget" or ".aurae.cells.v0.Cell".
+/// This function converts the package prefix to the corresponding Rust module path.
+fn get_module_path_for_type(
+    type_name: &str,
+    default_module_path: &str,
+) -> String {
+    // Proto type names start with a dot and have the format ".package.subpackage.TypeName"
+    // e.g., ".aurae.common.v0.ExecutionTarget" -> "::proto::common::"
+    // e.g., ".aurae.cells.v0.Cell" -> "::proto::cells::"
+
+    if !type_name.starts_with(".aurae.") {
+        // Not an aurae type, use default module path
+        return default_module_path.to_string();
+    }
+
+    // Parse the package from the type name
+    // ".aurae.common.v0.ExecutionTarget" -> ["", "aurae", "common", "v0", "ExecutionTarget"]
+    let parts: Vec<&str> = type_name.split('.').collect();
+    if parts.len() < 4 {
+        return default_module_path.to_string();
+    }
+
+    // parts[0] is "" (before the first dot)
+    // parts[1] is "aurae"
+    // parts[2] is the module name (e.g., "common", "cells", "vms")
+    // parts[3] is the version (e.g., "v0")
+    // parts[4+] is the type name
+    let module_name = parts[2];
+    format!("::proto::{}::", module_name)
+}
+
 fn write_mapping(
     module: &Path,
     proto: &ParsedAndTypechecked,
@@ -565,13 +597,20 @@ fn write_mapping(
 
         // Generate the message type and opening brace: `ModulePath::MessageType {`
         mapping.push_str(module_path);
+        // Determine the correct module path for the type
+        // The type_name from proto looks like ".aurae.common.v0.ExecutionTarget"
+        // We need to convert this to "::proto::common::" for cross-module types
+        let actual_module_path =
+            get_module_path_for_type(field.type_name(), module_path);
+        mapping.push_str(&actual_module_path);
         mapping.push_str(field_type_name);
         mapping.push('{');
 
         // Recursively generate all field assignments
         for field in &field_type_message.field {
+            // Use the actual module path for this type's fields, not the original module_path
             write_field(
-                module_path,
+                &actual_module_path,
                 proto,
                 command_field_parts,
                 mapping,
