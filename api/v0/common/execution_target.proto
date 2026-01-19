@@ -37,20 +37,32 @@ option go_package = "github.com/aurae-runtime/ae/client/pkg/api/v0/common;common
 // ExecutionTarget specifies where a workload should be executed.
 // This enables unified routing across cells, VMs, and nested combinations.
 //
-// The target is resolved in order:
-// 1. If vm_id is set, the request is forwarded to the auraed inside the VM
-// 2. If cell_path is set, the request is forwarded to the nested cell
-// 3. If neither is set, execution happens locally
+// Deep nesting is supported with arbitrary cell traversal before and after
+// a single VM hop. The resolution order is:
+// 1. Traverse cells_prefix in order (on current host/bare metal)
+// 2. If target_vm_id is set, forward to the VM's auraed
+// 3. Traverse cells_suffix in order (inside the VM)
+// 4. Execute locally when all hops are consumed
 //
-// When both vm_id and cell_path are set, the request is first forwarded
-// to the VM, then to the cell within that VM.
+// Constraint: Only one VM hop is supported (no nested virtualization).
+//
+// Example path: cell1 → cell2 → VM → cell3 → cell4 → execute
+// Represented as: cells_prefix=["cell1","cell2"], target_vm_id="VM",
+//                 cells_suffix=["cell3","cell4"]
 message ExecutionTarget {
-  // VM to target. If set, request forwards to auraed inside this VM first.
-  // The VM must already be started and have an auraed address available.
-  optional string vm_id = 1;
+  // Ordered cells to traverse before VM (on current host/bare metal).
+  // Each cell is forwarded to in sequence until we reach the VM's host.
+  // If target_vm_id is not set, these cells are traversed to reach the
+  // final execution location.
+  repeated string cells_prefix = 1;
 
-  // Cell path relative to the current context. Supports hierarchical naming
-  // (e.g., "parent/child/grandchild"). If vm_id is also set, the path is
-  // relative to the VM's auraed; otherwise, it's relative to the local auraed.
-  optional string cell_path = 2;
+  // VM to target. Resolved by the auraed we reach after traversing cells_prefix.
+  // If cells_prefix is empty, resolved by local auraed.
+  // The VM must already be started and have an auraed address available.
+  optional string target_vm_id = 2;
+
+  // Cells to traverse inside the VM, in order.
+  // Only valid when target_vm_id is set.
+  // After reaching the VM, these cells become the cells_prefix on the VM side.
+  repeated string cells_suffix = 3;
 }

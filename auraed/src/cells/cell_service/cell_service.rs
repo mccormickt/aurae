@@ -117,14 +117,20 @@ pub enum ResolvedTarget {
     /// Target is local - execute directly without forwarding.
     Local,
     /// Target is a cell - forward via Unix socket (no TLS).
-    Cell { socket: AuraeSocket },
+    /// `remaining_target` contains the path to continue after this cell hop.
+    Cell { socket: AuraeSocket, remaining_target: Option<ExecutionTarget> },
     /// Target is a VM - forward via network socket with TLS.
-    Vm { socket: AuraeSocket, cell_path: Option<String> },
+    /// `remaining_target` contains the path to continue after this VM hop.
+    Vm { socket: AuraeSocket, remaining_target: Option<ExecutionTarget> },
 }
 
 /// Macro to perform an operation within a target (VM or cell).
 /// It resolves the target, creates the appropriate client, and retries
 /// the operation with an exponential backoff strategy in case of connection errors.
+///
+/// The `$transform_request` closure receives the original request and an optional
+/// `remaining_target` (the path to continue after this hop), and should return
+/// the transformed request to send to the next hop.
 macro_rules! do_in_target {
     ($self:ident, $target:expr, $function:ident, $request:ident, $transform_request:expr) => {{
         let resolved = $self.resolve_target($target).await?;
@@ -137,7 +143,7 @@ macro_rules! do_in_target {
                 )
                 .into())
             }
-            ResolvedTarget::Cell { socket } => {
+            ResolvedTarget::Cell { socket, remaining_target } => {
                 // Cell forwarding uses Unix sockets (no TLS)
                 let mut retry_strategy =
                     backoff::ExponentialBackoffBuilder::new()
@@ -165,7 +171,9 @@ macro_rules! do_in_target {
                 }
                 .map_err(CellsServiceError::from)?;
 
-                let transformed_request = $transform_request($request, None);
+                // Pass the remaining target to the transform function
+                let transformed_request =
+                    $transform_request($request, remaining_target);
                 backoff::future::retry(retry_strategy, || async {
                     match client.$function(transformed_request.clone()).await {
                         Ok(res) => Ok(res),
@@ -181,7 +189,7 @@ macro_rules! do_in_target {
                 })
                 .await
             }
-            ResolvedTarget::Vm { socket, cell_path } => {
+            ResolvedTarget::Vm { socket, remaining_target } => {
                 // VM target - use TLS for network socket
                 let cert_material = $self.load_cert_material().await?;
 
@@ -215,9 +223,9 @@ macro_rules! do_in_target {
                 }
                 .map_err(CellsServiceError::from)?;
 
-                // Transform request: strip vm_id, keep cell_path as cell_name
+                // Pass the remaining target to the transform function
                 let transformed_request =
-                    $transform_request($request, cell_path);
+                    $transform_request($request, remaining_target);
                 backoff::future::retry(retry_strategy, || async {
                     match client.$function(transformed_request.clone()).await {
                         Ok(res) => Ok(res),
@@ -279,7 +287,19 @@ impl CellService {
         }
     }
 
+    /// Checks if an ExecutionTarget represents a local execution (no forwarding needed).
+    fn is_local_target(&self, target: &ExecutionTarget) -> bool {
+        target.cells_prefix.is_empty()
+            && target.target_vm_id.is_none()
+            && target.cells_suffix.is_empty()
+    }
+
     /// Resolves an execution target to determine where and how to forward a request.
+    ///
+    /// Resolution algorithm for deep nesting support:
+    /// 1. If there are cells_prefix entries, forward to the first one
+    /// 2. If VM specified, forward to VM (cells_suffix becomes cells_prefix on VM side)
+    /// 3. If neither, execute locally
     ///
     /// # Arguments
     /// * `target` - The execution target to resolve.
@@ -290,8 +310,49 @@ impl CellService {
         &self,
         target: &ExecutionTarget,
     ) -> Result<ResolvedTarget> {
-        // Check if VM target is specified
-        if let Some(vm_id) = &target.vm_id {
+        // Step 1: If there are cells_prefix entries, forward to the first one
+        if !target.cells_prefix.is_empty() {
+            let first_cell = &target.cells_prefix[0];
+            let cell_name = CellName::validate(
+                Some(first_cell.clone()),
+                "cells_prefix[0]",
+                None,
+            )
+            .map_err(|e| {
+                CellsServiceError::Other(format!(
+                    "Invalid cell name in cells_prefix: {}",
+                    e
+                ))
+            })?;
+            let mut cells = self.cells.lock().await;
+
+            // Retrieve the client socket for the specified cell
+            let client_socket = cells
+                .get(&cell_name, |cell| cell.client_socket())
+                .map_err(CellsServiceError::CellsError)?;
+
+            // Create remaining target (consume first cell)
+            let remaining_target = if target.cells_prefix.len() > 1
+                || target.target_vm_id.is_some()
+                || !target.cells_suffix.is_empty()
+            {
+                Some(ExecutionTarget {
+                    cells_prefix: target.cells_prefix[1..].to_vec(),
+                    target_vm_id: target.target_vm_id.clone(),
+                    cells_suffix: target.cells_suffix.clone(),
+                })
+            } else {
+                None
+            };
+
+            return Ok(ResolvedTarget::Cell {
+                socket: client_socket,
+                remaining_target,
+            });
+        }
+
+        // Step 2: If VM specified, forward to VM
+        if let Some(vm_id) = &target.target_vm_id {
             let vm_service = self.vm_service.as_ref().ok_or_else(|| {
                 CellsServiceError::Other(
                     "VM targeting not available (VmService not configured)"
@@ -305,33 +366,24 @@ impl CellService {
                     CellsServiceError::VmNotRunning { vm_id: vm_id.clone() }
                 })?;
 
+            // Create remaining target: cells_suffix becomes cells_prefix on VM side
+            let remaining_target = if !target.cells_suffix.is_empty() {
+                Some(ExecutionTarget {
+                    cells_prefix: target.cells_suffix.clone(),
+                    target_vm_id: None,
+                    cells_suffix: vec![],
+                })
+            } else {
+                None
+            };
+
             return Ok(ResolvedTarget::Vm {
                 socket: AuraeSocket::Addr(socket_addr),
-                cell_path: target.cell_path.clone(),
+                remaining_target,
             });
         }
 
-        // Check if cell path is specified
-        if let Some(cell_path) = &target.cell_path {
-            let cell_name =
-                CellName::validate(Some(cell_path.clone()), "cell_path", None)
-                    .map_err(|e| {
-                        CellsServiceError::Other(format!(
-                            "Invalid cell path: {}",
-                            e
-                        ))
-                    })?;
-            let mut cells = self.cells.lock().await;
-
-            // Retrieve the client socket for the specified cell
-            let client_socket = cells
-                .get(&cell_name, |cell| cell.client_socket())
-                .map_err(CellsServiceError::CellsError)?;
-
-            return Ok(ResolvedTarget::Cell { socket: client_socket });
-        }
-
-        // Neither VM nor cell specified - local execution
+        // Step 3: Neither cells nor VM specified - local execution
         Ok(ResolvedTarget::Local)
     }
 
@@ -561,16 +613,16 @@ impl CellService {
         target: &ExecutionTarget,
         request: CellServiceStartRequest,
     ) -> std::result::Result<Response<CellServiceStartResponse>, Status> {
-        // Transform function for the request - strips vm_id, sets cell_name from cell_path
+        // Transform function for the request - threads remaining_target through
         let transform_request = |req: CellServiceStartRequest,
-                                 cell_path: Option<String>|
+                                 remaining_target: Option<ExecutionTarget>|
          -> CellServiceStartRequest {
             CellServiceStartRequest {
-                cell_name: cell_path,
+                cell_name: None, // No longer used for forwarding
                 executable: req.executable,
                 uid: req.uid,
                 gid: req.gid,
-                execution_target: None, // Clear execution_target for forwarded request
+                execution_target: remaining_target, // Thread remaining path through
             }
         };
 
@@ -584,14 +636,14 @@ impl CellService {
         target: &ExecutionTarget,
         request: CellServiceStopRequest,
     ) -> std::result::Result<Response<CellServiceStopResponse>, Status> {
-        // Transform function for the request - strips vm_id, sets cell_name from cell_path
+        // Transform function for the request - threads remaining_target through
         let transform_request = |req: CellServiceStopRequest,
-                                 cell_path: Option<String>|
+                                 remaining_target: Option<ExecutionTarget>|
          -> CellServiceStopRequest {
             CellServiceStopRequest {
-                cell_name: cell_path,
+                cell_name: None, // No longer used for forwarding
                 executable_name: req.executable_name,
-                execution_target: None, // Clear execution_target for forwarded request
+                execution_target: remaining_target, // Thread remaining path through
             }
         };
 
@@ -606,14 +658,13 @@ impl CellService {
         request: CellServiceAllocateRequest,
     ) -> std::result::Result<Response<CellServiceAllocateResponse>, Status>
     {
-        // Transform function for the request - strips vm_id, clears parent_target
-        // The cell_path becomes the context where the cell is created
+        // Transform function for the request - threads remaining_target through
         let transform_request = |req: CellServiceAllocateRequest,
-                                 _cell_path: Option<String>|
+                                 remaining_target: Option<ExecutionTarget>|
          -> CellServiceAllocateRequest {
             CellServiceAllocateRequest {
                 cell: req.cell,
-                parent_target: None, // Clear parent_target for forwarded request
+                parent_target: remaining_target, // Thread remaining path through
             }
         };
 
@@ -627,13 +678,13 @@ impl CellService {
         target: &ExecutionTarget,
         request: CellServiceFreeRequest,
     ) -> std::result::Result<Response<CellServiceFreeResponse>, Status> {
-        // Transform function for the request - strips vm_id, clears parent_target
+        // Transform function for the request - threads remaining_target through
         let transform_request = |req: CellServiceFreeRequest,
-                                 _cell_path: Option<String>|
+                                 remaining_target: Option<ExecutionTarget>|
          -> CellServiceFreeRequest {
             CellServiceFreeRequest {
                 cell_name: req.cell_name,
-                parent_target: None, // Clear parent_target for forwarded request
+                parent_target: remaining_target, // Thread remaining path through
             }
         };
 
@@ -647,12 +698,12 @@ impl CellService {
         target: &ExecutionTarget,
         request: CellServiceListRequest,
     ) -> std::result::Result<Response<CellServiceListResponse>, Status> {
-        // Transform function for the request - clears execution_target for forwarded request
+        // Transform function for the request - threads remaining_target through
         let transform_request = |_req: CellServiceListRequest,
-                                 _cell_path: Option<String>|
+                                 remaining_target: Option<ExecutionTarget>|
          -> CellServiceListRequest {
             CellServiceListRequest {
-                execution_target: None, // Clear execution_target for forwarded request
+                execution_target: remaining_target, // Thread remaining path through
             }
         };
 
@@ -790,7 +841,7 @@ impl cell_service_server::CellService for CellService {
 
         // Check for parent_target for allocating cell in a VM or nested cell
         if let Some(ref target) = request.parent_target {
-            if target.vm_id.is_some() || target.cell_path.is_some() {
+            if !self.is_local_target(target) {
                 // Forward to VM or cell using the unified mechanism
                 return self.allocate_in_target(&target.clone(), request).await;
             }
@@ -815,7 +866,7 @@ impl cell_service_server::CellService for CellService {
 
         // Check for parent_target for freeing cell in a VM or nested cell
         if let Some(ref target) = request.parent_target {
-            if target.vm_id.is_some() || target.cell_path.is_some() {
+            if !self.is_local_target(target) {
                 // Forward to VM or cell using the unified mechanism
                 return self.free_in_target(&target.clone(), request).await;
             }
@@ -836,18 +887,19 @@ impl cell_service_server::CellService for CellService {
     ) -> std::result::Result<Response<CellServiceStartResponse>, Status> {
         let mut request = request.into_inner();
 
-        // Convert legacy cell_name to execution_target for unified handling
+        // Check if we need to forward to a cell or VM
         let target = if let Some(ref target) = request.execution_target {
-            if target.vm_id.is_some() || target.cell_path.is_some() {
+            if !self.is_local_target(target) {
                 Some(target.clone())
             } else {
                 None
             }
         } else if let Some(ref cell_name) = request.cell_name {
-            // Convert legacy cell_name to ExecutionTarget
+            // Convert cell_name to ExecutionTarget
             Some(ExecutionTarget {
-                vm_id: None,
-                cell_path: Some(cell_name.clone()),
+                cells_prefix: vec![cell_name.clone()],
+                target_vm_id: None,
+                cells_suffix: vec![],
             })
         } else {
             None
@@ -873,18 +925,19 @@ impl cell_service_server::CellService for CellService {
     ) -> std::result::Result<Response<CellServiceStopResponse>, Status> {
         let mut request = request.into_inner();
 
-        // Convert legacy cell_name to execution_target for unified handling
+        // Check if we need to forward to a cell or VM
         let target = if let Some(ref target) = request.execution_target {
-            if target.vm_id.is_some() || target.cell_path.is_some() {
+            if !self.is_local_target(target) {
                 Some(target.clone())
             } else {
                 None
             }
         } else if let Some(ref cell_name) = request.cell_name {
-            // Convert legacy cell_name to ExecutionTarget
+            // Convert cell_name to ExecutionTarget
             Some(ExecutionTarget {
-                vm_id: None,
-                cell_path: Some(cell_name.clone()),
+                cells_prefix: vec![cell_name.clone()],
+                target_vm_id: None,
+                cells_suffix: vec![],
             })
         } else {
             None
@@ -917,10 +970,12 @@ impl cell_service_server::CellService for CellService {
 
         // Check if we need to forward this request to another target
         if let Some(ref target) = request.execution_target {
-            // Clone the target before passing request
-            let target = target.clone();
-            // Forward to the target (VM or cell)
-            return self.list_in_target(&target, request).await;
+            if !self.is_local_target(target) {
+                // Clone the target before passing request
+                let target = target.clone();
+                // Forward to the target (VM or cell)
+                return self.list_in_target(&target, request).await;
+            }
         }
 
         // Local execution
