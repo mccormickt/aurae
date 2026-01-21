@@ -66,7 +66,8 @@ impl Manager {
                 self.debug.try_clone()?,
                 &seccompiler::SeccompAction::Allow,
                 self.hypervisor.clone(),
-                false,
+                false, // no_shutdown
+                false, // landlock_enable
             )
             .expect("Failed to start VMM thread"),
         );
