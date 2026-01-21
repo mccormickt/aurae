@@ -17,7 +17,7 @@ use anyhow::anyhow;
 use net_util::MacAddr;
 use std::{
     fmt::{self, Display},
-    net::{Ipv4Addr, SocketAddr},
+    net::{IpAddr, Ipv4Addr, SocketAddr},
     path::PathBuf,
     sync::{Arc, Mutex},
 };
@@ -27,10 +27,11 @@ use vmm::{
     api::ApiAction,
     vm::VmState,
     vm_config::{
-        CpuFeatures, CpusConfig, DEFAULT_DISK_NUM_QUEUES,
-        DEFAULT_DISK_QUEUE_SIZE, DEFAULT_MAX_PHYS_BITS, DEFAULT_NET_NUM_QUEUES,
-        DEFAULT_NET_QUEUE_SIZE, HotplugMethod, MemoryConfig, PayloadConfig,
-        RngConfig, VhostMode, default_console, default_serial,
+        ConsoleConfig, CoreScheduling, CpuFeatures, CpusConfig,
+        DEFAULT_DISK_NUM_QUEUES, DEFAULT_DISK_QUEUE_SIZE,
+        DEFAULT_MAX_PHYS_BITS, DEFAULT_NET_NUM_QUEUES, DEFAULT_NET_QUEUE_SIZE,
+        HotplugMethod, MemoryConfig, PayloadConfig, PciDeviceCommonConfig,
+        RngConfig, SerialConfig, VhostMode,
     },
 };
 
@@ -63,13 +64,16 @@ impl From<VmSpec> for vmm::vm_config::VmConfig {
     fn from(spec: VmSpec) -> Self {
         vmm::vm_config::VmConfig {
             cpus: CpusConfig {
-                boot_vcpus: spec.vcpu_count as u8,
-                max_vcpus: spec.vcpu_count as u8,
+                boot_vcpus: spec.vcpu_count,
+                max_vcpus: spec.vcpu_count,
                 topology: None,
                 kvm_hyperv: false,
                 max_phys_bits: DEFAULT_MAX_PHYS_BITS,
                 affinity: None,
                 features: CpuFeatures::default(),
+                nested: true,
+                core_scheduling: CoreScheduling::default(),
+                profile: Default::default(),
             },
             memory: MemoryConfig {
                 size: (spec.memory_size << 20) as u64,
@@ -81,6 +85,7 @@ impl From<VmSpec> for vmm::vm_config::VmConfig {
                 hugepages: false,
                 hugepage_size: None,
                 prefault: false,
+                reserve: false,
                 zones: None,
                 thp: false,
             },
@@ -95,10 +100,11 @@ impl From<VmSpec> for vmm::vm_config::VmConfig {
             net: Some(spec.net.into_iter().map(Into::into).collect()),
             rng: RngConfig::default(),
             balloon: None,
+            generic_vhost_user: None,
             fs: None,
             pmem: None,
-            serial: default_serial(),
-            console: default_console(),
+            serial: SerialConfig::default(),
+            console: ConsoleConfig::default(),
             #[cfg(target_arch = "x86_64")]
             debug_console: DebugConsoleConfig::default(),
             devices: None,
@@ -107,10 +113,9 @@ impl From<VmSpec> for vmm::vm_config::VmConfig {
             vsock: None,
             pvpanic: false,
             iommu: false,
-            #[cfg(target_arch = "x86_64")]
-            sgx_epc: None,
             numa: None,
             watchdog: false,
+            rtc: None,
             pci_segments: None,
             platform: None,
             tpm: None,
@@ -133,26 +138,34 @@ pub struct NetSpec {
 impl From<NetSpec> for vmm::vm_config::NetConfig {
     fn from(spec: NetSpec) -> Self {
         vmm::vm_config::NetConfig {
+            pci_common: PciDeviceCommonConfig::default(),
             tap: spec.tap,
-            ip: spec.ip,
-            mask: spec.mask,
+            ip: Some(IpAddr::V4(spec.ip)),
+            mask: Some(IpAddr::V4(spec.mask)),
             mac: spec.mac,
             host_mac: spec.host_mac,
             mtu: None,
-            iommu: false,
             num_queues: DEFAULT_NET_NUM_QUEUES,
             queue_size: DEFAULT_NET_QUEUE_SIZE,
             vhost_user: false,
             vhost_socket: None,
             vhost_mode: VhostMode::default(),
-            id: None,
             fds: None,
             rate_limiter_config: None,
-            pci_segment: 0,
             offload_tso: false,
             offload_ufo: false,
             offload_csum: false,
         }
+    }
+}
+
+/// Narrow an optional [`IpAddr`] from the VMM back to the [`Ipv4Addr`] aurae
+/// works with. VMs are always configured with IPv4 addresses, so anything else
+/// falls back to the unspecified address.
+fn to_ipv4(addr: Option<IpAddr>) -> Ipv4Addr {
+    match addr {
+        Some(IpAddr::V4(v4)) => v4,
+        Some(IpAddr::V6(_)) | None => Ipv4Addr::UNSPECIFIED,
     }
 }
 
@@ -165,22 +178,24 @@ pub struct MountSpec {
 impl From<MountSpec> for vmm::vm_config::DiskConfig {
     fn from(spec: MountSpec) -> Self {
         vmm::vm_config::DiskConfig {
+            pci_common: PciDeviceCommonConfig::default(),
             path: Some(spec.host_path),
             readonly: spec.read_only,
             direct: false,
-            iommu: false,
             num_queues: DEFAULT_DISK_NUM_QUEUES,
             queue_size: DEFAULT_DISK_QUEUE_SIZE,
             vhost_user: false,
             vhost_socket: None,
             rate_limit_group: None,
             rate_limiter_config: None,
-            id: None,
             disable_io_uring: false,
             disable_aio: false,
-            pci_segment: 0,
             serial: None,
             queue_affinity: None,
+            backing_files: false,
+            sparse: true,
+            image_type: Default::default(),
+            lock_granularity: Default::default(),
         }
     }
 }
@@ -259,8 +274,8 @@ impl VirtualMachine {
                 .iter()
                 .map(|n| NetSpec {
                     tap: n.tap.clone(),
-                    ip: n.ip,
-                    mask: n.mask,
+                    ip: to_ipv4(n.ip),
+                    mask: to_ipv4(n.mask),
                     mac: n.mac,
                     host_mac: n.host_mac,
                 })
@@ -349,13 +364,60 @@ impl VirtualMachine {
 
 #[cfg(test)]
 mod tests {
-    use std::{net::Ipv4Addr, path::PathBuf};
+    use std::{
+        net::{IpAddr, Ipv4Addr},
+        path::PathBuf,
+    };
 
     use net_util::MacAddr;
 
     use crate::vms::virtual_machine::{
-        MountSpec, NetSpec, VirtualMachine, VmID, VmSpec,
+        MountSpec, NetSpec, VirtualMachine, VmID, VmSpec, to_ipv4,
     };
+
+    #[test]
+    fn test_vm_spec_into_vm_config() {
+        let ip = Ipv4Addr::new(192, 168, 249, 2);
+        let mask = Ipv4Addr::new(255, 255, 255, 0);
+        let spec = VmSpec {
+            memory_size: 1024,
+            vcpu_count: 300,
+            kernel_image_path: PathBuf::from("/vmlinux.bin"),
+            kernel_args: vec!["console=hvc0".to_string()],
+            mounts: vec![],
+            net: vec![NetSpec {
+                tap: Some("tap0".to_string()),
+                ip,
+                mask,
+                mac: MacAddr::local_random(),
+                host_mac: None,
+            }],
+        };
+
+        let config: vmm::vm_config::VmConfig = spec.into();
+
+        assert_eq!(config.cpus.boot_vcpus, 300);
+        assert_eq!(config.cpus.max_vcpus, 300);
+        assert!(config.cpus.nested);
+        assert_eq!(config.memory.size, 1024 << 20);
+
+        let net = config.net.as_deref().expect("net config");
+        assert_eq!(net.len(), 1);
+        assert_eq!(net[0].tap.as_deref(), Some("tap0"));
+        assert_eq!(net[0].ip, Some(IpAddr::V4(ip)));
+        assert_eq!(net[0].mask, Some(IpAddr::V4(mask)));
+        assert_eq!(to_ipv4(net[0].ip), ip);
+        assert_eq!(to_ipv4(net[0].mask), mask);
+    }
+
+    #[test]
+    fn test_to_ipv4_falls_back_to_unspecified() {
+        assert_eq!(to_ipv4(None), Ipv4Addr::UNSPECIFIED);
+        assert_eq!(
+            to_ipv4(Some(IpAddr::V6(std::net::Ipv6Addr::LOCALHOST))),
+            Ipv4Addr::UNSPECIFIED
+        );
+    }
 
     #[test]
     #[ignore]
