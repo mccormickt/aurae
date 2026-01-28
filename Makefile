@@ -22,8 +22,8 @@ uid           =  $(shell id -u)
 uname_m       =  $(shell uname -m)
 buf_version   =  1.63.0
 cri_version   =  release-1.26
-clh_version   =  30.0
-vm_kernel     =  6.1.6
+clh_version   =  50.0
+vm_kernel     =  6.12.8
 vm_image      =  https://cloud-images.ubuntu.com/focal/current/focal-server-cloudimg-amd64.img
 ifeq ($(uid), 0)
 root_cargo    =  $(cargo)
