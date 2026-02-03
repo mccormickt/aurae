@@ -23,9 +23,13 @@ use std::{path::PathBuf, sync::Arc};
 use tokio::sync::Mutex;
 use tonic::{Request, Response, Status};
 
+use std::net::Ipv4Addr;
+
+use net_util::MacAddr;
+
 use super::{
     error::{Result, VmServiceError},
-    virtual_machine::{MountSpec, VmID, VmSpec},
+    virtual_machine::{MountSpec, NetSpec, VmID, VmSpec},
     virtual_machines::VirtualMachines,
 };
 
@@ -62,18 +66,57 @@ impl VmService {
         };
 
         let id = VmID::new(vm.id);
-        let Some(root_drive) = vm.root_drive else {
-            return Err(VmServiceError::MissingRootDrive { id: id.clone() });
-        };
 
-        let mut mounts = vec![MountSpec {
-            host_path: PathBuf::from(root_drive.image_path.as_str()),
-            read_only: root_drive.read_only,
-        }];
+        let mut mounts = Vec::new();
+        if let Some(root_drive) = vm.root_drive
+            && !root_drive.image_path.is_empty()
+        {
+            mounts.push(MountSpec {
+                host_path: PathBuf::from(root_drive.image_path.as_str()),
+                read_only: root_drive.read_only,
+            });
+        }
         mounts.extend(vm.drive_mounts.into_iter().map(|m| MountSpec {
             host_path: PathBuf::from(m.image_path.as_str()),
             read_only: m.read_only,
         }));
+
+        let net = if let Some(network) = vm.network {
+            if !network.tap_device.is_empty() || !network.mac_address.is_empty()
+            {
+                let tap = if network.tap_device.is_empty() {
+                    None
+                } else {
+                    Some(network.tap_device)
+                };
+
+                let mac = if network.mac_address.is_empty() {
+                    MacAddr::local_random()
+                } else {
+                    network.mac_address.parse().map_err(|_| {
+                        VmServiceError::InvalidNetworkConfig {
+                            id: id.clone(),
+                            message: format!(
+                                "Invalid MAC address: {}",
+                                network.mac_address
+                            ),
+                        }
+                    })?
+                };
+
+                vec![NetSpec {
+                    tap,
+                    ip: Ipv4Addr::new(0, 0, 0, 0),
+                    mask: Ipv4Addr::new(255, 255, 255, 0),
+                    mac,
+                    host_mac: None,
+                }]
+            } else {
+                vec![]
+            }
+        } else {
+            vec![]
+        };
 
         let spec = VmSpec {
             memory_size: vm.mem_size_mb,
@@ -81,7 +124,7 @@ impl VmService {
             kernel_image_path: PathBuf::from(vm.kernel_img_path.as_str()),
             kernel_args: vm.kernel_args,
             mounts,
-            net: vec![],
+            net,
         };
 
         let vm = vms.create(id.clone(), spec).map_err(|e| {
@@ -175,10 +218,14 @@ impl VmService {
                         .kernel_image_path
                         .to_string_lossy()
                         .to_string(),
-                    root_dir_path: m.vm.mounts[0]
-                        .host_path
-                        .to_string_lossy()
-                        .to_string(),
+                    root_dir_path: m
+                        .vm
+                        .mounts
+                        .first()
+                        .map(|mount| {
+                            mount.host_path.to_string_lossy().to_string()
+                        })
+                        .unwrap_or_default(),
                     auraed_address: m
                         .tap()
                         .map(|t| t.to_string())

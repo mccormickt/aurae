@@ -129,6 +129,9 @@ message VirtualMachine {
 
   // Auraed server address of the VM
   string auraed_address = 8;
+
+  // Network configuration for the VM
+  NetworkConfig network = 9;
 }
 
 // Message to specify the root filesystem config for a  VM
@@ -157,4 +160,15 @@ message DriveMount {
 
   // Mount the root filesystem as read-only. (Default: false)
   bool read_only = 4;
+}
+
+// Message to specify network configuration for a VM
+message NetworkConfig {
+  // The name of the TAP device to use for networking.
+  // If not specified, a random TAP device name will be generated.
+  string tap_device = 1;
+
+  // The MAC address to assign to the VM's network interface.
+  // If not specified, a random local MAC address will be generated.
+  string mac_address = 2;
 }

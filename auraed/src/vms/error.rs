@@ -33,8 +33,8 @@ pub(crate) enum VmServiceError {
     FailedToStopError { id: VmID, source: anyhow::Error },
     #[error("vm config has no machine specified")]
     MissingMachineConfig,
-    #[error("vm '{id}' config has no root drive specified")]
-    MissingRootDrive { id: VmID },
+    #[error("vm '{id}' has invalid network configuration: {message}")]
+    InvalidNetworkConfig { id: VmID, message: String },
 }
 
 impl From<VmServiceError> for Status {
@@ -46,9 +46,11 @@ impl From<VmServiceError> for Status {
             | VmServiceError::FailedToFreeError { .. }
             | VmServiceError::FailedToStartError { .. }
             | VmServiceError::FailedToStopError { .. } => Status::internal(msg),
-            VmServiceError::MissingMachineConfig
-            | VmServiceError::MissingRootDrive { .. } => {
+            VmServiceError::MissingMachineConfig => {
                 Status::failed_precondition(msg)
+            }
+            VmServiceError::InvalidNetworkConfig { .. } => {
+                Status::invalid_argument(msg)
             }
         }
     }

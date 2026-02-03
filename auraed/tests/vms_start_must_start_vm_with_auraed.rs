@@ -56,7 +56,8 @@ async fn vms_with_auraed() {
                         read_only: false,
                     }),
                     drive_mounts: vec![],
-                    auraed_address: String::new()
+                    auraed_address: String::new(),
+                    network: None,
                 }),
             }
         )

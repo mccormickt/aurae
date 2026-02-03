@@ -90,6 +90,21 @@ impl VirtualMachines {
                 mac: MacAddr::local_random(),
                 host_mac: None,
             });
+        } else {
+            // Fill in missing values for user-provided NetSpec
+            for net in spec.net.iter_mut() {
+                if net.tap.is_none() {
+                    net.tap = Some(format!(
+                        "auraed-{}",
+                        rand::rand_alphanumerics(6).into_string().map_err(
+                            |_| anyhow!("Error generating TAP device name")
+                        )?,
+                    ));
+                }
+                if net.ip == Ipv4Addr::new(0, 0, 0, 0) {
+                    net.ip = self.allocate_ip();
+                }
+            }
         }
 
         let vm = VirtualMachine::new(id.clone(), spec)?;
