@@ -17,6 +17,13 @@ use super::get_timestamp_sec;
 use proto::observe::LogItem;
 use tokio::sync::broadcast::{self, Receiver, Sender};
 
+/// Capacity of the per-channel broadcast ring and of the per-subscriber mpsc
+/// that drains it (see `spawn_log_forwarder`). Kept on a power of two so the
+/// broadcast doesn't silently round it up, and shared so the mpsc never
+/// becomes the binding constraint that forces the receiver to lag before the
+/// ring is actually full.
+pub(crate) const LOG_STREAM_CAPACITY: usize = 64;
+
 /// Abstraction Layer for one log generating entity
 /// LogChannel provides channels between Log producers and log consumers
 #[derive(Clone, Debug)]
@@ -29,14 +36,22 @@ pub struct LogChannel {
 impl LogChannel {
     /// Constructor creating the channel for log communication
     pub fn new(name: String) -> LogChannel {
-        // TODO: decide for a cap. 40 is arbitrary
-        let (tx, _) = broadcast::channel(40);
+        let (tx, _) = broadcast::channel(LOG_STREAM_CAPACITY);
         LogChannel { name, tx }
     }
 
     /// Getter for consumer channel
     pub fn subscribe(&self) -> Receiver<LogItem> {
         self.tx.subscribe()
+    }
+
+    /// Borrows the producer side of the broadcast. Used by the
+    /// `MakeWriter for LogChannel` impl in `broadcast_writer.rs` so the
+    /// per-event `BroadcastWriter` doesn't have to clone a `Sender` on
+    /// each event. `Sender::receiver_count()` and the rest of the surface
+    /// the writer needs are all callable through `&Sender`.
+    pub(crate) fn sender(&self) -> &Sender<LogItem> {
+        &self.tx
     }
 
     /// Wrapper that sends a log line to the channel
@@ -54,22 +69,9 @@ impl LogChannel {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use log::Level;
-    use simplelog::SimpleLogger;
-
-    fn init_logging() {
-        let logger_simple = SimpleLogger::new(
-            Level::Trace.to_level_filter(),
-            simplelog::Config::default(),
-        );
-
-        multi_log::MultiLogger::init(vec![logger_simple], Level::Trace)
-            .expect("failed to initialize logger");
-    }
 
     #[tokio::test]
     async fn test_ringbuffer_queue() {
-        init_logging();
         let channel = LogChannel::new("Test".into());
         let mut rx = channel.subscribe();
 

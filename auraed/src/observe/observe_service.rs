@@ -21,7 +21,7 @@ use super::error::ObserveServiceError;
 use super::observed_event_stream::ObservedEventStream;
 use super::proc_cache::{ProcCache, ProcfsProcessInfo};
 use crate::ebpf::tracepoint::PerfEventBroadcast;
-use crate::logging::log_channel::LogChannel;
+use crate::logging::log_channel::{LOG_STREAM_CAPACITY, LogChannel};
 use aurae_ebpf_shared::{ForkedProcess, ProcessExit, Signal};
 use cgroup_cache::CgroupCache;
 use proto::observe::{
@@ -34,10 +34,10 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
-use tokio::sync::{Mutex, broadcast::Receiver};
+use tokio::sync::{Mutex, broadcast::Receiver, broadcast::error::RecvError};
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status};
-use tracing::{info, instrument};
+use tracing::{debug, info, instrument};
 
 #[derive(Debug, Clone)]
 pub struct ObserveService {
@@ -144,6 +144,55 @@ impl ObserveService {
 
         ReceiverStream::new(events)
     }
+
+    /// Bridge a broadcast `LogItem` consumer to a gRPC stream. Each item is
+    /// wrapped with the caller-supplied envelope; `RecvError::Lagged(n)` is
+    /// forwarded as `Status::data_loss` and the stream stays open (broadcast
+    /// `Receiver` auto-recovers to the oldest still-buffered item). The
+    /// forwarder task exits when the client disconnects (`tx.send` errors)
+    /// or all senders are dropped (`RecvError::Closed`).
+    ///
+    /// The mpsc is sized to `LOG_STREAM_CAPACITY` to match the broadcast ring.
+    /// A broadcast `Receiver` can't backpressure its sender, so a smaller mpsc
+    /// would only make the receiver lag (and surface `DataLoss`) before the
+    /// ring was actually full; matching the capacities lets a client absorb a
+    /// full ring's worth of buffered events before any are dropped.
+    fn spawn_log_forwarder<R: Send + 'static>(
+        &self,
+        mut consumer: Receiver<LogItem>,
+        wrap: impl Fn(LogItem) -> R + Send + 'static,
+    ) -> ReceiverStream<Result<R, Status>> {
+        let (tx, rx) = mpsc::channel::<Result<R, Status>>(LOG_STREAM_CAPACITY);
+
+        // The broadcast layer's EnvFilter excludes events with target
+        // `auraed::observe`, so any tracing emitted from inside this task
+        // does not feed back into the consumer.
+        let _ignored = tokio::spawn(async move {
+            loop {
+                match consumer.recv().await {
+                    Ok(item) => {
+                        if tx.send(Ok(wrap(item))).await.is_err() {
+                            break; // gRPC client gone
+                        }
+                    }
+                    Err(RecvError::Lagged(n)) => {
+                        if tx
+                            .send(Err(Status::data_loss(format!(
+                                "log stream lagged: dropped {n} messages"
+                            ))))
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                    Err(RecvError::Closed) => break,
+                }
+            }
+        });
+
+        ReceiverStream::new(rx)
+    }
 }
 
 fn map_get_posix_signals_stream_response(
@@ -179,27 +228,10 @@ impl observe_service_server::ObserveService for ObserveService {
         &self,
         _request: Request<GetAuraeDaemonLogStreamRequest>,
     ) -> Result<Response<Self::GetAuraeDaemonLogStreamStream>, Status> {
-        let (tx, rx) =
-            mpsc::channel::<Result<GetAuraeDaemonLogStreamResponse, Status>>(4);
-        let mut log_consumer = self.get_aurae_daemon_log_stream();
-
-        // TODO: error handling. Warning: recursively logging if error message is also send to this grpc api endpoint
-        //  .. thus disabled logging here.
-        let _ignored = tokio::spawn(async move {
-            // Log consumer will error if:
-            //  the producer is closed (no more logs)
-            //  the receiver is lagging
-            while let Ok(log_item) = log_consumer.recv().await {
-                let resp =
-                    GetAuraeDaemonLogStreamResponse { item: Some(log_item) };
-                if tx.send(Ok(resp)).await.is_err() {
-                    // receiver is gone
-                    break;
-                }
-            }
-        });
-
-        Ok(Response::new(ReceiverStream::new(rx)))
+        let consumer = self.get_aurae_daemon_log_stream();
+        Ok(Response::new(self.spawn_log_forwarder(consumer, |item| {
+            GetAuraeDaemonLogStreamResponse { item: Some(item) }
+        })))
     }
 
     type GetSubProcessStreamStream =
@@ -215,10 +247,9 @@ impl observe_service_server::ObserveService for ObserveService {
             ObserveServiceError::InvalidLogChannelType { channel_type }
         })?;
 
-        println!("Requested Channel {channel:?}");
-        println!("Requested Process ID {pid}");
+        debug!("get_sub_process_stream channel={channel:?} pid={pid}");
 
-        let mut log_consumer = {
+        let consumer = {
             let mut consumer_list = self.sub_process_consumer_list.lock().await;
             consumer_list
                 .get_mut(&pid)
@@ -228,29 +259,12 @@ impl observe_service_server::ObserveService for ObserveService {
                     pid,
                     channel_type: channel,
                 })?
-                .clone()
-        }
-        .subscribe();
+                .subscribe()
+        };
 
-        let (tx, rx) =
-            mpsc::channel::<Result<GetSubProcessStreamResponse, Status>>(4);
-
-        // TODO: error handling. Warning: recursively logging if error message is also send to this grpc api endpoint
-        //  .. thus disabled logging here.
-        let _ignored = tokio::spawn(async move {
-            // Log consumer will error if:
-            //  the producer is closed (no more logs)
-            //  the receiver is lagging
-            while let Ok(log_item) = log_consumer.recv().await {
-                let resp = GetSubProcessStreamResponse { item: Some(log_item) };
-                if tx.send(Ok(resp)).await.is_err() {
-                    // receiver is gone
-                    break;
-                }
-            }
-        });
-
-        Ok(Response::new(ReceiverStream::new(rx)))
+        Ok(Response::new(self.spawn_log_forwarder(consumer, |item| {
+            GetSubProcessStreamResponse { item: Some(item) }
+        })))
     }
 
     type GetPosixSignalsStreamStream =
@@ -274,9 +288,10 @@ impl observe_service_server::ObserveService for ObserveService {
 
 #[cfg(test)]
 mod tests {
-    use super::ObserveService;
+    use super::*;
     use crate::logging::log_channel::LogChannel;
     use proto::observe::LogChannelType;
+    use tonic::Code;
 
     #[tokio::test]
     async fn test_register_sub_process_channel_success() {
@@ -386,5 +401,96 @@ mod tests {
         );
 
         svc.sub_process_consumer_list.lock().await.clear();
+    }
+
+    /// Parses the dropped count out of a `Status::data_loss` message of the
+    /// form `"log stream lagged: dropped N messages"`. Returning a `Result`
+    /// rather than panicking lets the caller assert on it.
+    fn parse_dropped_count(msg: &str) -> Option<usize> {
+        let n_str = msg.strip_prefix("log stream lagged: dropped ")?;
+        let n_str = n_str.strip_suffix(" messages")?;
+        n_str.parse().ok()
+    }
+
+    /// Bursting more items than the broadcast ringbuffer holds while the
+    /// consumer is parked triggers RecvError::Lagged. The handler must
+    /// forward this as a `DataLoss` Status whose dropped count is consistent
+    /// with the position of the first surviving item, and the stream must
+    /// stay open afterwards.
+    #[tokio::test]
+    async fn lagged_consumer_receives_data_loss_status_and_continues() {
+        use tokio_stream::StreamExt as _;
+
+        let aurae_logger = LogChannel::new("auraed".into());
+        let svc = ObserveService::new(aurae_logger.clone(), (None, None, None));
+
+        // Subscribe FIRST (handler captures broadcast::Receiver at sender pos 0).
+        let mut stream =
+            <ObserveService as observe_service_server::ObserveService>::get_aurae_daemon_log_stream(
+                &svc,
+                Request::new(GetAuraeDaemonLogStreamRequest {}),
+            )
+            .await
+            .expect("handler returned stream")
+            .into_inner();
+
+        // Burst far past whatever the ringbuffer can hold (tokio rounds the
+        // requested capacity up to a power of two, so the exact cap is an
+        // implementation detail we don't pin here). 1024 messages is enough
+        // to overrun any reasonable cap.
+        const BURST: usize = 1024;
+        for i in 0..BURST {
+            aurae_logger.send(format!("msg {i:04}"));
+        }
+
+        // First yield runs the consumer; its first recv() sees Lagged.
+        let first = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            stream.next(),
+        )
+        .await
+        .expect("did not receive first item before timeout")
+        .expect("stream ended unexpectedly");
+
+        let status =
+            first.expect_err("first stream item should be a DataLoss Status");
+        assert_eq!(
+            status.code(),
+            Code::DataLoss,
+            "expected DataLoss code, got: {status:?}"
+        );
+        let dropped = parse_dropped_count(status.message()).unwrap_or_else(
+            || {
+                panic!(
+                    "Status message must match \"log stream lagged: dropped N messages\", got: {:?}",
+                    status.message()
+                )
+            },
+        );
+        assert!(
+            dropped > 0 && dropped < BURST,
+            "dropped count {dropped} must be in (0, {BURST})"
+        );
+
+        // Stream stays open: the next item must be the oldest item still in
+        // the ringbuffer. The contract under test: dropped == index of first
+        // surviving item.
+        let next = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            stream.next(),
+        )
+        .await
+        .expect("post-lag item timeout")
+        .expect("stream ended unexpectedly")
+        .expect("post-lag item should be Ok");
+
+        let line = next.item.expect("LogItem present").line;
+        let expected = format!("msg {dropped:04}");
+        assert_eq!(
+            line, expected,
+            "first post-lag item index ({line}) must equal the dropped count \
+             ({dropped}); the broadcast Receiver auto-recovers to the oldest \
+             still-buffered position",
+        );
     }
 }

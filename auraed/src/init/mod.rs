@@ -23,6 +23,7 @@ use self::system_runtimes::{
     CellSystemRuntime, ContainerSystemRuntime, DaemonSystemRuntime,
     Pid1SystemRuntime, SystemRuntime, SystemRuntimeError,
 };
+use crate::logging::log_channel::LogChannel;
 use std::fs::File;
 use std::io::{BufReader, Read};
 mod fileio;
@@ -79,16 +80,17 @@ pub async fn init(
     verbose: bool,
     nested: bool,
     socket_address: Option<String>,
+    log_channel: LogChannel,
 ) -> (Context, SocketStream) {
     let context = Context::get(nested);
     let init_result = init_with_runtimes(
         context,
         verbose,
         socket_address,
-        Pid1SystemRuntime {},
-        CellSystemRuntime {},
-        ContainerSystemRuntime {},
-        DaemonSystemRuntime {},
+        Pid1SystemRuntime::new(log_channel.clone()),
+        CellSystemRuntime::new(log_channel.clone()),
+        ContainerSystemRuntime::new(log_channel.clone()),
+        DaemonSystemRuntime::new(log_channel),
     )
     .await;
 
@@ -98,6 +100,8 @@ pub async fn init(
     }
 }
 
+// init_with_runtimes deliberately takes one runtime per Context variant so
+// tests can inject mocks.
 async fn init_with_runtimes<RPid1, RCell, RContainer, RDaemon>(
     context: Context,
     verbose: bool,

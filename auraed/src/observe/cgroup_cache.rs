@@ -150,7 +150,6 @@ mod test {
         let dir_entry = fs::read_dir("/tmp")
             .expect("tmp dir entries")
             .find(|e| {
-                println!("{:?}", e.as_ref().expect("").file_name());
                 e.as_ref()
                     .expect("file")
                     .file_name()

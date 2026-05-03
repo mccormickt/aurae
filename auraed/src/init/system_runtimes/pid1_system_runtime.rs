@@ -17,10 +17,11 @@ use super::{SocketStream, SystemRuntime, SystemRuntimeError};
 use crate::init::{
     BANNER,
     fs::{CGROUP_MNT_FLAGS, CHMOD_0755, COMMON_MNT_FLAGS, FsError, MountSpec},
-    logging, network,
+    network,
     power::spawn_thread_power_button_listener,
     system_runtimes::create_tcp_socket_stream,
 };
+use crate::logging::log_channel::LogChannel;
 use nix::{
     mount::MsFlags,
     unistd::{mkdir, symlinkat},
@@ -32,9 +33,15 @@ use tracing::{error, info, trace};
 const POWER_BUTTON_DEVICE: &str = "/dev/input/event0";
 const DEFAULT_NETWORK_SOCKET_ADDR: &str = "[::]:8080";
 
-pub(crate) struct Pid1SystemRuntime;
+pub(crate) struct Pid1SystemRuntime {
+    log_channel: LogChannel,
+}
 
 impl Pid1SystemRuntime {
+    pub(crate) fn new(log_channel: LogChannel) -> Self {
+        Self { log_channel }
+    }
+
     fn spawn_system_runtime_threads(&self) {
         // ---- MAIN DAEMON THREAD POOL ----
         // TODO: https://github.com/aurae-runtime/auraed/issues/33
@@ -65,7 +72,7 @@ impl SystemRuntime for Pid1SystemRuntime {
         println!("{BANNER}");
 
         // Initialize the PID 1 logger
-        logging::init(verbose, false)?;
+        self.log_channel.clone().pid1(verbose)?;
         info!("Running as pid 1");
         trace!("Configure filesystem");
 
