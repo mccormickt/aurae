@@ -23,6 +23,7 @@ use self::system_runtimes::{
     CellSystemRuntime, ContainerSystemRuntime, DaemonSystemRuntime,
     Pid1SystemRuntime, SystemRuntime, SystemRuntimeError,
 };
+use crate::logging::log_channel::LogChannel;
 use std::fs::File;
 use std::io::{BufReader, Read};
 mod fileio;
@@ -79,16 +80,20 @@ pub async fn init(
     verbose: bool,
     nested: bool,
     socket_address: Option<String>,
+    log_channel: LogChannel,
 ) -> (Context, SocketStream) {
     let context = Context::get(nested);
     let init_result = init_with_runtimes(
         context,
         verbose,
         socket_address,
-        Pid1SystemRuntime {},
-        CellSystemRuntime {},
-        ContainerSystemRuntime {},
-        DaemonSystemRuntime {},
+        log_channel,
+        (
+            Pid1SystemRuntime {},
+            CellSystemRuntime {},
+            ContainerSystemRuntime {},
+            DaemonSystemRuntime {},
+        ),
     )
     .await;
 
@@ -98,14 +103,14 @@ pub async fn init(
     }
 }
 
+// init_with_runtimes deliberately takes one runtime per Context variant so
+// tests can inject mocks.
 async fn init_with_runtimes<RPid1, RCell, RContainer, RDaemon>(
     context: Context,
     verbose: bool,
     socket_address: Option<String>,
-    pid1_runtime: RPid1,
-    cell_runtime: RCell,
-    container_runtime: RContainer,
-    daemon_runtime: RDaemon,
+    log_channel: LogChannel,
+    runtimes: (RPid1, RCell, RContainer, RDaemon),
 ) -> Result<SocketStream, SystemRuntimeError>
 where
     RPid1: SystemRuntime,
@@ -113,13 +118,21 @@ where
     RContainer: SystemRuntime,
     RDaemon: SystemRuntime,
 {
+    let (pid1_runtime, cell_runtime, container_runtime, daemon_runtime) =
+        runtimes;
     match context {
-        Context::Pid1 => pid1_runtime.init(verbose, socket_address).await,
-        Context::Cell => cell_runtime.init(verbose, socket_address).await,
-        Context::Container => {
-            container_runtime.init(verbose, socket_address).await
+        Context::Pid1 => {
+            pid1_runtime.init(verbose, socket_address, log_channel).await
         }
-        Context::Daemon => daemon_runtime.init(verbose, socket_address).await,
+        Context::Cell => {
+            cell_runtime.init(verbose, socket_address, log_channel).await
+        }
+        Context::Container => {
+            container_runtime.init(verbose, socket_address, log_channel).await
+        }
+        Context::Daemon => {
+            daemon_runtime.init(verbose, socket_address, log_channel).await
+        }
     }
 }
 
@@ -337,6 +350,7 @@ mod tests {
             self,
             _verbose: bool,
             _socket_address: Option<String>,
+            _log_channel: LogChannel,
         ) -> Result<SocketStream, SystemRuntimeError> {
             let _ = self.calls.fetch_add(1, Ordering::SeqCst);
             Err(SystemRuntimeError::Other(anyhow!(self.label)))
@@ -382,10 +396,13 @@ mod tests {
                     ctx,
                     false,
                     None,
-                    pid1.clone(),
-                    cell.clone(),
-                    container.clone(),
-                    daemon.clone(),
+                    LogChannel::new("test"),
+                    (
+                        pid1.clone(),
+                        cell.clone(),
+                        container.clone(),
+                        daemon.clone(),
+                    ),
                 )
                 .await;
             }
