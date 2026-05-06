@@ -69,7 +69,7 @@ use crate::ebpf::{
     SignalSignalGenerateTracepointProgram, TaskstatsExitKProbeProgram,
 };
 use crate::{
-    cells::CellService, cri::oci::AuraeOCIBuilder,
+    cells::{CellObserveService, CellService}, cri::oci::AuraeOCIBuilder,
     cri::runtime_service::RuntimeService, discovery::DiscoveryService,
     init::Context as AuraeContext, init::SocketStream,
     logging::log_channel::LogChannel, observe::ObserveService,
@@ -247,12 +247,15 @@ pub async fn run(
             tonic_health::server::health_reporter();
 
         let observe_service = ObserveService::new(log_channel, perf_events);
-        let observe_service_server =
-            ObserveServiceServer::new(observe_service.clone());
 
         let cell_service = CellService::new(observe_service.clone());
         let cell_service_server = CellServiceServer::new(cell_service.clone());
         health_reporter.set_serving::<CellServiceServer<CellService>>().await;
+
+        // The cell-aware observe service shares CellService's cell registry so
+        // it can proxy cell-scoped observe RPCs to nested daemons.
+        let observe_service_server =
+            ObserveServiceServer::new(cell_service.observe_proxy());
 
         let discovery_service = DiscoveryService::new();
         let discovery_service_server =
@@ -262,7 +265,7 @@ pub async fn run(
             .await;
 
         health_reporter
-            .set_serving::<ObserveServiceServer<ObserveService>>()
+            .set_serving::<ObserveServiceServer<CellObserveService>>()
             .await;
 
         // let pod_service = PodService::new(self.runtime_dir.clone());

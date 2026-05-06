@@ -37,7 +37,7 @@ use tokio::sync::mpsc;
 use tokio::sync::{Mutex, broadcast::Receiver, broadcast::error::RecvError};
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status};
-use tracing::{debug, info, instrument};
+use tracing::{debug, info, instrument, warn};
 
 #[derive(Debug, Clone)]
 pub struct ObserveService {
@@ -125,12 +125,8 @@ impl ObserveService {
         Ok(())
     }
 
-    fn get_aurae_daemon_log_stream(&self) -> Receiver<LogItem> {
-        self.aurae_logger.subscribe()
-    }
-
     #[instrument(skip(self))]
-    fn get_posix_signals_stream(
+    fn subscribe_posix_signals(
         &self,
         filter: Option<(WorkloadType, String)>,
     ) -> ReceiverStream<Result<GetPosixSignalsStreamResponse, Status>> {
@@ -146,11 +142,16 @@ impl ObserveService {
     }
 
     /// Bridge a broadcast `LogItem` consumer to a gRPC stream. Each item is
-    /// wrapped with the caller-supplied envelope; `RecvError::Lagged(n)` is
-    /// forwarded as `Status::data_loss` and the stream stays open (broadcast
-    /// `Receiver` auto-recovers to the oldest still-buffered item). The
-    /// forwarder task exits when the client disconnects (`tx.send` errors)
-    /// or all senders are dropped (`RecvError::Closed`).
+    /// wrapped with the caller-supplied envelope. On `RecvError::Lagged` the
+    /// broadcast `Receiver` has already dropped the oldest unread items and
+    /// auto-recovered to the oldest still-buffered one; the gap is logged
+    /// server-side and forwarding continues. We deliberately do not surface
+    /// the lag as a `Status` item: tonic ends a server-streaming RPC at the
+    /// first `Err(Status)` the stream yields (it becomes the `grpc-status`
+    /// trailer), so emitting one would terminate the client's stream rather
+    /// than merely signal the gap. The forwarder task exits when the client
+    /// disconnects (`tx.send` errors) or all senders are dropped
+    /// (`RecvError::Closed`).
     ///
     /// The mpsc is sized to `LOG_STREAM_CAPACITY` to match the broadcast ring.
     /// A broadcast `Receiver` can't backpressure its sender, so a smaller mpsc
@@ -176,15 +177,13 @@ impl ObserveService {
                         }
                     }
                     Err(RecvError::Lagged(n)) => {
-                        if tx
-                            .send(Err(Status::data_loss(format!(
-                                "log stream lagged: dropped {n} messages"
-                            ))))
-                            .await
-                            .is_err()
-                        {
-                            break;
-                        }
+                        // The ring overran a slow consumer. The Receiver has
+                        // auto-recovered to the oldest still-buffered item, so
+                        // keep forwarding; surfacing an `Err(Status)` here
+                        // would end the client's RPC (see method docs). The
+                        // `auraed::observe` target is excluded from the
+                        // broadcast layer, so this warning does not feed back.
+                        warn!("log stream lagged: dropped {n} messages");
                     }
                     Err(RecvError::Closed) => break,
                 }
@@ -228,7 +227,7 @@ impl observe_service_server::ObserveService for ObserveService {
         &self,
         _request: Request<GetAuraeDaemonLogStreamRequest>,
     ) -> Result<Response<Self::GetAuraeDaemonLogStreamStream>, Status> {
-        let consumer = self.get_aurae_daemon_log_stream();
+        let consumer = self.aurae_logger.subscribe();
         Ok(Response::new(self.spawn_log_forwarder(consumer, |item| {
             GetAuraeDaemonLogStreamResponse { item: Some(item) }
         })))
@@ -241,8 +240,11 @@ impl observe_service_server::ObserveService for ObserveService {
         &self,
         request: Request<GetSubProcessStreamRequest>,
     ) -> Result<Response<Self::GetSubProcessStreamStream>, Status> {
-        let GetSubProcessStreamRequest { process_id: pid, channel_type } =
-            request.into_inner();
+        let GetSubProcessStreamRequest {
+            process_id: pid,
+            channel_type,
+            cell_name: _,
+        } = request.into_inner();
         let channel = LogChannelType::try_from(channel_type).map_err(|_| {
             ObserveServiceError::InvalidLogChannelType { channel_type }
         })?;
@@ -280,7 +282,7 @@ impl observe_service_server::ObserveService for ObserveService {
             ));
         }
 
-        Ok(Response::new(self.get_posix_signals_stream(
+        Ok(Response::new(self.subscribe_posix_signals(
             request.into_inner().workload.map(|w| (w.workload_type(), w.id)),
         )))
     }
@@ -291,7 +293,6 @@ mod tests {
     use super::*;
     use crate::logging::log_channel::LogChannel;
     use proto::observe::LogChannelType;
-    use tonic::Code;
 
     #[tokio::test]
     async fn test_register_sub_process_channel_success() {
@@ -403,22 +404,19 @@ mod tests {
         svc.sub_process_consumer_list.lock().await.clear();
     }
 
-    /// Parses the dropped count out of a `Status::data_loss` message of the
-    /// form `"log stream lagged: dropped N messages"`. Returning a `Result`
-    /// rather than panicking lets the caller assert on it.
-    fn parse_dropped_count(msg: &str) -> Option<usize> {
-        let n_str = msg.strip_prefix("log stream lagged: dropped ")?;
-        let n_str = n_str.strip_suffix(" messages")?;
-        n_str.parse().ok()
+    /// Parses the index N out of a `"msg NNNN"` log line.
+    fn parse_msg_index(line: &str) -> Option<usize> {
+        line.strip_prefix("msg ")?.trim().parse().ok()
     }
 
     /// Bursting more items than the broadcast ringbuffer holds while the
-    /// consumer is parked triggers RecvError::Lagged. The handler must
-    /// forward this as a `DataLoss` Status whose dropped count is consistent
-    /// with the position of the first surviving item, and the stream must
-    /// stay open afterwards.
+    /// consumer is parked triggers RecvError::Lagged inside the forwarder.
+    /// The forwarder must swallow the lag (logging it server-side) and keep
+    /// the gRPC stream open, delivering the oldest still-buffered items in
+    /// order. It must never yield an `Err(Status)`, which tonic would turn
+    /// into the RPC's terminating trailer over the wire.
     #[tokio::test]
-    async fn lagged_consumer_receives_data_loss_status_and_continues() {
+    async fn lagged_consumer_skips_dropped_messages_and_continues() {
         use tokio_stream::StreamExt as _;
 
         let aurae_logger = LogChannel::new("auraed".into());
@@ -428,7 +426,7 @@ mod tests {
         let mut stream =
             <ObserveService as observe_service_server::ObserveService>::get_aurae_daemon_log_stream(
                 &svc,
-                Request::new(GetAuraeDaemonLogStreamRequest {}),
+                Request::new(GetAuraeDaemonLogStreamRequest { cell_name: None }),
             )
             .await
             .expect("handler returned stream")
@@ -443,38 +441,29 @@ mod tests {
             aurae_logger.send(format!("msg {i:04}"));
         }
 
-        // First yield runs the consumer; its first recv() sees Lagged.
+        // The forwarder's first recv() sees Lagged and swallows it, so the
+        // first item the client observes is a real LogItem (the oldest item
+        // still in the ring) — never an `Err(Status)`, which would end the RPC.
         let first = tokio::time::timeout(
             std::time::Duration::from_secs(2),
             stream.next(),
         )
         .await
         .expect("did not receive first item before timeout")
-        .expect("stream ended unexpectedly");
+        .expect("stream ended unexpectedly")
+        .expect("first item must be Ok; a Status would terminate the RPC");
 
-        let status =
-            first.expect_err("first stream item should be a DataLoss Status");
-        assert_eq!(
-            status.code(),
-            Code::DataLoss,
-            "expected DataLoss code, got: {status:?}"
-        );
-        let dropped = parse_dropped_count(status.message()).unwrap_or_else(
-            || {
-                panic!(
-                    "Status message must match \"log stream lagged: dropped N messages\", got: {:?}",
-                    status.message()
-                )
-            },
-        );
+        let first_line = first.item.expect("LogItem present").line;
+        let first_idx = parse_msg_index(&first_line)
+            .unwrap_or_else(|| panic!("unexpected line: {first_line:?}"));
+        // The front of the burst was dropped; we recovered partway through.
         assert!(
-            dropped > 0 && dropped < BURST,
-            "dropped count {dropped} must be in (0, {BURST})"
+            first_idx > 0 && first_idx < BURST,
+            "first surviving index {first_idx} must be in (0, {BURST})"
         );
 
-        // Stream stays open: the next item must be the oldest item still in
-        // the ringbuffer. The contract under test: dropped == index of first
-        // surviving item.
+        // Stream stays open and keeps delivering items contiguously after the
+        // dropped prefix.
         let next = tokio::time::timeout(
             std::time::Duration::from_secs(2),
             stream.next(),
@@ -484,13 +473,13 @@ mod tests {
         .expect("stream ended unexpectedly")
         .expect("post-lag item should be Ok");
 
-        let line = next.item.expect("LogItem present").line;
-        let expected = format!("msg {dropped:04}");
+        let next_line = next.item.expect("LogItem present").line;
+        let next_idx = parse_msg_index(&next_line)
+            .unwrap_or_else(|| panic!("unexpected line: {next_line:?}"));
         assert_eq!(
-            line, expected,
-            "first post-lag item index ({line}) must equal the dropped count \
-             ({dropped}); the broadcast Receiver auto-recovers to the oldest \
-             still-buffered position",
+            next_idx,
+            first_idx + 1,
+            "items must arrive contiguously after the dropped prefix",
         );
     }
 }

@@ -24,9 +24,12 @@ use super::{
     },
 };
 use crate::{cells::cell_service::cells::CellsError, observe::ObserveService};
-use ::validation::ValidatedType;
+use ::validation::{ValidatedField, ValidatedType};
 use backoff::backoff::Backoff;
-use client::{Client, ClientError, cells::cell_service::CellServiceClient};
+use client::{
+    Client, ClientError, cells::cell_service::CellServiceClient,
+    observe::observe_service::ObserveServiceClient,
+};
 use proto::{
     cells::{
         Cell, CellGraphNode, CellServiceAllocateRequest,
@@ -37,10 +40,16 @@ use proto::{
         CellServiceStopResponse, CpuController, CpusetController,
         MemoryController, cell_service_server,
     },
-    observe::LogChannelType,
+    observe::{
+        GetAuraeDaemonLogStreamRequest, GetAuraeDaemonLogStreamResponse,
+        GetPosixSignalsStreamRequest, GetPosixSignalsStreamResponse,
+        GetSubProcessStreamRequest, GetSubProcessStreamResponse,
+        LogChannelType, observe_service_server,
+    },
 };
-use std::{os::unix::fs::MetadataExt, sync::Arc, time::Duration};
+use std::{os::unix::fs::MetadataExt, pin::Pin, sync::Arc, time::Duration};
 use tokio::sync::Mutex;
+use tokio_stream::Stream;
 use tonic::{Code, Request, Response, Status};
 use tracing::{info, instrument, trace, warn};
 
@@ -101,6 +110,13 @@ macro_rules! do_in_cell {
         .await
     }};
 }
+
+/// Boxed server-streaming response. Both the nested daemon's `Streaming<T>`
+/// (proxy path) and the local `ObserveService`'s `ReceiverStream` (delegate
+/// path) are `Stream<Item = Result<T, Status>>`, so a boxed trait object lets a
+/// single associated type carry either without an intermediate forwarding task.
+type ObserveStream<T> =
+    Pin<Box<dyn Stream<Item = std::result::Result<T, Status>> + Send>>;
 
 /// CellService struct manages the lifecycle of cells and executables.
 #[derive(Debug, Clone)]
@@ -568,6 +584,104 @@ impl cell_service_server::CellService for CellService {
     }
 }
 
+impl CellService {
+    /// Build the cell-aware observe service that shares this service's cell
+    /// registry and local `ObserveService`. Kept separate from `CellService`
+    /// so the cell-lifecycle service isn't coupled to observe routing.
+    pub fn observe_proxy(&self) -> CellObserveService {
+        CellObserveService {
+            cells: self.cells.clone(),
+            observe_service: self.observe_service.clone(),
+        }
+    }
+}
+
+/// Serves the observe gRPC API with cell awareness: when `cell_name` is set on
+/// a request it proxies through `do_in_cell!` to the nested auraed inside that
+/// cell; otherwise it delegates to the local `ObserveService`.
+#[derive(Debug, Clone)]
+pub struct CellObserveService {
+    cells: Arc<Mutex<Cells>>,
+    observe_service: ObserveService,
+}
+
+#[tonic::async_trait]
+impl observe_service_server::ObserveService for CellObserveService {
+    type GetAuraeDaemonLogStreamStream =
+        ObserveStream<GetAuraeDaemonLogStreamResponse>;
+
+    #[instrument(skip(self))]
+    async fn get_aurae_daemon_log_stream(
+        &self,
+        mut request: Request<GetAuraeDaemonLogStreamRequest>,
+    ) -> std::result::Result<
+        Response<Self::GetAuraeDaemonLogStreamStream>,
+        Status,
+    > {
+        let cell_name = CellName::validate_optional(
+            request.get_mut().cell_name.take(),
+            "cell_name",
+            None,
+        )?;
+
+        if let Some(cell_name) = cell_name {
+            let request = request.into_inner();
+            let response = do_in_cell!(
+                self,
+                cell_name,
+                get_aurae_daemon_log_stream,
+                request
+            )?;
+            Ok(Response::new(Box::pin(response.into_inner())))
+        } else {
+            let response =
+                self.observe_service.get_aurae_daemon_log_stream(request).await?;
+            Ok(Response::new(Box::pin(response.into_inner())))
+        }
+    }
+
+    type GetSubProcessStreamStream =
+        ObserveStream<GetSubProcessStreamResponse>;
+
+    #[instrument(skip(self))]
+    async fn get_sub_process_stream(
+        &self,
+        mut request: Request<GetSubProcessStreamRequest>,
+    ) -> std::result::Result<Response<Self::GetSubProcessStreamStream>, Status>
+    {
+        let cell_name = CellName::validate_optional(
+            request.get_mut().cell_name.take(),
+            "cell_name",
+            None,
+        )?;
+
+        if let Some(cell_name) = cell_name {
+            let request = request.into_inner();
+            let response =
+                do_in_cell!(self, cell_name, get_sub_process_stream, request)?;
+            Ok(Response::new(Box::pin(response.into_inner())))
+        } else {
+            let response =
+                self.observe_service.get_sub_process_stream(request).await?;
+            Ok(Response::new(Box::pin(response.into_inner())))
+        }
+    }
+
+    type GetPosixSignalsStreamStream =
+        ObserveStream<GetPosixSignalsStreamResponse>;
+
+    #[instrument(skip(self))]
+    async fn get_posix_signals_stream(
+        &self,
+        request: Request<GetPosixSignalsStreamRequest>,
+    ) -> std::result::Result<Response<Self::GetPosixSignalsStreamStream>, Status>
+    {
+        let response =
+            self.observe_service.get_posix_signals_stream(request).await?;
+        Ok(Response::new(Box::pin(response.into_inner())))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -580,12 +694,14 @@ mod tests {
         logging::log_channel::LogChannel,
     };
     use iter_tools::Itertools;
+    use proto::observe::observe_service_server::ObserveService as _;
     use proto::{
         cells::{CellServiceStartRequest, CellServiceStopRequest, Executable},
         observe::LogChannelType,
     };
     use std::os::unix::fs::MetadataExt;
     use test_helpers::*;
+    use tokio_stream::StreamExt as _;
 
     /// Test for the list function.
     #[tokio::test]
@@ -774,5 +890,169 @@ mod tests {
                 .await,
             "stderr channel should be removed after stop"
         );
+    }
+
+    /// When `cell_name` is unset, the observe-trait impl on `CellService`
+    /// must delegate to its inner `ObserveService` (no proxy hop).
+    #[tokio::test]
+    async fn observe_delegates_to_local_when_cell_name_unset_for_sub_process_stream()
+     {
+        let observe_service = ObserveService::new(
+            LogChannel::new(String::from("auraed")),
+            (None, None, None),
+        );
+        let cell_service = CellService::new(observe_service.clone());
+
+        let pid = 4242;
+        let producer = LogChannel::new(String::from("test::stdout"));
+        observe_service
+            .register_sub_process_channel(
+                pid,
+                LogChannelType::Stdout,
+                producer.clone(),
+            )
+            .await
+            .expect("register channel");
+
+        let mut stream = cell_service
+            .observe_proxy()
+            .get_sub_process_stream(Request::new(GetSubProcessStreamRequest {
+                process_id: pid,
+                channel_type: LogChannelType::Stdout as i32,
+                cell_name: None,
+            }))
+            .await
+            .expect("local delegation returns a stream")
+            .into_inner();
+
+        producer.send("hello from local".into());
+
+        let item = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            stream.next(),
+        )
+        .await
+        .expect("stream should deliver an item")
+        .expect("stream not closed")
+        .expect("item is Ok");
+
+        assert_eq!(
+            item.item.expect("LogItem present").line,
+            "hello from local"
+        );
+    }
+
+    #[tokio::test]
+    async fn observe_delegates_to_local_when_cell_name_unset_for_daemon_log_stream()
+     {
+        let aurae_logger = LogChannel::new(String::from("auraed"));
+        let observe_service =
+            ObserveService::new(aurae_logger.clone(), (None, None, None));
+        let cell_service = CellService::new(observe_service);
+
+        let mut stream = cell_service
+            .observe_proxy()
+            .get_aurae_daemon_log_stream(Request::new(
+                GetAuraeDaemonLogStreamRequest { cell_name: None },
+            ))
+            .await
+            .expect("local delegation returns a stream")
+            .into_inner();
+
+        aurae_logger.send("hello from daemon".into());
+
+        let item = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            stream.next(),
+        )
+        .await
+        .expect("stream should deliver an item")
+        .expect("stream not closed")
+        .expect("item is Ok");
+
+        assert_eq!(
+            item.item.expect("LogItem present").line,
+            "hello from daemon"
+        );
+    }
+
+    fn cell_service_for_test() -> CellService {
+        CellService::new(ObserveService::new(
+            LogChannel::new(String::from("auraed")),
+            (None, None, None),
+        ))
+    }
+
+    /// A malformed `cell_name` (containing a character outside the
+    /// domain-name-label regex) must be rejected via the project-wide
+    /// `ValidationError → Status::failed_precondition` mapping, before
+    /// any cell lookup is attempted.
+    #[tokio::test]
+    async fn observe_rejects_malformed_cell_name_for_sub_process_stream() {
+        let err = cell_service_for_test()
+            .observe_proxy()
+            .get_sub_process_stream(Request::new(GetSubProcessStreamRequest {
+                process_id: 1,
+                channel_type: LogChannelType::Stdout as i32,
+                cell_name: Some(String::from("bad@name")),
+            }))
+            .await
+            .err()
+            .expect("malformed cell_name must be rejected");
+
+        assert_eq!(err.code(), Code::FailedPrecondition);
+    }
+
+    #[tokio::test]
+    async fn observe_rejects_malformed_cell_name_for_daemon_log_stream() {
+        let err = cell_service_for_test()
+            .observe_proxy()
+            .get_aurae_daemon_log_stream(Request::new(
+                GetAuraeDaemonLogStreamRequest {
+                    cell_name: Some(String::from("bad@name")),
+                },
+            ))
+            .await
+            .err()
+            .expect("malformed cell_name must be rejected");
+
+        assert_eq!(err.code(), Code::FailedPrecondition);
+    }
+
+    /// A well-formed but unknown `cell_name` must surface as `NotFound`
+    /// from `do_in_cell!`'s `cells.get` miss — not as a misleading
+    /// `Unavailable` or `Internal`.
+    #[tokio::test]
+    async fn observe_returns_not_found_when_cell_does_not_exist_for_sub_process_stream()
+     {
+        let err = cell_service_for_test()
+            .observe_proxy()
+            .get_sub_process_stream(Request::new(GetSubProcessStreamRequest {
+                process_id: 1,
+                channel_type: LogChannelType::Stdout as i32,
+                cell_name: Some(String::from("does-not-exist")),
+            }))
+            .await
+            .err()
+            .expect("missing cell must yield NotFound");
+
+        assert_eq!(err.code(), Code::NotFound);
+    }
+
+    #[tokio::test]
+    async fn observe_returns_not_found_when_cell_does_not_exist_for_daemon_log_stream()
+     {
+        let err = cell_service_for_test()
+            .observe_proxy()
+            .get_aurae_daemon_log_stream(Request::new(
+                GetAuraeDaemonLogStreamRequest {
+                    cell_name: Some(String::from("does-not-exist")),
+                },
+            ))
+            .await
+            .err()
+            .expect("missing cell must yield NotFound");
+
+        assert_eq!(err.code(), Code::NotFound);
     }
 }

@@ -13,6 +13,6 @@
  * SPDX-License-Identifier: Apache-2.0                                        *
 \* -------------------------------------------------------------------------- */
 
-pub(crate) use cell_service::CellService;
+pub(crate) use cell_service::{CellObserveService, CellService};
 
 mod cell_service;
