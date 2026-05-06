@@ -12,7 +12,7 @@
  * Copyright 2022 - 2024, the aurae contributors                              *
  * SPDX-License-Identifier: Apache-2.0                                        *
 \* -------------------------------------------------------------------------- */
-pub use cell_service::CellService;
+pub use cell_service::{CellObserveService, CellService};
 use error::Result;
 
 #[allow(clippy::module_inception)]

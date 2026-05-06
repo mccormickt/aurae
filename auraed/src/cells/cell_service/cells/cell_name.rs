@@ -101,7 +101,7 @@ impl ValidatedField<String> for CellName {
 
         let input = input
             .split(SEPARATOR)
-            .flat_map(|component| {
+            .map(|component| {
                 // NOTE: We must always reserve '/' (separator) and '_' (name of leaf cgroup)
                 validation::allow_regex(
                     component,
@@ -112,7 +112,7 @@ impl ValidatedField<String> for CellName {
 
                 Ok::<_, ValidationError>(component)
             })
-            .collect();
+            .collect::<Result<PathBuf, ValidationError>>()?;
 
         Ok(Self(input))
     }
@@ -157,6 +157,18 @@ mod tests {
         .expect("failed to create valid cell name");
 
         assert_eq!(cell_name.leaf(), "child-cell");
+    }
+
+    #[test]
+    fn rejects_invalid_nested_component() {
+        assert!(
+            CellName::validate(
+                Some("parent-cell/bad@name".into()),
+                "test",
+                None,
+            )
+            .is_err()
+        );
     }
 
     #[test]

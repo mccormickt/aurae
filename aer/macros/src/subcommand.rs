@@ -233,10 +233,16 @@ impl Command<'_> {
                 #method_ident
             }
         } else {
+            let command_attribute =
+                if fields.iter().any(|f| f.requires_argument) {
+                    quote! { #[command(arg_required_else_help = true)] }
+                } else {
+                    quote! { #[command()] }
+                };
             let fields = fields.iter().map(|f| f.to_variant());
 
             quote! {
-                #[command(arg_required_else_help = true)]
+                #command_attribute
                 #method_ident {
                     #(#fields,)*
                 }
@@ -343,6 +349,7 @@ struct ResolvedField {
     attribute: proc_macro2::TokenStream,
     field_ident: VecDeque<Ident>,
     type_ident: proc_macro2::TokenStream,
+    requires_argument: bool,
 }
 
 impl ResolvedField {
@@ -361,7 +368,12 @@ impl ResolvedField {
 
     fn to_variant(&self) -> proc_macro2::TokenStream {
         let field_ident = self.get_resolved_field_ident();
-        let Self { attribute, field_ident: _, type_ident } = self;
+        let Self {
+            attribute,
+            field_ident: _,
+            type_ident,
+            requires_argument: _,
+        } = self;
 
         quote! {
             #attribute
@@ -397,6 +409,7 @@ fn resolve_fields<'a>(
                         attribute: quote! { #[arg(long)] },
                         field_ident: vec![field_ident].into(),
                         type_ident,
+                        requires_argument: !f.proto3_optional(),
                     }]
                 }
                 FieldType::VecPrimitive => {
@@ -410,6 +423,7 @@ fn resolve_fields<'a>(
                         attribute: quote! { #[arg(long, action = clap::ArgAction::Append)] },
                         field_ident: vec![field_ident].into(),
                         type_ident: quote! { Vec<#inner_type> },
+                        requires_argument: true,
                     }]
                 }
                 FieldType::Message | FieldType::VecMessage => {

@@ -79,12 +79,17 @@ message Signal {
   int32 process_id = 2;
 }
 
-message GetAuraeDaemonLogStreamRequest {}
+message GetAuraeDaemonLogStreamRequest {
+  // when set, proxy to the nested auraed inside this cell
+  optional string cell_name = 1;
+}
 
 // TODO: not implemented in auraescript
 message GetSubProcessStreamRequest {
   int32 process_id = 2;
   LogChannelType channel_type = 1;
+  // when set, proxy to the nested auraed inside this cell
+  optional string cell_name = 3;
 }
 
 message LogItem {

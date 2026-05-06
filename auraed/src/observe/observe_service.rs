@@ -83,6 +83,12 @@ impl ObserveService {
         let _ = self.log_stream_shutdown.send_replace(true);
     }
 
+    pub(crate) fn subscribe_log_stream_shutdown(
+        &self,
+    ) -> watch::Receiver<bool> {
+        self.log_stream_shutdown.subscribe()
+    }
+
     pub async fn register_sub_process_channel(
         &self,
         pid: i32,
@@ -132,12 +138,8 @@ impl ObserveService {
         Ok(())
     }
 
-    fn get_aurae_daemon_log_stream(&self) -> Receiver<LogItem> {
-        self.aurae_logger.subscribe()
-    }
-
     #[instrument(skip(self))]
-    fn get_posix_signals_stream(
+    fn subscribe_posix_signals(
         &self,
         filter: Option<(WorkloadType, String)>,
     ) -> ReceiverStream<Result<GetPosixSignalsStreamResponse, Status>> {
@@ -228,7 +230,7 @@ impl observe_service_server::ObserveService for ObserveService {
         &self,
         _request: Request<GetAuraeDaemonLogStreamRequest>,
     ) -> Result<Response<Self::GetAuraeDaemonLogStreamStream>, Status> {
-        let consumer = self.get_aurae_daemon_log_stream();
+        let consumer = self.aurae_logger.subscribe();
         Ok(Response::new(self.spawn_log_forwarder(consumer, |item| {
             GetAuraeDaemonLogStreamResponse { item: Some(item) }
         })))
@@ -241,8 +243,11 @@ impl observe_service_server::ObserveService for ObserveService {
         &self,
         request: Request<GetSubProcessStreamRequest>,
     ) -> Result<Response<Self::GetSubProcessStreamStream>, Status> {
-        let GetSubProcessStreamRequest { process_id: pid, channel_type } =
-            request.into_inner();
+        let GetSubProcessStreamRequest {
+            process_id: pid,
+            channel_type,
+            cell_name: _,
+        } = request.into_inner();
         let channel = LogChannelType::try_from(channel_type).map_err(|_| {
             ObserveServiceError::InvalidLogChannelType { channel_type }
         })?;
@@ -280,7 +285,7 @@ impl observe_service_server::ObserveService for ObserveService {
             ));
         }
 
-        Ok(Response::new(self.get_posix_signals_stream(
+        Ok(Response::new(self.subscribe_posix_signals(
             request.into_inner().workload.map(|w| (w.workload_type(), w.id)),
         )))
     }
@@ -413,7 +418,7 @@ mod tests {
         let mut stream =
             <ObserveService as observe_service_server::ObserveService>::get_aurae_daemon_log_stream(
                 &svc,
-                Request::new(GetAuraeDaemonLogStreamRequest {}),
+                Request::new(GetAuraeDaemonLogStreamRequest { cell_name: None }),
             )
             .await
             .expect("handler returned stream")
@@ -446,7 +451,7 @@ mod tests {
         let mut stream =
             <ObserveService as observe_service_server::ObserveService>::get_aurae_daemon_log_stream(
                 &svc,
-                Request::new(GetAuraeDaemonLogStreamRequest {}),
+                Request::new(GetAuraeDaemonLogStreamRequest { cell_name: None }),
             )
             .await
             .expect("handler returned stream")
@@ -467,7 +472,7 @@ mod tests {
         let _stream =
             <ObserveService as observe_service_server::ObserveService>::get_aurae_daemon_log_stream(
                 &svc,
-                Request::new(GetAuraeDaemonLogStreamRequest {}),
+                Request::new(GetAuraeDaemonLogStreamRequest { cell_name: None }),
             )
             .await
             .expect("handler returned stream")
