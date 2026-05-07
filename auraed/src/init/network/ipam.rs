@@ -43,6 +43,13 @@ pub const DEFAULT_POOL_V6: &str = "fd00:ae::/64";
 /// sub-delegate the remainder to nested VMs.
 pub const DEFAULT_DEVICE_PREFIX_V6: u8 = 112;
 
+/// The IPAM key of a VM allocation. Cells and VMs use the same pool. The
+/// prefix `cell:` or `vm:` keeps the two key spaces separate. A cell uses
+/// the key `cell:<name>`.
+pub fn vm_key(vm_id: impl std::fmt::Display) -> String {
+    format!("vm:{vm_id}")
+}
+
 /// The runtime errors of the IPAM allocator. A construction error, for
 /// example a parse error or an invalid prefix range, uses
 /// [`ValidationError`].
