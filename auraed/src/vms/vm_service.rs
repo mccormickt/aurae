@@ -13,6 +13,8 @@
  * SPDX-License-Identifier: Apache-2.0                                        *
 \* -------------------------------------------------------------------------- */
 
+use anyhow::anyhow;
+use client::vms::vm_service::VmServiceClient;
 use proto::vms::{
     VirtualMachineSummary, VmServiceAllocateRequest, VmServiceAllocateResponse,
     VmServiceFreeRequest, VmServiceFreeResponse, VmServiceListRequest,
@@ -22,9 +24,15 @@ use proto::vms::{
 use std::{path::PathBuf, sync::Arc};
 use tokio::sync::Mutex;
 use tonic::{Request, Response, Status};
+use tracing::error;
+use validation::ValidatedField;
+
+use crate::cells::cell_service::cells::{CellName, Cells};
+use crate::init::network::Network;
 
 use super::{
     error::{Result, VmServiceError},
+    proxy::proxy_to_cell,
     virtual_machine::{MountSpec, VmID, VmSpec},
     virtual_machines::VirtualMachines,
 };
@@ -33,28 +41,84 @@ use super::{
 #[derive(Debug, Clone)]
 pub struct VmService {
     vms: Arc<Mutex<VirtualMachines>>,
+    /// Shared host networking. `None` when VM networking could not be
+    /// set up (non-daemon contexts, netlink failed). Allocation is
+    /// refused in that state.
+    network: Option<Network>,
+    /// Shared with `CellService` so `cell_name`-scoped requests can be
+    /// proxied into a nested auraed.
+    cells: Arc<Mutex<Cells>>,
+    /// True only when this auraed is the host daemon, which is the only
+    /// context that can host VMs locally. A nested auraed (cell/pid1)
+    /// sets this `false` and refuses local VM lifecycle RPCs with
+    /// [`VmServiceError::VmInCellUnsupported`] — the host still proxies
+    /// `cell_name`-scoped requests here, but a nested auraed can't yet
+    /// allocate VMs of its own.
+    is_host_daemon: bool,
     // TODO: ObserveService
 }
 
 impl VmService {
     /// Allocates a new instance of VmService.
-    pub fn new() -> Self {
-        Self { vms: Default::default() }
+    ///
+    /// `network` is the daemon's `Network` handle (which owns the IPAM
+    /// allocator). Pass `None` from non-Daemon contexts and from hosts
+    /// where network setup failed; VM allocation is refused in that
+    /// state.
+    ///
+    /// `cells` is shared with [`crate::cells::CellService`] so that
+    /// `cell_name`-scoped VM RPCs can look up the target cell's client
+    /// socket and proxy the request.
+    ///
+    /// `is_host_daemon` must be `true` only for the host daemon. Nested
+    /// auraeds pass `false` so local VM lifecycle RPCs are refused with a
+    /// clear "not supported inside a cell" error instead of a misleading
+    /// host-networking failure.
+    pub fn new(
+        network: Option<Network>,
+        cells: Arc<Mutex<Cells>>,
+        is_host_daemon: bool,
+    ) -> Self {
+        Self {
+            vms: Arc::new(Mutex::new(VirtualMachines::new(network.clone()))),
+            network,
+            cells,
+            is_host_daemon,
+        }
     }
 
-    // TODO: validate requestts
-    /// Allocates a new VM based on the provided request.
-    ///
-    /// # Arguments
-    /// * `request` - A (currently unvalidated) request to allocate a VM
-    ///
-    /// # Returns
-    /// A result containing the VmServiceAllocateResponse or an error.
     #[tracing::instrument(skip(self))]
     async fn allocate(
         &self,
         request: VmServiceAllocateRequest,
     ) -> Result<VmServiceAllocateResponse> {
+        if let Some(cell_name) = validated_cell_name(&request.cell_name)? {
+            let mut req = request;
+            req.cell_name = None;
+            return proxy_to_cell(
+                &self.cells,
+                &cell_name,
+                req,
+                |client, req| async move {
+                    VmServiceClient::allocate(&client, req)
+                        .await
+                        .map(|r| r.into_inner())
+                },
+            )
+            .await;
+        }
+
+        // A nested auraed can't host VMs of its own yet — refuse with a
+        // clear error rather than the host-networking failure below.
+        if !self.is_host_daemon {
+            return Err(VmServiceError::VmInCellUnsupported);
+        }
+
+        // Refuse early if the daemon couldn't initialize VM networking.
+        if self.network.is_none() {
+            return Err(VmServiceError::NetworkingUnavailable);
+        }
+
         let mut vms = self.vms.lock().await;
 
         let Some(vm) = request.machine else {
@@ -91,18 +155,27 @@ impl VmService {
         Ok(VmServiceAllocateResponse { vm_id: vm.id.to_string() })
     }
 
-    /// Frees a VM
-    ///
-    /// # Arguments
-    /// * `request` - An (unvalidated) request to free a VM
-    ///
-    /// # Returns
-    /// A result containing VmServiceFreeResponse or an error.
     #[tracing::instrument(skip(self))]
     async fn free(
         &self,
         request: VmServiceFreeRequest,
     ) -> Result<VmServiceFreeResponse> {
+        if let Some(cell_name) = validated_cell_name(&request.cell_name)? {
+            let mut req = request;
+            req.cell_name = None;
+            return proxy_to_cell(
+                &self.cells,
+                &cell_name,
+                req,
+                |client, req| async move {
+                    VmServiceClient::free(&client, req)
+                        .await
+                        .map(|r| r.into_inner())
+                },
+            )
+            .await;
+        }
+
         let id = VmID::new(request.vm_id);
 
         let mut vms = self.vms.lock().await;
@@ -112,40 +185,101 @@ impl VmService {
         Ok(VmServiceFreeResponse {})
     }
 
-    /// Starts a VM
-    ///
-    /// # Arguments
-    /// * `request` - An (unvalidated) request to start a VM
-    ///
-    /// # Returns
-    /// A result containing VmServiceStartResponse or an error.
     #[tracing::instrument(skip(self))]
     async fn start(
         &self,
         request: VmServiceStartRequest,
     ) -> Result<VmServiceStartResponse> {
+        if let Some(cell_name) = validated_cell_name(&request.cell_name)? {
+            let mut req = request;
+            req.cell_name = None;
+            return proxy_to_cell(
+                &self.cells,
+                &cell_name,
+                req,
+                |client, req| async move {
+                    VmServiceClient::start(&client, req)
+                        .await
+                        .map(|r| r.into_inner())
+                },
+            )
+            .await;
+        }
+
+        if !self.is_host_daemon {
+            return Err(VmServiceError::VmInCellUnsupported);
+        }
+
         let id = VmID::new(request.vm_id);
 
-        let mut vms = self.vms.lock().await;
-        let addr = vms.start(&id).map_err(|e| {
-            VmServiceError::FailedToStartError { id, source: e }
-        })?;
+        // Phase 1: boot the VM under the lock and extract the host-side TAP
+        // to configure. `start_boot` does no awaiting, so the lock is held
+        // only for the (fast) Cloud Hypervisor boot call.
+        let tap_endpoint = {
+            let mut vms = self.vms.lock().await;
+            vms.start_boot(&id).map_err(|e| {
+                VmServiceError::FailedToStartError { id: id.clone(), source: e }
+            })?
+        };
+
+        // Phase 2: configure the host side of the TAP *without* holding the
+        // VMs lock. This waits for the device to appear and brings the link
+        // up (a multi-second operation); serializing all VM RPCs behind it
+        // would needlessly block unrelated VMs.
+        if let Some(endpoint) = tap_endpoint {
+            let network = self
+                .network
+                .as_ref()
+                .ok_or(VmServiceError::NetworkingUnavailable)?;
+            if let Err(e) = network
+                .configure_tap_endpoint(
+                    &endpoint.tap,
+                    endpoint.host_ip,
+                    endpoint.delegated,
+                )
+                .await
+            {
+                error!(
+                    "Failed to configure TAP endpoint for VM {id}: {e}. \
+                     Tearing down."
+                );
+                // Phase 3: roll back under the lock — stop + delete the VM,
+                // drop it from the cache, release its IPAM slot.
+                self.vms.lock().await.rollback_failed_start(&id);
+                return Err(VmServiceError::FailedToStartError {
+                    id,
+                    source: anyhow!("Failed to configure TAP endpoint: {e}"),
+                });
+            }
+        }
+
+        // Phase 4: read back the guest auraed address.
+        let addr = self.vms.lock().await.guest_socket(&id).unwrap_or_default();
 
         Ok(VmServiceStartResponse { auraed_address: addr })
     }
 
-    /// Stops a VM
-    ///
-    /// # Arguments
-    /// * `request` - An (unvalidated) request to stop a VM
-    ///
-    /// # Returns
-    /// A result containing VmServiceStopResponse or an error.
     #[tracing::instrument(skip(self))]
     async fn stop(
         &self,
         request: VmServiceStopRequest,
     ) -> Result<VmServiceStopResponse> {
+        if let Some(cell_name) = validated_cell_name(&request.cell_name)? {
+            let mut req = request;
+            req.cell_name = None;
+            return proxy_to_cell(
+                &self.cells,
+                &cell_name,
+                req,
+                |client, req| async move {
+                    VmServiceClient::stop(&client, req)
+                        .await
+                        .map(|r| r.into_inner())
+                },
+            )
+            .await;
+        }
+
         let id = VmID::new(request.vm_id);
 
         let mut vms = self.vms.lock().await;
@@ -155,12 +289,27 @@ impl VmService {
         Ok(VmServiceStopResponse {})
     }
 
-    /// List VMs
-    ///
-    /// # Returns
-    /// A result containing VmServiceListResponse or an error.
     #[tracing::instrument(skip(self))]
-    async fn list(&self) -> Result<VmServiceListResponse> {
+    async fn list(
+        &self,
+        request: VmServiceListRequest,
+    ) -> Result<VmServiceListResponse> {
+        if let Some(cell_name) = validated_cell_name(&request.cell_name)? {
+            let mut req = request;
+            req.cell_name = None;
+            return proxy_to_cell(
+                &self.cells,
+                &cell_name,
+                req,
+                |client, req| async move {
+                    VmServiceClient::list(&client, req)
+                        .await
+                        .map(|r| r.into_inner())
+                },
+            )
+            .await;
+        }
+
         let vms = self.vms.lock().await;
         Ok(VmServiceListResponse {
             machines: vms
@@ -189,22 +338,40 @@ impl VmService {
         })
     }
 
-    /// Stop all VMs
+    /// Stop all VMs (host-scoped only).
     #[tracing::instrument(skip(self))]
     pub async fn stop_all(&self) -> Result<()> {
-        for vm in self.list().await?.machines {
-            let _ = self.stop(VmServiceStopRequest { vm_id: vm.id }).await?;
+        for vm in self.list(VmServiceListRequest::default()).await?.machines {
+            let _ = self
+                .stop(VmServiceStopRequest { vm_id: vm.id, cell_name: None })
+                .await?;
         }
         Ok(())
     }
 
-    /// Free all VMs
+    /// Free all VMs (host-scoped only).
     #[tracing::instrument(skip(self))]
     pub async fn free_all(&self) -> Result<()> {
-        for vm in self.list().await?.machines {
-            let _ = self.free(VmServiceFreeRequest { vm_id: vm.id }).await?;
+        for vm in self.list(VmServiceListRequest::default()).await?.machines {
+            let _ = self
+                .free(VmServiceFreeRequest { vm_id: vm.id, cell_name: None })
+                .await?;
         }
         Ok(())
+    }
+}
+
+/// Validate the optional `cell_name` field on every VmService request.
+/// `None`/empty string → `None` (local execution). Non-empty → validated
+/// `CellName`. Invalid syntax → `Err`.
+fn validated_cell_name(
+    raw: &Option<String>,
+) -> std::result::Result<Option<CellName>, VmServiceError> {
+    match raw.as_deref() {
+        None | Some("") => Ok(None),
+        Some(_) => CellName::validate(raw.clone(), "cell_name", None)
+            .map(Some)
+            .map_err(|source| VmServiceError::InvalidCellName { source }),
     }
 }
 
@@ -215,7 +382,6 @@ impl vm_service_server::VmService for VmService {
         request: Request<VmServiceAllocateRequest>,
     ) -> std::result::Result<Response<VmServiceAllocateResponse>, Status> {
         let req = request.into_inner();
-        // TODO: validate the request
         Ok(Response::new(self.allocate(req).await?))
     }
 
@@ -224,7 +390,6 @@ impl vm_service_server::VmService for VmService {
         request: Request<VmServiceFreeRequest>,
     ) -> std::result::Result<Response<VmServiceFreeResponse>, Status> {
         let req = request.into_inner();
-        // TODO: validate request
         Ok(Response::new(self.free(req).await?))
     }
 
@@ -246,8 +411,9 @@ impl vm_service_server::VmService for VmService {
 
     async fn list(
         &self,
-        _request: Request<VmServiceListRequest>,
+        request: Request<VmServiceListRequest>,
     ) -> std::result::Result<Response<VmServiceListResponse>, Status> {
-        Ok(Response::new(self.list().await?))
+        let req = request.into_inner();
+        Ok(Response::new(self.list(req).await?))
     }
 }
