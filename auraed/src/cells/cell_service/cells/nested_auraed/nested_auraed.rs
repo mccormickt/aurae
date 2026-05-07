@@ -15,6 +15,7 @@
 
 use super::isolation_controls::{Isolation, IsolationControls};
 use crate::AURAED_RUNTIME;
+use crate::init::network::endpoint::NetworkConfig;
 use client::AuraeSocket;
 use clone3::Flags;
 use nix::{
@@ -45,7 +46,11 @@ pub struct NestedAuraed {
 }
 
 impl NestedAuraed {
-    pub fn new(name: String, iso_ctl: IsolationControls) -> io::Result<Self> {
+    pub fn new(
+        name: String,
+        iso_ctl: IsolationControls,
+        net_config: Option<NetworkConfig>,
+    ) -> io::Result<Self> {
         // Here we launch a nested auraed with the --nested flag
         // which is used our way of "hooking" into the newly created
         // aurae isolation zone.
@@ -85,6 +90,15 @@ impl NestedAuraed {
         // We check that the command we kept has the expected number of args following the call
         // to command.args, whose return value we ignored above.
         assert_eq!(command.get_args().len(), 13);
+
+        // Pass per-cell network config to the child auraed via CLI flags.
+        // The child parses these on startup (in `CellSystemRuntime`) and
+        // uses them to configure its eth0 from inside the cell's netns.
+        if let Some(net_config) = net_config.as_ref() {
+            for (flag, value) in net_config.as_cli_args() {
+                let _ = command.args([flag, value.as_str()]);
+            }
+        }
 
         // *****************************************************************
         // ██████╗██╗      ██████╗ ███╗   ██╗███████╗██████╗

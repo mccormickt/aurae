@@ -68,11 +68,17 @@ use crate::ebpf::{
     BpfContext, SchedProcessForkTracepointProgram,
     SignalSignalGenerateTracepointProgram, TaskstatsExitKProbeProgram,
 };
+pub use crate::init::network::endpoint::NetworkConfig;
 use crate::{
-    cells::CellService, cri::oci::AuraeOCIBuilder,
-    cri::runtime_service::RuntimeService, discovery::DiscoveryService,
-    init::Context as AuraeContext, init::SocketStream,
-    logging::log_channel::LogChannel, observe::ObserveService,
+    cells::CellService,
+    cri::oci::AuraeOCIBuilder,
+    cri::runtime_service::RuntimeService,
+    discovery::DiscoveryService,
+    init::Context as AuraeContext,
+    init::SocketStream,
+    init::network::{Network, NetworkReady},
+    logging::log_channel::LogChannel,
+    observe::ObserveService,
     spawn::spawn_auraed_oci_to,
 };
 use anyhow::{Context, anyhow};
@@ -166,6 +172,7 @@ pub async fn run(
     socket: Option<String>,
     verbose: bool,
     nested: bool,
+    net_config: Option<NetworkConfig>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     async fn inner<T, IO, IE>(
         runtime: &AuraedRuntime,
@@ -252,7 +259,46 @@ pub async fn run(
         let observe_service_server =
             ObserveServiceServer::new(observe_service.clone());
 
-        let cell_service = CellService::new(observe_service.clone());
+        // The daemon owns the host's Network (which embeds its own IPAM
+        // allocator) for the duration of `inner`. For non-Daemon contexts
+        // (Pid1/Cell/Container) the daemon doesn't manage cell networking,
+        // so we leave it as None — CellService refuses
+        // isolate_network=true allocation when it has no Network.
+        let network: Option<Network> = if context == AuraeContext::Daemon {
+            match Network::connect() {
+                Ok(net) => {
+                    let ready = net
+                        .init_host_network(
+                            crate::init::network::ipam::IpamConfig::default(),
+                        )
+                        .await;
+                    if !ready.allows_cells() {
+                        warn!(
+                            "Cell networking unavailable ({:?}); cells with \
+                             isolate_network=true cannot be allocated.",
+                            ready
+                        );
+                    }
+                    if matches!(ready, NetworkReady::Unavailable) {
+                        None
+                    } else {
+                        Some(net)
+                    }
+                }
+                Err(e) => {
+                    error!(
+                        "Failed to connect to netlink for cell networking: \
+                         {e}. Cells with isolate_network=true cannot start \
+                         without it."
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
+        let cell_service = CellService::new(observe_service.clone(), network);
         let cell_service_server = CellServiceServer::new(cell_service.clone());
         health_reporter.set_serving::<CellServiceServer<CellService>>().await;
 
@@ -340,7 +386,8 @@ pub async fn run(
 
     let runtime = AURAED_RUNTIME.get_or_init(|| runtime);
 
-    let (context, stream) = init::init(verbose, nested, socket).await;
+    let (context, stream) =
+        init::init(verbose, nested, socket, net_config).await;
     match stream {
         SocketStream::Tcp(stream) => inner(runtime, context, stream).await,
         SocketStream::Unix(stream) => inner(runtime, context, stream).await,

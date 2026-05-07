@@ -37,6 +37,10 @@ impl SystemRuntime for DaemonSystemRuntime {
         logging::init(verbose, false)?;
         info!("Running as a daemon.");
 
+        // Network plumbing (forwarding sysctls, NAT install) happens in the
+        // daemon's main loop (lib.rs::run::inner), where the Network can be
+        // held for the daemon's lifetime and torn down on shutdown.
+
         // Running as a daemon supports both TCP and Unix sockets for listening, depending on the
         // socket address that's passed in.
         let sockaddr = socket_address.unwrap_or_else(|| {

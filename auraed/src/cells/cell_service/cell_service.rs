@@ -23,6 +23,7 @@ use super::{
         ValidatedCellServiceStartRequest, ValidatedCellServiceStopRequest,
     },
 };
+use crate::init::network::Network;
 use crate::{cells::cell_service::cells::CellsError, observe::ObserveService};
 use ::validation::ValidatedType;
 use backoff::backoff::Backoff;
@@ -115,9 +116,15 @@ impl CellService {
     ///
     /// # Arguments
     /// * `observe_service` - An instance of ObserveService to manage log channels.
-    pub fn new(observe_service: ObserveService) -> Self {
+    /// * `network` - The host's `Network` handle, or `None` if cell
+    ///   networking is unavailable (non-Daemon contexts).
+    pub fn new(
+        observe_service: ObserveService,
+        network: Option<Network>,
+    ) -> Self {
+        let network = network.map(Arc::new);
         CellService {
-            cells: Default::default(),
+            cells: Arc::new(Mutex::new(Cells::new_root(network))),
             executables: Default::default(),
             observe_service,
         }
@@ -144,10 +151,10 @@ impl CellService {
 
         let mut cells = self.cells.lock().await;
 
-        let cell = cells.allocate(cell_name, cell_spec)?;
+        let cell = cells.allocate(cell_name, cell_spec).await?;
 
         Ok(CellServiceAllocateResponse {
-            cell_name: cell.name().clone().to_string(),
+            cell_name: cell.name().to_string(),
             cgroup_v2: cell.v2().expect("allocated cell returns `Some`"),
         })
     }
@@ -170,7 +177,7 @@ impl CellService {
 
         let mut cells = self.cells.lock().await;
 
-        cells.free(&cell_name)?;
+        cells.free(&cell_name).await?;
 
         Ok(CellServiceFreeResponse::default())
     }
@@ -180,7 +187,7 @@ impl CellService {
         let mut cells = self.cells.lock().await;
 
         // Attempt to gracefully free all cells
-        cells.broadcast_free();
+        cells.broadcast_free().await;
 
         // The cells that remain failed to shut down for some reason.
         // Forcefully kill any remaining cells that failed to shut down
@@ -597,10 +604,13 @@ mod tests {
         let _ = AURAED_RUNTIME.set(AuraedRuntime::default());
 
         // Create a new instance of CellService for testing
-        let service = CellService::new(ObserveService::new(
-            LogChannel::new(String::from("test")),
-            (None, None, None),
-        ));
+        let service = CellService::new(
+            ObserveService::new(
+                LogChannel::new(String::from("test")),
+                (None, None, None),
+            ),
+            None,
+        );
 
         // Allocate a parent cell for testing
         let parent_cell_name = format!("ae-test-{}", uuid::Uuid::new_v4());
@@ -700,7 +710,7 @@ mod tests {
             LogChannel::new(String::from("test")),
             (None, None, None),
         );
-        let service = CellService::new(observe_service.clone());
+        let service = CellService::new(observe_service.clone(), None);
 
         let executable_name = format!("exec-{}", uuid::Uuid::new_v4().simple());
 
