@@ -51,7 +51,11 @@ service VmService {
   rpc List(VmServiceListRequest) returns (VmServiceListResponse) {}
 }
 
-message VmServiceListRequest {}
+message VmServiceListRequest {
+  // When set, the request is proxied to the auraed running inside the
+  // named cell instead of being served by the host daemon.
+  optional string cell_name = 1;
+}
 message VmServiceListResponse {
   repeated VirtualMachineSummary machines = 1;
 }
@@ -81,6 +85,9 @@ message VirtualMachineSummary {
 
 message VmServiceAllocateRequest {
   VirtualMachine machine = 1;
+  // When set, the request is proxied to the auraed running inside the
+  // named cell instead of being served by the host daemon.
+  optional string cell_name = 2;
 }
 message VmServiceAllocateResponse {
   string vm_id = 1;
@@ -88,11 +95,17 @@ message VmServiceAllocateResponse {
 
 message VmServiceFreeRequest {
   string vm_id = 1;
+  // When set, the request is proxied to the auraed running inside the
+  // named cell. See VmServiceAllocateRequest.cell_name.
+  optional string cell_name = 2;
 }
 message VmServiceFreeResponse {}
 
 message VmServiceStartRequest {
   string vm_id = 1;
+  // When set, the request is proxied to the auraed running inside the
+  // named cell. See VmServiceAllocateRequest.cell_name.
+  optional string cell_name = 2;
 }
 message VmServiceStartResponse {
   // Auraed server address of the VM
@@ -101,6 +114,9 @@ message VmServiceStartResponse {
 
 message VmServiceStopRequest {
   string vm_id = 1;
+  // When set, the request is proxied to the auraed running inside the
+  // named cell. See VmServiceAllocateRequest.cell_name.
+  optional string cell_name = 2;
 }
 message VmServiceStopResponse {}
 

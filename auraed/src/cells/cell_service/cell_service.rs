@@ -118,7 +118,9 @@ impl CellService {
     /// * `observe_service` - An instance of ObserveService to manage log channels.
     /// * `network` - The `Network` handle of the host. It is `None` if
     ///   cell networking is not available, which is true outside the
-    ///   daemon context.
+    ///   daemon context. An `Arc` shares it with
+    ///   [`crate::vms::VmService`], thus cells and VMs allocate from the
+    ///   same IPAM pool.
     pub fn new(
         observe_service: ObserveService,
         network: Option<Network>,
@@ -128,6 +130,13 @@ impl CellService {
             executables: Default::default(),
             observe_service,
         }
+    }
+
+    /// Share the internal `Cells` handle so that other services (currently
+    /// [`crate::vms::VmService`], for `cell_name`-scoped VM proxying) can
+    /// look up cell sockets without duplicating the cache.
+    pub(crate) fn cells_handle(&self) -> Arc<Mutex<Cells>> {
+        Arc::clone(&self.cells)
     }
 
     /// Allocates a new cell based on the provided request.

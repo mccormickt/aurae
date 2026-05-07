@@ -15,6 +15,7 @@
 
 mod error;
 mod manager;
+mod proxy;
 mod virtual_machine;
 mod virtual_machines;
 mod vm_service;
