@@ -58,6 +58,7 @@ async fn vms_with_auraed() {
                     drive_mounts: vec![],
                     auraed_address: String::new()
                 }),
+                cell_name: None,
             }
         )
         .await
@@ -67,7 +68,7 @@ async fn vms_with_auraed() {
 
     let vm = VmServiceClient::start(
         &client,
-        VmServiceStartRequest { vm_id: vm_id.clone() },
+        VmServiceStartRequest { vm_id: vm_id.clone(), cell_name: None },
     )
     .await
     .expect("failed to start vm")
@@ -80,14 +81,17 @@ async fn vms_with_auraed() {
         if remote_client.is_ok() {
             break;
         }
-        let vm = VmServiceClient::list(&client, VmServiceListRequest {})
-            .await
-            .expect("failed to list vms")
-            .into_inner()
-            .machines
-            .into_iter()
-            .find(|m| m.id == vm_id)
-            .expect("vm not found");
+        let vm = VmServiceClient::list(
+            &client,
+            VmServiceListRequest { cell_name: None },
+        )
+        .await
+        .expect("failed to list vms")
+        .into_inner()
+        .machines
+        .into_iter()
+        .find(|m| m.id == vm_id)
+        .expect("vm not found");
         if vm.auraed_address.is_empty() || vm.status != "Running" {
             tokio::time::sleep(std::time::Duration::from_secs(1)).await;
             continue;

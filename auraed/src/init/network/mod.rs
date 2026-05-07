@@ -35,6 +35,7 @@ use ipnet::Ipv6Net;
 use rtnetlink::Handle;
 use std::collections::HashMap;
 use std::fmt;
+use std::net::Ipv6Addr;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tracing::{info, warn};
@@ -54,8 +55,8 @@ mod sriov;
 use cell::CellInterfaceState;
 use nat::NatManager;
 use netlink::{
-    add_address, add_onlink_default, configure_loopback, rename_link,
-    set_link_up, wait_for_link,
+    add_address, add_onlink_default, configure_loopback,
+    configure_routed_endpoint, rename_link, set_link_up, wait_for_link,
 };
 
 #[derive(thiserror::Error, Debug)]
@@ -164,6 +165,41 @@ impl Network {
 
     pub(crate) fn ipam(&self) -> &Ipam {
         &self.inner.ipam
+    }
+
+    /// Reserve a unique TAP name for a VM. Cloud Hypervisor creates the
+    /// device with this name at the boot of the VM.
+    /// [`Self::configure_tap_endpoint`] then configures the host side. The
+    /// prefix `vm-` separates a VM tap from a cell netkit interface, which
+    /// uses the prefix `nk-`. The name is shorter than IFNAMSIZ (16).
+    pub(crate) fn reserve_tap_name(&self) -> String {
+        let suffix = uuid::Uuid::new_v4().simple().to_string();
+        format!("vm-{}", &suffix[..8])
+    }
+
+    /// Configure the host side of the routed TAP of a VM after Cloud
+    /// Hypervisor creates it. The function adds `host/128`, sets the link
+    /// up, and installs a `dev` route for the delegated prefix of the VM,
+    /// so that return traffic reaches the host stack. This is the same
+    /// host-side step as in [`Self::create_cell_interface`], but Cloud
+    /// Hypervisor owns the TAP and this function only adds the addressing.
+    /// It waits a maximum of 5 s for the TAP, because Cloud Hypervisor
+    /// creates the device during the boot of the VM.
+    pub(crate) async fn configure_tap_endpoint(
+        &self,
+        tap: &str,
+        host: Ipv6Addr,
+        delegated: Ipv6Net,
+    ) -> Result<(), NetworkError> {
+        const TIMEOUT: Duration = Duration::from_secs(5);
+        const POLL: Duration = Duration::from_millis(50);
+        let _ = wait_for_link(&self.inner.handle, tap, TIMEOUT, POLL).await?;
+        configure_routed_endpoint(&self.inner.handle, tap, host, delegated)
+            .await?;
+        info!(
+            "Configured VM TAP endpoint {tap}: host={host}, guest={delegated}"
+        );
+        Ok(())
     }
 
     /// Set up the local NIC of an auraed that runs in its own network namespace. The

@@ -17,7 +17,7 @@ use anyhow::anyhow;
 use net_util::MacAddr;
 use std::{
     fmt::{self, Display},
-    net::{IpAddr, Ipv4Addr, SocketAddr},
+    net::{IpAddr, Ipv6Addr, SocketAddr, SocketAddrV6},
     path::PathBuf,
     sync::{Arc, Mutex},
 };
@@ -123,22 +123,45 @@ impl From<VmSpec> for vmm::vm_config::VmConfig {
     }
 }
 
+/// Network configuration for a VM.
+///
+/// Carries the host-side TAP gateway address (used by Cloud Hypervisor to
+/// configure the host side of the TAP) and the guest-side address +
+/// delegated prefix (passed via kernel cmdline so pid1 inside the guest
+/// configures eth0).
+///
+/// The host-side address is always /128 — the routed point-to-link shape —
+/// even when the device prefix is wider, because the host's view of the TAP
+/// is just one address. Networking is IPv6-only.
 #[derive(Debug, Clone)]
 pub struct NetSpec {
+    /// TAP device name (CH creates it if it doesn't exist).
     pub tap: Option<String>,
-    pub ip: Ipv4Addr,
-    pub mask: Ipv4Addr,
+    /// MAC address for the VM's virtual NIC.
     pub mac: MacAddr,
+    /// Optional host MAC address.
     pub host_mac: Option<MacAddr>,
+    /// Host-side IPv6 address (TAP gateway).
+    pub host_ip_v6: Ipv6Addr,
+    /// Guest-side IPv6 address.
+    pub guest_ip_v6: Ipv6Addr,
+    /// Delegated IPv6 prefix length (default 128).
+    pub prefix_len_v6: u8,
 }
 
 impl From<NetSpec> for vmm::vm_config::NetConfig {
     fn from(spec: NetSpec) -> Self {
+        // Advertise the host-side IPv6 with a /128 mask so Cloud Hypervisor
+        // treats the TAP as a single-address point-to-link instead of a
+        // wider subnet that would conflict with the per-VM dev routes.
+        let host_v6_mask = Ipv6Addr::new(
+            0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff,
+        );
         vmm::vm_config::NetConfig {
             pci_common: PciDeviceCommonConfig::default(),
             tap: spec.tap,
-            ip: Some(IpAddr::V4(spec.ip)),
-            mask: Some(IpAddr::V4(spec.mask)),
+            ip: Some(IpAddr::V6(spec.host_ip_v6)),
+            mask: Some(IpAddr::V6(host_v6_mask)),
             mac: spec.mac,
             host_mac: spec.host_mac,
             mtu: None,
@@ -153,16 +176,6 @@ impl From<NetSpec> for vmm::vm_config::NetConfig {
             offload_ufo: false,
             offload_csum: false,
         }
-    }
-}
-
-/// Narrow an optional [`IpAddr`] from the VMM back to the [`Ipv4Addr`] aurae
-/// works with. VMs are always configured with IPv4 addresses, so anything else
-/// falls back to the unspecified address.
-fn to_ipv4(addr: Option<IpAddr>) -> Ipv4Addr {
-    match addr {
-        Some(IpAddr::V4(v4)) => v4,
-        Some(IpAddr::V6(_)) | None => Ipv4Addr::UNSPECIFIED,
     }
 }
 
@@ -263,22 +276,6 @@ impl VirtualMachine {
             return Err(anyhow!("Virtual machine manager not initialized"))?;
         }
 
-        // Update the VM with the network device information if it wasn't provided
-        if self.vm.net.is_empty()
-            && let Some(net) = &self.info()?.net
-        {
-            self.vm.net = net
-                .iter()
-                .map(|n| NetSpec {
-                    tap: n.tap.clone(),
-                    ip: to_ipv4(n.ip),
-                    mask: to_ipv4(n.mask),
-                    mac: n.mac,
-                    host_mac: n.host_mac,
-                })
-                .collect();
-        }
-
         Ok(())
     }
 
@@ -321,58 +318,30 @@ impl VirtualMachine {
         Err(anyhow!("Virtual machine manager not initialized"))
     }
 
-    fn info(&self) -> Result<vmm::vm_config::VmConfig, anyhow::Error> {
-        let manager = self
-            .manager
-            .lock()
-            .map_err(|_| anyhow!("Failed to aquire lock for vm manager"))?;
-
-        if let Some(sender) = &manager.sender {
-            let res = vmm::api::VmInfo
-                .send(manager.events.try_clone()?, sender.clone(), ())
-                .map_err(|e| anyhow!("Failed to send info request: {e}"))?;
-            let config = *res.config;
-            return Ok(config.clone());
-        }
-        Err(anyhow!("Virtual machine manager not initialized"))
-    }
-
-    /// Get a reference to the address of the TAP device for this VM
+    /// Socket address for connecting to the auraed instance in this VM.
+    /// Returns the VM's IPv6 address (ULA) on the well-known auraed port.
     pub fn tap(&self) -> Option<SocketAddr> {
-        let manager = self.manager.lock().ok()?;
-
-        // Retrieve config from the VMM
-        let res = vmm::api::VmInfo
-            .send(manager.events.try_clone().ok()?, manager.sender.clone()?, ())
-            .ok()?;
-        let config = *res.config;
-        let net = config.net.clone()?;
-
-        let iface = net.first()?.tap.clone()?;
-        let scope_id = nix::net::if_::if_nametoindex(iface.as_str()).ok()?;
-
-        // TODO: Make this somehow configurable
-        let addr: SocketAddr = format!("[fe80::2%{scope_id}]:8080")
-            .parse()
-            .expect("failed to parse socket address for aurae client");
-        Some(addr)
+        let net = self.vm.net.first()?;
+        Some(SocketAddr::V6(SocketAddrV6::new(net.guest_ip_v6, 8080, 0, 0)))
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::{net::Ipv4Addr, path::PathBuf};
+    use std::net::{IpAddr, Ipv6Addr};
+    use std::path::PathBuf;
 
     use net_util::MacAddr;
 
-    use crate::vms::virtual_machine::{
-        MountSpec, NetSpec, VirtualMachine, VmID, VmSpec,
-    };
+    use super::{MountSpec, NetSpec, VirtualMachine, VmID, VmSpec};
 
     #[test]
     #[ignore]
     fn test_create_vm() {
         let id = VmID::new("test_vm");
+        let host_v6 = Ipv6Addr::new(0xfd00, 0x00ae, 0, 0, 0, 0, 0, 0);
+        let guest_v6 = Ipv6Addr::new(0xfd00, 0x00ae, 0, 0, 0, 0, 0, 1);
+
         let spec = VmSpec {
             memory_size: 1024,
             vcpu_count: 4,
@@ -382,6 +351,8 @@ mod tests {
             kernel_args: vec![
                 "console=hvc0".to_string(),
                 "root=/dev/vda1".to_string(),
+                format!("aurae.prefix_v6={guest_v6}/128"),
+                format!("aurae.gw_v6={host_v6}"),
             ],
             mounts: vec![MountSpec {
                 host_path: PathBuf::from("/var/lib/aurae/vm/image/disk.raw"),
@@ -389,10 +360,11 @@ mod tests {
             }],
             net: vec![NetSpec {
                 tap: Some("tap0".to_string()),
-                ip: Ipv4Addr::new(192, 168, 249, 1),
-                mask: Ipv4Addr::new(255, 255, 255, 255),
                 mac: MacAddr::local_random(),
                 host_mac: None,
+                host_ip_v6: host_v6,
+                guest_ip_v6: guest_v6,
+                prefix_len_v6: 128,
             }],
         };
 
@@ -401,11 +373,100 @@ mod tests {
 
         assert!(vm.start().is_ok(), "{:?}", vm);
 
-        // Give the VM some time to boot
         std::thread::sleep(std::time::Duration::from_secs(10));
         assert!(vm.stop().is_ok(), "{:?}", vm);
 
         std::thread::sleep(std::time::Duration::from_secs(5));
         assert!(vm.delete().is_ok(), "{:?}", vm);
+    }
+
+    fn sample_net_spec() -> NetSpec {
+        NetSpec {
+            tap: Some("vm-7".to_string()),
+            mac: MacAddr::local_random(),
+            host_mac: None,
+            host_ip_v6: Ipv6Addr::new(0xfd00, 0xae, 0, 0, 0, 0, 0, 0),
+            guest_ip_v6: Ipv6Addr::new(0xfd00, 0xae, 0, 0, 0, 0, 0, 1),
+            prefix_len_v6: 128,
+        }
+    }
+
+    fn sample_vm_spec() -> VmSpec {
+        VmSpec {
+            memory_size: 512,
+            vcpu_count: 2,
+            kernel_image_path: PathBuf::from("/k/vmlinux.bin"),
+            kernel_args: vec!["console=hvc0".into()],
+            mounts: vec![
+                MountSpec {
+                    host_path: PathBuf::from("/disks/root.raw"),
+                    read_only: true,
+                },
+                MountSpec {
+                    host_path: PathBuf::from("/disks/data.raw"),
+                    read_only: false,
+                },
+            ],
+            net: vec![sample_net_spec()],
+        }
+    }
+
+    /// `NetSpec` → `vmm::vm_config::NetConfig` advertises the host-side
+    /// IPv6 + a /128 mask to Cloud Hypervisor. The /128 mask is what
+    /// makes CH treat the TAP as a single-address point-to-link instead
+    /// of advertising a wider subnet that would conflict with the
+    /// per-VM dev routes.
+    #[test]
+    fn net_spec_to_net_config_uses_v6_host_ip_and_128_mask() {
+        let spec = sample_net_spec();
+        let host_v6 = spec.host_ip_v6;
+        let cfg: vmm::vm_config::NetConfig = spec.into();
+
+        assert_eq!(cfg.ip, Some(IpAddr::V6(host_v6)));
+        let all_ones = Ipv6Addr::new(
+            0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff,
+        );
+        assert_eq!(cfg.mask, Some(IpAddr::V6(all_ones)));
+        assert_eq!(cfg.tap.as_deref(), Some("vm-7"));
+    }
+
+    /// `MountSpec` → `DiskConfig` carries the host path and `read_only`
+    /// flag through unchanged.
+    #[test]
+    fn mount_spec_to_disk_config_preserves_path_and_readonly() {
+        let spec =
+            MountSpec { host_path: PathBuf::from("/x/y.raw"), read_only: true };
+        let cfg: vmm::vm_config::DiskConfig = spec.into();
+        assert_eq!(cfg.path.as_deref(), Some(std::path::Path::new("/x/y.raw")));
+        assert!(cfg.readonly);
+    }
+
+    /// `VmSpec` → `VmConfig` round-trips CPU, memory, kernel, payload,
+    /// and disk count.
+    #[test]
+    fn vm_spec_to_vm_config_round_trip_preserves_core_fields() {
+        let spec = sample_vm_spec();
+        let cfg: vmm::vm_config::VmConfig = spec.into();
+
+        assert_eq!(cfg.cpus.boot_vcpus, 2);
+        assert_eq!(cfg.cpus.max_vcpus, 2);
+        // memory_size is in MiB; VmConfig stores bytes (size << 20).
+        assert_eq!(cfg.memory.size, 512u64 << 20);
+
+        let payload = cfg.payload.as_ref().expect("payload");
+        assert_eq!(
+            payload.kernel.as_deref(),
+            Some(std::path::Path::new("/k/vmlinux.bin"))
+        );
+        assert_eq!(payload.cmdline.as_deref(), Some("console=hvc0"));
+
+        let disks = cfg.disks.as_ref().expect("disks");
+        assert_eq!(disks.len(), 2);
+        // Root drive is read-only in the sample spec; data drive isn't.
+        assert!(disks[0].readonly);
+        assert!(!disks[1].readonly);
+
+        let nets = cfg.net.as_ref().expect("net");
+        assert_eq!(nets.len(), 1);
     }
 }

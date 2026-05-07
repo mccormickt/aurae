@@ -235,10 +235,24 @@ impl Command<'_> {
         } else {
             let fields = fields.iter().map(|f| f.to_variant());
 
-            quote! {
-                #[command(arg_required_else_help = true)]
-                #method_ident {
-                    #(#fields,)*
+            // Only force "show help when invoked bare" when the command has at
+            // least one required argument. A command whose fields are all
+            // optional (e.g. `List` with just an optional `cell_name`) is
+            // legitimately runnable with no args, so requiring one would make
+            // it impossible to invoke without a flag.
+            if self.fields.iter().any(ResolvedField::is_required) {
+                quote! {
+                    #[command(arg_required_else_help = true)]
+                    #method_ident {
+                        #(#fields,)*
+                    }
+                }
+            } else {
+                quote! {
+                    #[command()]
+                    #method_ident {
+                        #(#fields,)*
+                    }
                 }
             }
         }
@@ -346,6 +360,21 @@ struct ResolvedField {
 }
 
 impl ResolvedField {
+    /// Whether clap will treat this generated arg as required, and thus
+    /// whether the enclosing command must be invoked with at least one arg.
+    /// A field is required unless it is optional (`Option<T>` from a proto3
+    /// `optional`), repeated (`Vec<T>`, which defaults to empty), or carries
+    /// an explicit `default_value` / `required = false` in its `#[arg(..)]`.
+    fn is_required(&self) -> bool {
+        let type_str = self.type_ident.to_string();
+        if type_str.starts_with("Option") || type_str.starts_with("Vec") {
+            return false;
+        }
+        let attr_str = self.attribute.to_string();
+        !attr_str.contains("default_value")
+            && !attr_str.contains("required = false")
+    }
+
     fn get_resolved_field_ident(&self) -> Ident {
         self.field_ident
             .iter()

@@ -264,6 +264,12 @@ pub async fn run(
         // context there is no cell networking. The value stays
         // `None`. `CellService` then refuses an allocation with
         // `isolate_network` set.
+        //
+        // `Network` is a cheap clonable handle to shared state.
+        // `CellService`, which owns the netkit endpoint of each cell, and
+        // `VmService`, which owns the routed TAP of each VM, hold their own
+        // clones of it. Both use one pool. The IPAM key prefixes
+        // `cell:<name>` and `vm:<id>` keep the two key spaces separate.
         let network: Option<Network> = if context == AuraeContext::Daemon {
             match Network::connect(IpamConfig::default()) {
                 Ok(net) => match net.init_host_network().await {
@@ -289,9 +295,14 @@ pub async fn run(
             None
         };
 
-        let cell_service = CellService::new(observe_service.clone(), network);
+        let cell_service =
+            CellService::new(observe_service.clone(), network.clone());
         let cell_service_server = CellServiceServer::new(cell_service.clone());
         health_reporter.set_serving::<CellServiceServer<CellService>>().await;
+
+        // VmService shares the cell store with CellService so it can proxy
+        // `cell_name`-scoped VM RPCs into a nested auraed.
+        let cells_handle = cell_service.cells_handle();
 
         let discovery_service = DiscoveryService::new();
         let discovery_service_server =
@@ -314,7 +325,14 @@ pub async fn run(
             .set_serving::<RuntimeServiceServer<RuntimeService>>()
             .await;
 
-        let vm_service = VmService::new();
+        // Only the host daemon hosts VMs locally; nested auraeds refuse
+        // local VM RPCs with a clear error (the host still proxies
+        // `cell_name`-scoped requests into them).
+        let vm_service = VmService::new(
+            network,
+            cells_handle,
+            context == AuraeContext::Daemon,
+        );
         let vm_service_server = VmServiceServer::new(vm_service.clone());
         health_reporter.set_serving::<VmServiceServer<VmService>>().await;
 
