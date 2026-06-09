@@ -27,7 +27,7 @@ use std::fmt;
 use std::net::Ipv6Addr;
 use std::os::fd::RawFd;
 use std::str;
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use tracing::{error, info, trace, warn};
 
@@ -35,11 +35,13 @@ use crate::cells::cell_service::cells::CellName;
 use crate::init::network::endpoint::NetworkConfig;
 use crate::init::network::ipam::{Allocation, Ipam, IpamConfig};
 
+pub(crate) mod bpf;
 pub(crate) mod endpoint;
 pub(crate) mod ipam;
 pub(crate) mod nat;
 mod sriov;
 
+use bpf::{CellNetGuard, SchedClassifierLink};
 use nat::NatManager;
 
 /// Outcome of [`Network::init_host_network`]. Callers consult this to decide
@@ -109,8 +111,26 @@ pub enum NetworkError {
     CellInterfacesPoisoned,
     #[error("Failed to rename link `{old}` to `{new}`: {source}")]
     ErrorRenamingLink { old: String, new: String, source: rtnetlink::Error },
+    #[error("Failed to enable cell-net BPF guard for `{iface}`: {source}")]
+    BpfGuardFailed { iface: String, source: bpf::CellGuardError },
     #[error(transparent)]
     Other(#[from] rtnetlink::Error),
+}
+
+/// Host-side state for one cell's interface, tracked so the destroy,
+/// hard-kill, and rollback paths can undo everything `create_cell_interface`
+/// set up.
+struct CellInterfaceState {
+    /// Name of the netkit primary in the host netns (e.g. `nk-a1b2c3d4`).
+    primary: String,
+    /// The primary's ifindex — the key for the guard's BPF map entries.
+    ifindex: u32,
+    /// The cell's delegated prefix — the guard's redirect-map key.
+    delegated: Ipv6Net,
+    /// Owned tc(x) link for the guard program on the primary; dropping it
+    /// detaches the program. `None` when the daemon runs without the
+    /// guard (eBPF object missing or failed to load).
+    bpf_link: Option<SchedClassifierLink>,
 }
 
 /// Handle to the host's network plumbing. Owns the rtnetlink handle for
@@ -126,11 +146,15 @@ pub(crate) struct Network {
     /// Self-managing NAT lifecycle: tracks its own installed/uninstalled
     /// state and serializes install/uninstall internally.
     nat: NatManager,
-    /// Per-cell host-side interface primary names (e.g. `nk-a1b2c3d4`),
-    /// keyed by cell name. The peer in the cell's netns disappears with
-    /// the netns; we only need to track the host-side primary for
-    /// teardown.
-    cell_interfaces: Mutex<HashMap<CellName, String>>,
+    /// Per-cell host-side interface state (primary name, ifindex, guard
+    /// link), keyed by cell name. The peer in the cell's netns disappears
+    /// with the netns; only host-side state needs tracking for teardown.
+    cell_interfaces: Mutex<HashMap<CellName, CellInterfaceState>>,
+    /// The cell-net eBPF guard (per-cell anti-spoof + cell→cell
+    /// redirect). Loaded once by [`Self::init_host_network`]; stays unset
+    /// in cell-side contexts and when loading fails — cells then run
+    /// without the guard, exactly as before it existed.
+    cell_guard: OnceLock<CellNetGuard>,
     /// IPAM allocator. Self-locking; callers go directly to it for
     /// allocate/release. In cell-side contexts (where this `Network` is
     /// built but [`Self::init_host_network`] is never called), the
@@ -159,6 +183,7 @@ impl Network {
             handle,
             nat: NatManager::new(),
             cell_interfaces: Mutex::new(HashMap::new()),
+            cell_guard: OnceLock::new(),
             ipam: Ipam::default(),
         })
     }
@@ -184,6 +209,28 @@ impl Network {
                 "Failed to enable IPv6 forwarding: {e}. Endpoints cannot start."
             );
             return NetworkReady::Unavailable;
+        }
+
+        // Load the cell-net guard before the LocalOnly early-returns:
+        // hosts without internet egress still allocate cells and want
+        // per-cell anti-spoof + cell→cell redirect. Failure degrades to
+        // guard-less operation (the pre-guard behavior) rather than
+        // blocking the daemon.
+        match CellNetGuard::load() {
+            Ok(guard) => {
+                let _ = self.cell_guard.set(guard);
+                info!(
+                    "Loaded cell-net BPF guard (per-cell anti-spoof + \
+                     cell-to-cell redirect)"
+                );
+            }
+            Err(e) => {
+                warn!(
+                    "Cell-net BPF guard unavailable ({e}); cells will run \
+                     without per-cell anti-spoof and the cell-to-cell fast \
+                     path. Run `make ebpf` to install the eBPF programs."
+                );
+            }
         }
 
         if !self.has_gateway_v6().await {
@@ -294,17 +341,24 @@ impl Network {
     ///    `IFF_NOARP`). The `Pass` policy on both ends is required:
     ///    packets must reach the primary's RX path where the host's tc
     ///    programs run — a `Drop` device policy would starve them).
-    /// 2. Move the peer into `peer_netns_fd`.
-    /// 3. Configure the host-side primary with `host_ip/128` and bring
+    /// 2. Activate the cell-net guard on the primary (when loaded):
+    ///    insert the cell's policy/redirect/stats map entries, then
+    ///    attach the classifier at tc(x) ingress. This happens BEFORE
+    ///    the peer enters the cell's netns, so the cell can never emit
+    ///    unfiltered traffic. A guard failure is fatal for the cell —
+    ///    when the guard exists we never hand out an unguarded
+    ///    interface.
+    /// 3. Move the peer into `peer_netns_fd`.
+    /// 4. Configure the host-side primary with `host_ip/128` and bring
     ///    it up.
-    /// 4. Add a `dev` route for the delegated guest prefix via the primary
+    /// 5. Add a `dev` route for the delegated guest prefix via the primary
     ///    so return traffic from the cell reaches the host stack.
-    /// 5. Track the primary in `cell_interfaces` so
+    /// 6. Track the host-side state in `cell_interfaces` so
     ///    `destroy_cell_interface` can find it later.
     ///
-    /// On failure of any step after step 1, the primary is deleted so the
-    /// pair doesn't leak. The kernel removes the orphaned peer along with
-    /// its primary.
+    /// On failure of any step after step 1, the guard state (if any) is
+    /// torn down and the primary is deleted so the pair doesn't leak.
+    /// The kernel removes the orphaned peer along with its primary.
     pub(crate) async fn create_cell_interface(
         &self,
         cell_name: &CellName,
@@ -332,7 +386,37 @@ impl Network {
                 source: e,
             })?;
 
-        // 2. Move the peer into the cell's netns. The peer name is
+        let ifindex =
+            match get_link_index(&self.handle, primary.to_string()).await {
+                Ok(idx) => idx,
+                Err(e) => {
+                    self.delete_primary_best_effort(primary).await;
+                    return Err(e);
+                }
+            };
+
+        // 2. Activate the guard while the peer is still in the host netns
+        //    and admin-down — no packet can cross the pair before the
+        //    program is attached.
+        let mut bpf_link = None;
+        if let Some(cell_guard) = self.cell_guard.get() {
+            match cell_guard.enable_for_cell(
+                primary,
+                ifindex,
+                allocation.delegated,
+            ) {
+                Ok(link) => bpf_link = Some(link),
+                Err(source) => {
+                    self.delete_primary_best_effort(primary).await;
+                    return Err(NetworkError::BpfGuardFailed {
+                        iface: primary.to_string(),
+                        source,
+                    });
+                }
+            }
+        }
+
+        // 3. Move the peer into the cell's netns. The peer name is
         //    unique-per-cell so it doesn't collide with the host's
         //    `eth0` (or any other interface) before the move.
         let setup_result: Result<(), NetworkError> = async {
@@ -346,7 +430,7 @@ impl Network {
                 }
             })?;
 
-            // 3 & 4: configure the routed host endpoint.
+            // 4 & 5: configure the routed host endpoint.
             configure_routed_endpoint(
                 &self.handle,
                 primary,
@@ -359,19 +443,33 @@ impl Network {
         .await;
 
         if let Err(e) = setup_result {
-            // Roll back: delete the primary. The kernel removes the peer
-            // along with it (whether still local or already in the cell
-            // netns — orphaned interface halves are reaped).
+            // Roll back: deactivate the guard, then delete the primary.
+            // The kernel removes the peer along with it (whether still
+            // local or already in the cell netns — orphaned interface
+            // halves are reaped).
+            if let Some(cell_guard) = self.cell_guard.get() {
+                cell_guard.disable_for_cell(
+                    ifindex,
+                    allocation.delegated,
+                    bpf_link.take(),
+                );
+            }
             self.delete_primary_best_effort(primary).await;
             return Err(e);
         }
 
-        // 5. Track the host-side primary so destroy_cell_interface can find
+        // 6. Track the host-side state so destroy_cell_interface can find
         //    it. If the mutex is poisoned the daemon is in an unrecoverable
         //    state — bail and roll back rather than leak.
+        let state = CellInterfaceState {
+            primary: primary.to_string(),
+            ifindex,
+            delegated: allocation.delegated,
+            bpf_link,
+        };
         let track_result = match self.cell_interfaces.lock() {
             Ok(mut guard) => {
-                let _ = guard.insert(cell_name.clone(), primary.to_string());
+                let _ = guard.insert(cell_name.clone(), state);
                 Ok(())
             }
             Err(_poisoned) => Err(NetworkError::CellInterfacesPoisoned),
@@ -381,14 +479,26 @@ impl Network {
             error!(
                 "cell_interfaces mutex poisoned — rolling back interface `{primary}`"
             );
+            if let Some(cell_guard) = self.cell_guard.get() {
+                // The link lives in `state`, which drops when this
+                // function returns (detaching the program); only the map
+                // entries need explicit removal here.
+                cell_guard.disable_for_cell(
+                    ifindex,
+                    allocation.delegated,
+                    None,
+                );
+            }
             self.delete_primary_best_effort(primary).await;
             return Err(e);
         }
 
         info!(
             "Created cell interface for {cell_name}: primary={primary} \
-             peer={peer}, host={}, guest={}",
-            allocation.host_ip, allocation.guest_ip,
+             peer={peer}, host={}, guest={}, guard={}",
+            allocation.host_ip,
+            allocation.guest_ip,
+            if self.cell_guard.get().is_some() { "on" } else { "off" },
         );
         Ok(())
     }
@@ -419,29 +529,53 @@ impl Network {
         }
     }
 
-    /// Tear down the host-side interface primary for a cell. The peer
-    /// disappears with the cell's netns (kernel removes orphaned
-    /// interface halves), and the kernel removes routes referring to a
-    /// deleted link automatically — so this only needs to delete the
-    /// primary.
-    pub(crate) async fn destroy_cell_interface(
+    /// Synchronously reclaim a cell's guard state: remove the tracking
+    /// entry, detach the guard link, and remove the cell's BPF map
+    /// entries. Returns the primary's name so the caller can delete the
+    /// link itself (async); `None` when the cell had no interface.
+    ///
+    /// Split from [`Self::destroy_cell_interface`] so non-async paths
+    /// (hard-kill, drop) can reclaim everything except the netlink
+    /// deletion — and the primary usually dies with the cell's netns
+    /// anyway.
+    pub(crate) fn reclaim_cell_interface_sync(
         &self,
         cell_name: &CellName,
-    ) -> Result<(), NetworkError> {
-        let entry = match self.cell_interfaces.lock() {
-            Ok(mut guard) => guard.remove(cell_name),
+    ) -> Option<String> {
+        let mut state = match self.cell_interfaces.lock() {
+            Ok(mut guard) => guard.remove(cell_name)?,
             Err(_poisoned) => {
                 error!(
                     "cell_interfaces mutex poisoned — cannot remove entry for \
                      {cell_name}. Host-side primary will leak."
                 );
-                return Ok(());
+                return None;
             }
         };
 
-        let Some(primary) = entry else {
+        if let Some(cell_guard) = self.cell_guard.get() {
+            cell_guard.disable_for_cell(
+                state.ifindex,
+                state.delegated,
+                state.bpf_link.take(),
+            );
+        }
+        Some(state.primary)
+    }
+
+    /// Tear down the host-side interface primary for a cell. The peer
+    /// disappears with the cell's netns (kernel removes orphaned
+    /// interface halves), and the kernel removes routes referring to a
+    /// deleted link automatically — so this only needs to reclaim the
+    /// guard state and delete the primary.
+    pub(crate) async fn destroy_cell_interface(
+        &self,
+        cell_name: &CellName,
+    ) -> Result<(), NetworkError> {
+        let Some(primary) = self.reclaim_cell_interface_sync(cell_name) else {
             // No-op: cell had no interface (e.g. isolate_network=false, or
-            // create_cell_interface failed before insert).
+            // create_cell_interface failed before insert), or the
+            // tracking mutex is poisoned (already logged).
             trace!(
                 "destroy_cell_interface: no interface handles for cell {cell_name}"
             );

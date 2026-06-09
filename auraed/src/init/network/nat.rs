@@ -147,10 +147,16 @@ impl NatState {
     /// matched here — without it, established/related return flows
     /// would die before the conntrack-accept rule runs.
     ///
-    /// Note: this rule does NOT enforce per-iif saddr binding, so a cell
-    /// with a valid pool saddr can still spoof another cell's IP. Strong
-    /// per-cell saddr binding ("siblings are adversaries") requires
-    /// per-endpoint rules and is deferred to the BPF anti-spoof phase.
+    /// Note: this rule does NOT enforce per-iif saddr binding — that is
+    /// the cell-net BPF guard's job (see `init/network/bpf.rs`), which
+    /// pins each cell's source addresses to its delegated prefix at tc
+    /// ingress on the netkit primary. This pool-granularity rule stays
+    /// as defense in depth for guard-less (degraded) operation.
+    ///
+    /// Also note: cell→cell traffic delivered via the guard's
+    /// `bpf_redirect_peer` fast path never traverses this chain (BPF
+    /// redirect bypasses netfilter); only gateway-local and WAN-bound
+    /// traffic shows up here.
     fn rule_antispoof(&self) -> Rule<'_> {
         self.rule(
             FORWARD_CHAIN,
