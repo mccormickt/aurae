@@ -16,7 +16,9 @@
 use futures::stream::TryStreamExt;
 use ipnet::{IpNet, Ipv6Net};
 use netlink_packet_route::AddressFamily;
-use netlink_packet_route::link::{LinkAttribute, NetkitMode, NetkitPolicy};
+use netlink_packet_route::link::{
+    LinkAttribute, LinkFlags, NetkitMode, NetkitPolicy,
+};
 use netlink_packet_route::route::RouteAttribute;
 use nix::libc::EEXIST;
 use rtnetlink::{Handle, LinkNetkit, LinkUnspec, RouteMessageBuilder};
@@ -287,8 +289,11 @@ impl Network {
     /// in the parent netns.
     ///
     /// Steps:
-    /// 1. Build the interface pair (netkit in L2 mode with the `Pass`
-    ///    policy on both ends so packets flow without an L2 segment).
+    /// 1. Build the interface pair (netkit in L3 mode — a pure-IP pair
+    ///    with no MACs, no ARP/ND, and no DAD (`ARPHRD_NONE` +
+    ///    `IFF_NOARP`). The `Pass` policy on both ends is required:
+    ///    packets must reach the primary's RX path where the host's tc
+    ///    programs run — a `Drop` device policy would starve them).
     /// 2. Move the peer into `peer_netns_fd`.
     /// 3. Configure the host-side primary with `host_ip/128` and bring
     ///    it up.
@@ -314,7 +319,7 @@ impl Network {
         self.handle
             .link()
             .add(
-                LinkNetkit::new(primary, peer, NetkitMode::L2)
+                LinkNetkit::new(primary, peer, NetkitMode::L3)
                     .policy(NetkitPolicy::Pass)
                     .peer_policy(NetkitPolicy::Pass)
                     .build(),
@@ -492,6 +497,12 @@ impl Network {
     /// 6. Add an `onlink` default route via the host gateway. `onlink` is
     ///    required because the gateway address sits outside the bound
     ///    prefix.
+    ///
+    /// Cell endpoints are netkit peers in L3 mode: `ARPHRD_NONE`,
+    /// `IFF_NOARP`, no MAC and no link-local address. The `via` gateway
+    /// still works because neighbours on NOARP devices are `NUD_NOARP` —
+    /// the kernel never tries to resolve a link-layer address and queues
+    /// packets straight to the device.
     pub(crate) async fn init_endpoint(
         &self,
         config: &NetworkConfig,
@@ -664,17 +675,47 @@ async fn set_link_up(
     handle: &Handle,
     iface: String,
 ) -> Result<(), NetworkError> {
+    const TIMEOUT: Duration = Duration::from_secs(3);
+    const POLL: Duration = Duration::from_millis(25);
+
     let link_index = get_link_index(handle, iface.clone()).await?;
     let msg = LinkUnspec::new_with_index(link_index).up().build();
     handle.link().set(msg).execute().await.map_err(|e| {
         NetworkError::ErrorSettingLinkUp { iface: iface.clone(), source: e }
     })?;
-    // TODO: replace sleep with an await mechanism that checks if device is
-    // up (with a timeout). https://github.com/aurae-runtime/auraed/issues/40
-    info!("Waiting for link '{iface}' to become up");
-    tokio::time::sleep(Duration::from_secs(3)).await;
-    info!("Waited 3 seconds, assuming link '{iface}' is up");
-    Ok(())
+
+    // Poll for admin-up (IFF_UP), not carrier/oper-up: pair devices like
+    // netkit only raise carrier once BOTH halves are up, and the host-side
+    // primary legitimately comes up before the peer does inside the cell.
+    // Admin-up is all the subsequent address/route adds need. No DAD wait
+    // is needed either — netkit sets IFF_NOARP, so addresses skip the
+    // tentative state. Timeout is warn-and-continue: the set request above
+    // already succeeded, so a slow flag read shouldn't fail the caller.
+    let start = Instant::now();
+    loop {
+        let link = handle
+            .link()
+            .get()
+            .match_index(link_index)
+            .execute()
+            .try_next()
+            .await;
+        if let Ok(Some(link)) = link
+            && link.header.flags.contains(LinkFlags::Up)
+        {
+            trace!("Link '{iface}' is up");
+            return Ok(());
+        }
+        if start.elapsed() >= TIMEOUT {
+            warn!(
+                "Timed out after {}ms waiting for link '{iface}' to report \
+                 IFF_UP; continuing anyway",
+                TIMEOUT.as_millis()
+            );
+            return Ok(());
+        }
+        tokio::time::sleep(POLL).await;
+    }
 }
 
 /// Rename a link. Looks up the current link by name, then sends a
