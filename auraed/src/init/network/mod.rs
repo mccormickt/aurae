@@ -504,10 +504,11 @@ impl Network {
     }
 
     /// Best-effort delete of a host-side interface primary by name. Used
-    /// from `create_cell_interface`'s rollback path. Errors are logged
-    /// rather than propagated — the caller is already returning an
-    /// error and would lose the original cause if we replaced it.
-    async fn delete_primary_best_effort(&self, primary: &str) {
+    /// from `create_cell_interface`'s rollback path and the hard-kill
+    /// reclamation path. Errors are logged rather than propagated — the
+    /// callers are already on failure paths and would lose the original
+    /// cause if we replaced it.
+    pub(crate) async fn delete_primary_best_effort(&self, primary: &str) {
         match get_link_index(&self.handle, primary.to_string()).await {
             Ok(idx) => {
                 if let Err(e) = self.handle.link().del(idx).execute().await {

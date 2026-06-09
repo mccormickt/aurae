@@ -289,17 +289,24 @@ impl Cell {
         {
             children.broadcast_free().await;
 
-            let _exit_status = nested_auraed.shutdown().map_err(|e| {
-                CellsError::FailedToKillCellChildren {
+            // Shut down processes and delete the cgroup, but don't let
+            // either failure skip the network/IPAM cleanup below — a
+            // half-freed cell must not leak its host-side interface,
+            // guard state, or address slot.
+            let teardown: Result<()> = (|| {
+                let _exit_status = nested_auraed.shutdown().map_err(|e| {
+                    CellsError::FailedToKillCellChildren {
+                        cell_name: self.cell_name.clone(),
+                        source: e,
+                    }
+                })?;
+
+                cgroup.delete().map_err(|e| CellsError::FailedToFreeCell {
                     cell_name: self.cell_name.clone(),
                     source: e,
-                }
-            })?;
-
-            cgroup.delete().map_err(|e| CellsError::FailedToFreeCell {
-                cell_name: self.cell_name.clone(),
-                source: e,
-            })?;
+                })?;
+                Ok(())
+            })();
 
             if ipam_allocation.is_some()
                 && let Some(net) = network.as_ref()
@@ -321,37 +328,113 @@ impl Cell {
                     );
                 }
             }
+
+            // Propagate the first teardown failure now that the network
+            // state is reclaimed. The state stays Allocated so a retry
+            // (or Drop's kill) can still reach the processes; the
+            // already-reclaimed network cleanup paths are no-ops then.
+            teardown?;
         }
 
         self.state = CellState::Freed;
         Ok(())
     }
 
-    /// Sends a [SIGKILL] to the [NestedAuraed], and deletes the underlying
-    /// cgroup. Best-effort sync path used by `Drop`. Does NOT clean up the
-    /// host-side interface primary or release the IPAM slot — those are the
-    /// correctness responsibility of `free()`. A hard-killed cell leaks
-    /// host-side network state until the daemon shuts down (`Network::Drop`
-    /// runs the NAT cleanup; per-cell primaries are not currently
-    /// reclaimed at that point — TODO).
+    /// Sends a [SIGKILL] to the [NestedAuraed], deletes the underlying
+    /// cgroup, and synchronously reclaims the cell's host-side network
+    /// state: guard link + BPF map entries (via
+    /// `Network::reclaim_cell_interface_sync`) and the IPAM slot. The
+    /// netlink deletion of the primary itself is async-only, so it is
+    /// spawned onto the runtime when one exists — the primary normally
+    /// dies with the cell's netns anyway, and a recycled ifindex fails
+    /// closed in the guard regardless.
     pub fn kill(&mut self) -> Result<()> {
         if let CellState::Allocated {
-            cgroup, nested_auraed, children, ..
+            cgroup,
+            nested_auraed,
+            children,
+            ipam_allocation,
+            network,
         } = &mut self.state
         {
             children.broadcast_kill();
 
-            let _exit_status = nested_auraed.kill().map_err(|e| {
-                CellsError::FailedToKillCellChildren {
+            // As in free(): a kill/cgroup failure must not skip the
+            // network/IPAM reclamation below.
+            let teardown: Result<()> = (|| {
+                let _exit_status = nested_auraed.kill().map_err(|e| {
+                    CellsError::FailedToKillCellChildren {
+                        cell_name: self.cell_name.clone(),
+                        source: e,
+                    }
+                })?;
+
+                cgroup.delete().map_err(|e| CellsError::FailedToFreeCell {
                     cell_name: self.cell_name.clone(),
                     source: e,
-                }
-            })?;
+                })?;
+                Ok(())
+            })();
 
-            cgroup.delete().map_err(|e| CellsError::FailedToFreeCell {
-                cell_name: self.cell_name.clone(),
-                source: e,
-            })?;
+            if ipam_allocation.is_some()
+                && let Some(net) = network.as_ref()
+            {
+                let key = format!("cell:{}", self.cell_name);
+                match (
+                    net.reclaim_cell_interface_sync(&self.cell_name),
+                    tokio::runtime::Handle::try_current(),
+                ) {
+                    (Some(primary), Ok(handle)) => {
+                        // Delete the primary BEFORE releasing the IPAM
+                        // slot: the reuse stack is LIFO, so an immediate
+                        // re-allocation could otherwise get this cell's
+                        // address while the old primary's dev route still
+                        // exists — and add_dev_route treats EEXIST as
+                        // success, which would leave the new cell's
+                        // return route pointing at the dying device.
+                        // free() has the same ordering (destroy, then
+                        // release).
+                        let net = Arc::clone(net);
+                        let cell_name = self.cell_name.clone();
+                        let _ignored = handle.spawn(async move {
+                            net.delete_primary_best_effort(&primary).await;
+                            if let Err(e) = net.ipam.release(&key) {
+                                warn!(
+                                    "Cell {cell_name}: failed to release \
+                                     IPAM slot: {e}"
+                                );
+                            }
+                            info!(
+                                "Cell {cell_name}: reclaimed host primary \
+                                 `{primary}` on kill path"
+                            );
+                        });
+                    }
+                    (primary, _) => {
+                        if let Some(primary) = primary {
+                            // No runtime (process teardown): the kernel
+                            // reaps the primary with the cell's netns, and
+                            // nothing can re-allocate after this process
+                            // exits — the route-collision window above
+                            // doesn't apply.
+                            warn!(
+                                "Cell {}: no tokio runtime on kill path — \
+                                 host primary `{primary}` is deleted only \
+                                 when the cell netns is reaped",
+                                self.cell_name
+                            );
+                        }
+                        if let Err(e) = net.ipam.release(&key) {
+                            warn!(
+                                "Cell {}: failed to release IPAM slot: {e}",
+                                self.cell_name
+                            );
+                        }
+                    }
+                }
+            }
+
+            teardown?;
         }
 
         self.state = CellState::Freed;
@@ -484,8 +567,10 @@ impl Drop for Cell {
     /// Here we have a chance to clean up, no matter the circumstance.
     fn drop(&mut self) {
         // We use kill here to be aggressive in cleaning up if anything has
-        // been left behind. kill is sync best-effort; the host-side interface
-        // primary leaks until daemon shutdown if Drop is the only path.
+        // been left behind. kill is sync best-effort and reclaims the
+        // guard/IPAM state inline; only the netlink deletion of the host
+        // primary needs a runtime, and the primary dies with the cell's
+        // netns anyway.
         let _best_effort = self.kill();
     }
 }
