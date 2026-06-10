@@ -92,8 +92,17 @@ impl NatState {
         batch
     }
 
+    /// The delete batch is `add table` + `delete table`, applied in one
+    /// nft transaction: `add` is a no-op when the table already exists
+    /// and creates it when it doesn't, so the `delete` target is
+    /// guaranteed to exist and the batch never fails with "no such
+    /// table". Detecting that error after the fact doesn't work — the
+    /// `nftables` crate spawns `nft` with stderr inherited (not piped),
+    /// so `NftablesError::NftFailed.stderr` is always empty and the
+    /// message text is unavailable for matching.
     fn build_delete(&self) -> Batch<'_> {
         let mut batch = Batch::new();
+        batch.add(NfListObject::Table(self.table()));
         batch.delete(NfListObject::Table(self.table()));
         batch
     }
@@ -288,20 +297,17 @@ impl NatManager {
         let new_state = NatState::new(pool_v6, wan_iface)?;
         let mut guard = self.state.lock().expect("nat mutex poisoned");
 
-        // Clear any pre-existing `inet aurae` table. "Doesn't exist" is
-        // expected on the fresh-install path.
-        if let Err(e) = apply_batch(new_state.build_delete())
-            && !is_not_found(&e)
-        {
+        // Clear any pre-existing `inet aurae` table. The delete batch is
+        // idempotent (add-before-delete), so this succeeds whether or
+        // not the table exists — a failure here is a real nft problem.
+        if let Err(e) = apply_batch(new_state.build_delete()) {
             return Err(io_err("delete prior nft table", e));
         }
 
         if let Err(e) = apply_batch(new_state.build_install()) {
             // Best-effort cleanup of any partial install; kernel and
             // tracked state both end up empty, so a retry is well-defined.
-            if let Err(cleanup_err) = apply_batch(new_state.build_delete())
-                && !is_not_found(&cleanup_err)
-            {
+            if let Err(cleanup_err) = apply_batch(new_state.build_delete()) {
                 warn!(
                     "NAT install failed and cleanup also failed: \
                      install={e}, cleanup={cleanup_err}. Operator may \
@@ -316,17 +322,14 @@ impl NatManager {
         Ok(())
     }
 
-    /// Tear down the NAT ruleset. No-op when nothing is installed. A
-    /// "table doesn't exist" error from `nft` (e.g. operator already
-    /// removed it) is treated as success.
+    /// Tear down the NAT ruleset. No-op when nothing is installed, and
+    /// safe when the operator already removed the table (the delete
+    /// batch is idempotent via add-before-delete).
     pub(crate) fn uninstall(&self) -> io::Result<()> {
         let mut guard = self.state.lock().expect("nat mutex poisoned");
         let Some(state) = guard.take() else { return Ok(()) };
-        match apply_batch(state.build_delete()) {
-            Ok(()) => Ok(()),
-            Err(e) if is_not_found(&e) => Ok(()),
-            Err(e) => Err(io_err("uninstall nft ruleset", e)),
-        }
+        apply_batch(state.build_delete())
+            .map_err(|e| io_err("uninstall nft ruleset", e))
     }
 
     pub(crate) fn is_installed(&self) -> bool {
@@ -346,18 +349,6 @@ fn apply_batch(batch: Batch<'_>) -> Result<(), NftablesError> {
 
 fn io_err(hint: &str, err: NftablesError) -> io::Error {
     io::Error::other(format!("nft {hint}: {err}"))
-}
-
-/// Detect whether the `nft` error indicates "table doesn't exist". The
-/// `nftables` crate doesn't expose a structured code for this, so we
-/// match the stderr substring as a best-effort.
-fn is_not_found(err: &NftablesError) -> bool {
-    matches!(
-        err,
-        NftablesError::NftFailed { stderr, .. }
-            if stderr.contains("does not exist")
-                || stderr.contains("No such file or directory")
-    )
 }
 
 #[cfg(test)]
@@ -545,14 +536,22 @@ mod tests {
     }
 
     #[test]
-    fn delete_batch_deletes_only_the_table() {
+    fn delete_batch_adds_then_deletes_the_table() {
         let state = test_state();
         let nft = state.build_delete().to_nftables();
         let objs = &*nft.objects;
-        assert_eq!(objs.len(), 1, "delete batch is a single Delete(Table)");
-        let table = expect_table(expect_delete(&objs[0]));
-        assert_eq!(table.family, FAMILY);
-        assert_eq!(table.name, TABLE_NAME);
+        assert_eq!(
+            objs.len(),
+            2,
+            "delete batch is Add(Table) then Delete(Table) so the delete \
+             can never fail on a missing table"
+        );
+        let added = expect_table(expect_add(&objs[0]));
+        assert_eq!(added.family, FAMILY);
+        assert_eq!(added.name, TABLE_NAME);
+        let deleted = expect_table(expect_delete(&objs[1]));
+        assert_eq!(deleted.family, FAMILY);
+        assert_eq!(deleted.name, TABLE_NAME);
     }
 
     // ---- Statement structural assertions ----
