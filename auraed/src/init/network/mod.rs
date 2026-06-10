@@ -17,10 +17,10 @@ use futures::stream::TryStreamExt;
 use ipnet::{IpNet, Ipv6Net};
 use netlink_packet_route::AddressFamily;
 use netlink_packet_route::link::{
-    LinkAttribute, LinkFlags, NetkitMode, NetkitPolicy,
+    InfoKind, LinkAttribute, LinkFlags, LinkInfo, NetkitMode, NetkitPolicy,
 };
 use netlink_packet_route::route::RouteAttribute;
-use nix::libc::EEXIST;
+use nix::libc;
 use rtnetlink::{Handle, LinkNetkit, LinkUnspec, RouteMessageBuilder};
 use std::collections::HashMap;
 use std::fmt;
@@ -210,6 +210,11 @@ impl Network {
             );
             return NetworkReady::Unavailable;
         }
+
+        // Reconcile leftover per-cell state from a previous daemon
+        // before anything can collide with it (the fresh IPAM will
+        // re-hand-out addresses that leftover primaries still route).
+        self.cleanup_leftover_cell_interfaces().await;
 
         // Load the cell-net guard before the LocalOnly early-returns:
         // hosts without internet egress still allocate cells and want
@@ -511,11 +516,22 @@ impl Network {
     pub(crate) async fn delete_primary_best_effort(&self, primary: &str) {
         match get_link_index(&self.handle, primary.to_string()).await {
             Ok(idx) => {
-                if let Err(e) = self.handle.link().del(idx).execute().await {
-                    warn!(
-                        "Rollback: failed to delete primary `{primary}` \
-                         (index {idx}): {e}. Host interface may leak."
-                    );
+                match self.handle.link().del(idx).execute().await {
+                    Ok(()) => {}
+                    // The kernel reaps the pair when the cell's netns
+                    // dies, racing this delete — already gone is fine.
+                    Err(e) if netlink_errno(&e) == Some(-libc::ENODEV) => {
+                        trace!(
+                            "Primary `{primary}` disappeared before delete \
+                             (netns teardown won the race)"
+                        );
+                    }
+                    Err(e) => {
+                        warn!(
+                            "Rollback: failed to delete primary `{primary}` \
+                             (index {idx}): {e}. Host interface may leak."
+                        );
+                    }
                 }
             }
             Err(NetworkError::DeviceNotFound { .. }) => {
@@ -526,6 +542,80 @@ impl Network {
                     "Rollback: could not look up primary `{primary}` for \
                      deletion: {e}. Host interface may leak."
                 );
+            }
+        }
+    }
+
+    /// Best-effort sweep of leftover cell primaries from a previous
+    /// daemon. A crash/SIGKILL leaves orphaned nested auraeds running
+    /// (they're spawned without `PDEATHSIG`), and their netnses keep the
+    /// host-side `nk-*` primaries and `/128` dev routes alive — while
+    /// this daemon's in-memory IPAM restarts from scratch and re-hands
+    /// out the very same addresses. Deleting the leftover primaries
+    /// severs those orphans (the daemon owns all cell plumbing; the
+    /// orphans already lost their BPF guard when the old daemon's links
+    /// died with its fds) and frees their routes. Same philosophy as the
+    /// NAT delete-before-install.
+    ///
+    /// Matches only netkit-kind devices named `nk-<8 hex>` — the
+    /// namespace [`Self::reserve_interface_names`] owns. Assumes a
+    /// single auraed daemon per host (the NAT table already does).
+    async fn cleanup_leftover_cell_interfaces(&self) {
+        let mut links = self.handle.link().get().execute();
+        let mut leftovers: Vec<(u32, String)> = Vec::new();
+        loop {
+            match links.try_next().await {
+                Ok(Some(link)) => {
+                    let mut name = None;
+                    let mut is_netkit = false;
+                    for attr in &link.attributes {
+                        match attr {
+                            LinkAttribute::IfName(n) => name = Some(n.clone()),
+                            LinkAttribute::LinkInfo(infos) => {
+                                is_netkit = infos.iter().any(|info| {
+                                    matches!(
+                                        info,
+                                        LinkInfo::Kind(InfoKind::Netkit)
+                                    )
+                                });
+                            }
+                            _ => {}
+                        }
+                    }
+                    if let Some(name) = name
+                        && is_netkit
+                        && is_cell_primary_name(&name)
+                    {
+                        leftovers.push((link.header.index, name));
+                    }
+                }
+                Ok(None) => break,
+                Err(e) => {
+                    warn!(
+                        "Leftover cell-interface sweep failed to dump links: \
+                         {e}. Stale primaries from a previous daemon may \
+                         shadow new cell routes."
+                    );
+                    return;
+                }
+            }
+        }
+
+        for (index, name) in leftovers {
+            match self.handle.link().del(index).execute().await {
+                Ok(()) => {
+                    info!(
+                        "Reclaimed leftover cell primary `{name}` \
+                         (index {index}) from a previous daemon"
+                    );
+                }
+                Err(e) if netlink_errno(&e) == Some(-libc::ENODEV) => {}
+                Err(e) => {
+                    warn!(
+                        "Failed to reclaim leftover cell primary `{name}` \
+                         (index {index}): {e}"
+                    );
+                }
             }
         }
     }
@@ -595,13 +685,28 @@ impl Network {
             Err(e) => return Err(e),
         };
 
-        self.handle.link().del(index).execute().await.map_err(|e| {
-            NetworkError::ErrorDeletingLink {
-                iface: primary.clone(),
-                index,
-                source: e,
+        match self.handle.link().del(index).execute().await {
+            Ok(()) => {}
+            // The kernel reaps the pair when the cell's netns dies (the
+            // nested auraed was just shut down), and that races this
+            // delete: ENODEV between the lookup above and here means the
+            // primary is already gone — which is the goal.
+            Err(e) if netlink_errno(&e) == Some(-libc::ENODEV) => {
+                trace!(
+                    "destroy_cell_interface: primary `{primary}` disappeared \
+                     before delete for cell {cell_name} (netns teardown won \
+                     the race)"
+                );
+                return Ok(());
             }
-        })?;
+            Err(e) => {
+                return Err(NetworkError::ErrorDeletingLink {
+                    iface: primary.clone(),
+                    index,
+                    source: e,
+                });
+            }
+        }
         info!(
             "Destroyed cell interface for {cell_name}: primary={primary} \
              index={index}"
@@ -789,17 +894,12 @@ async fn add_address(
         .await
         .map(|_| trace!("Added address to link {iface}"))
         .or_else(|e| {
-            if let rtnetlink::Error::NetlinkError(msg) = &e {
-                let dup_code: i32 = -EEXIST;
-                if msg
-                    .code
-                    .map(|c| c.get())
-                    .map(|c| c == dup_code)
-                    .unwrap_or(false)
-                {
-                    warn!("Address {ip} already present on {iface}, ignoring");
-                    return Ok(());
-                }
+            // Address EEXIST really does mean "this exact address is
+            // already on this link" (addresses are keyed per-interface),
+            // unlike routes — tolerating it here is safe idempotency.
+            if netlink_errno(&e) == Some(-libc::EEXIST) {
+                warn!("Address {ip} already present on {iface}, ignoring");
+                return Ok(());
             }
             Err(NetworkError::ErrorAddingAddress { iface, ip, source: e })
         })?;
@@ -875,6 +975,27 @@ async fn rename_link(
     Ok(())
 }
 
+/// Extract the negative errno from a netlink NACK, if that's what the
+/// error is. Lets call sites classify kernel responses (`-EEXIST`,
+/// `-ENODEV`, ...) without pattern-matching boilerplate.
+fn netlink_errno(err: &rtnetlink::Error) -> Option<i32> {
+    if let rtnetlink::Error::NetlinkError(msg) = err {
+        msg.code.map(|c| c.get())
+    } else {
+        None
+    }
+}
+
+/// True for names produced by [`Network::reserve_interface_names`] for
+/// host-side primaries: `nk-` followed by exactly 8 hex chars. Used by
+/// the leftover-state sweep to recognize this daemon's own devices.
+fn is_cell_primary_name(name: &str) -> bool {
+    let bytes = name.as_bytes();
+    bytes.len() == 11
+        && bytes.starts_with(b"nk-")
+        && bytes[3..].iter().all(|b| b.is_ascii_hexdigit())
+}
+
 async fn get_link_index(
     handle: &Handle,
     iface: String,
@@ -893,8 +1014,15 @@ async fn get_link_index(
     }
 }
 
-/// Install a v6 host route: `dest dev iface src host_ip`. No gateway —
+/// Ensure a v6 host route: `dest dev iface src host_ip`. No gateway —
 /// `dev` routes are sufficient for the routed point-to-link.
+///
+/// Sent with `NLM_F_REPLACE` ("ensure exactly this route"), NOT
+/// `NLM_F_EXCL` + EEXIST-tolerance: EEXIST only means *a* route to the
+/// prefix exists, not that it points at this device. A stale same-prefix
+/// route via a dead device (leftover from a crashed daemon, or a
+/// hard-kill racing re-allocation of the address) would otherwise be
+/// silently kept and blackhole the new endpoint's return traffic.
 async fn add_dev_route(
     handle: &Handle,
     iface: &str,
@@ -907,28 +1035,27 @@ async fn add_dev_route(
         .output_interface(link_index)
         .pref_source(pref_source)
         .build();
-    handle.route().add(route).execute().await.or_else(|e| {
-        if let rtnetlink::Error::NetlinkError(msg) = &e
-            && msg.code.map(|c| c.get()) == Some(-EEXIST)
-        {
-            return Ok(());
-        }
-        Err(NetworkError::ErrorAddingRoute {
+    handle.route().add(route).replace().execute().await.map_err(|e| {
+        NetworkError::ErrorAddingRoute {
             iface: iface.to_string(),
             route_source: IpNet::V6(
                 Ipv6Net::new(pref_source, 128).expect("/128"),
             ),
             route_destination: IpNet::V6(dest),
             source: e,
-        })
+        }
     })?;
     Ok(())
 }
 
-/// Install an `onlink` default route: `default via <gw> dev iface onlink`.
+/// Ensure an `onlink` default route: `default via <gw> dev iface onlink`.
 /// `onlink` lets the kernel install the route even though the gateway
 /// address is not in any directly-attached subnet (we use /128 on the
 /// guest side, so the gateway lives outside the guest's "own" prefix).
+///
+/// Sent with `NLM_F_REPLACE` so a pre-existing default route (leftover
+/// state) is superseded instead of failing the endpoint setup with
+/// EEXIST.
 async fn add_onlink_default(
     handle: &Handle,
     iface: &str,
@@ -943,7 +1070,7 @@ async fn add_onlink_default(
         .pref_source(pref_source)
         .onlink()
         .build();
-    handle.route().add(route).execute().await.map_err(|e| {
+    handle.route().add(route).replace().execute().await.map_err(|e| {
         NetworkError::ErrorAddingRoute {
             iface: iface.to_string(),
             route_source: IpNet::V6(
@@ -997,11 +1124,245 @@ async fn get_link_name(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use netlink_packet_route::route::RouteAddress;
+    use rtnetlink::packet_core::ErrorMessage;
+    use serial_test::serial;
+    use std::num::NonZeroI32;
+    use test_helpers::*;
 
     #[test]
     fn network_ready_allows_cells_only_for_full_or_local() {
         assert!(NetworkReady::Full.allows_cells());
         assert!(NetworkReady::LocalOnly.allows_cells());
         assert!(!NetworkReady::Unavailable.allows_cells());
+    }
+
+    #[test]
+    fn cell_primary_name_matcher_is_strict() {
+        assert!(is_cell_primary_name("nk-a1b2c3d4"));
+        assert!(is_cell_primary_name("nk-00000000"));
+        assert!(is_cell_primary_name("nk-DEADBEEF"));
+        // Peers, wrong lengths, non-hex, other prefixes: never matched —
+        // the leftover sweep must not take devices it doesn't own.
+        assert!(!is_cell_primary_name("nk-a1b2c3d4-p"));
+        assert!(!is_cell_primary_name("nk-a1b2c3d"));
+        assert!(!is_cell_primary_name("nk-a1b2c3d4e"));
+        assert!(!is_cell_primary_name("nk-a1b2c3dg"));
+        assert!(!is_cell_primary_name("xk-a1b2c3d4"));
+        assert!(!is_cell_primary_name("nk-"));
+        assert!(!is_cell_primary_name("eth0"));
+    }
+
+    #[test]
+    fn netlink_errno_classifies_only_nack_replies() {
+        let mut nack = ErrorMessage::default();
+        nack.code = NonZeroI32::new(-libc::ENODEV);
+        assert_eq!(
+            netlink_errno(&rtnetlink::Error::NetlinkError(nack)),
+            Some(-libc::ENODEV)
+        );
+
+        // An ACK (code None) carries no errno.
+        assert_eq!(
+            netlink_errno(&rtnetlink::Error::NetlinkError(
+                ErrorMessage::default()
+            )),
+            None
+        );
+
+        // Non-netlink error variants carry no errno either.
+        assert_eq!(
+            netlink_errno(&rtnetlink::Error::NamespaceError("x".into())),
+            None
+        );
+    }
+
+    // ---- Root-gated behavioral tests against a real kernel ----
+    //
+    // These mirror the cell.rs unit-test convention: they run only as
+    // root (skipped otherwise) and operate on real netlink state, using
+    // `tst-`-prefixed scratch devices and the fd00:dead:beef::/48 range
+    // so they can't collide with live cell plumbing.
+
+    async fn create_test_pair(handle: &Handle, primary: &str, peer: &str) {
+        handle
+            .link()
+            .add(
+                LinkNetkit::new(primary, peer, NetkitMode::L3)
+                    .policy(NetkitPolicy::Pass)
+                    .peer_policy(NetkitPolicy::Pass)
+                    .build(),
+            )
+            .execute()
+            .await
+            .expect("create test netkit pair");
+    }
+
+    async fn delete_if_exists(handle: &Handle, name: &str) {
+        if let Ok(idx) = get_link_index(handle, name.to_string()).await {
+            let _ = handle.link().del(idx).execute().await;
+        }
+    }
+
+    /// Find the oif of the v6 route to exactly `dest`, if any.
+    async fn route_oif(handle: &Handle, dest: Ipv6Net) -> Option<u32> {
+        let msg = RouteMessageBuilder::<Ipv6Addr>::new().build();
+        let mut routes = handle.route().get(msg).execute();
+        while let Ok(Some(route)) = routes.try_next().await {
+            if route.header.destination_prefix_length != dest.prefix_len() {
+                continue;
+            }
+            let mut matches_dest = false;
+            let mut oif = None;
+            for attr in &route.attributes {
+                match attr {
+                    RouteAttribute::Destination(RouteAddress::Inet6(a)) => {
+                        matches_dest = *a == dest.addr();
+                    }
+                    RouteAttribute::Oif(i) => oif = Some(*i),
+                    _ => {}
+                }
+            }
+            if matches_dest {
+                return oif;
+            }
+        }
+        None
+    }
+
+    /// The kernel returns ENODEV when deleting a link that disappeared
+    /// between lookup and delete (pair devices race netns teardown) —
+    /// the exact classification the tolerant delete paths rely on.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    // Serialized: mutates global host netlink state.
+    #[serial]
+    async fn delete_tolerates_already_gone_device() {
+        skip_if_not_root!("delete_tolerates_already_gone_device");
+        skip_if_seccomp!("delete_tolerates_already_gone_device");
+
+        let network = Network::connect().expect("netlink connect");
+        let handle = &network.handle;
+        let suffix = uuid::Uuid::new_v4().simple().to_string();
+        let primary = format!("tst-{}", &suffix[..8]);
+        let peer = format!("{primary}-p");
+
+        create_test_pair(handle, &primary, &peer).await;
+        let idx = get_link_index(handle, primary.clone())
+            .await
+            .expect("test pair exists");
+        handle.link().del(idx).execute().await.expect("first delete");
+
+        let err = handle
+            .link()
+            .del(idx)
+            .execute()
+            .await
+            .expect_err("device is already gone");
+        assert_eq!(netlink_errno(&err), Some(-libc::ENODEV));
+
+        // The best-effort path stays silent on an already-gone primary.
+        network.delete_primary_best_effort(&primary).await;
+    }
+
+    /// `add_dev_route` must supersede a stale same-prefix route that
+    /// points at a different device (leftover from a crashed daemon or a
+    /// hard-kill race) instead of silently keeping it: with NLM_F_EXCL
+    /// the second add would EEXIST and the stale route would keep
+    /// blackholing the new endpoint's return traffic.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    // Serialized: mutates global host netlink state.
+    #[serial]
+    async fn dev_route_replace_supersedes_stale_route() {
+        skip_if_not_root!("dev_route_replace_supersedes_stale_route");
+        skip_if_seccomp!("dev_route_replace_supersedes_stale_route");
+
+        let network = Network::connect().expect("netlink connect");
+        let handle = &network.handle;
+        let suffix = uuid::Uuid::new_v4().simple().to_string();
+        let stale = format!("tst-{}", &suffix[..8]);
+        let stale_peer = format!("{stale}-p");
+        let fresh = format!("tsu-{}", &suffix[..8]);
+        let fresh_peer = format!("{fresh}-p");
+        let host: Ipv6Addr = "fd00:dead:beef::1".parse().expect("addr");
+        let dest: Ipv6Net = "fd00:dead:beef::2/128".parse().expect("net");
+
+        create_test_pair(handle, &stale, &stale_peer).await;
+        create_test_pair(handle, &fresh, &fresh_peer).await;
+
+        let setup: Result<(), NetworkError> = async {
+            add_address(
+                handle,
+                stale.clone(),
+                Ipv6Net::new(host, 128).expect("/128"),
+            )
+            .await?;
+            set_link_up(handle, stale.clone()).await?;
+            set_link_up(handle, fresh.clone()).await?;
+            // The "leftover" route via the stale device...
+            add_dev_route(handle, &stale, dest, host).await?;
+            // ...must be atomically superseded by the new endpoint's.
+            add_dev_route(handle, &fresh, dest, host).await?;
+            Ok(())
+        }
+        .await;
+
+        let oif = route_oif(handle, dest).await;
+        let fresh_idx = get_link_index(handle, fresh.clone()).await.ok();
+
+        // Clean up before asserting so failures don't leak devices (the
+        // routes die with the links).
+        delete_if_exists(handle, &stale).await;
+        delete_if_exists(handle, &fresh).await;
+
+        setup.expect("route setup");
+        assert_eq!(
+            oif, fresh_idx,
+            "the route must point at the replacing device, not the stale one"
+        );
+    }
+
+    /// The startup sweep must reclaim leftover `nk-<hex>` netkit
+    /// primaries (a previous daemon's cell plumbing) and must NOT touch
+    /// netkit devices outside that namespace.
+    ///
+    /// NOTE: like the daemon's own startup, this deletes any live
+    /// `nk-<8 hex>` netkit devices on the host — don't run root tests
+    /// next to a production auraed (the existing nft-table tests have
+    /// the same single-daemon assumption).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    // Serialized: mutates global host netlink state.
+    #[serial]
+    async fn leftover_sweep_removes_only_cell_primaries() {
+        skip_if_not_root!("leftover_sweep_removes_only_cell_primaries");
+        skip_if_seccomp!("leftover_sweep_removes_only_cell_primaries");
+
+        let network = Network::connect().expect("netlink connect");
+        let handle = &network.handle;
+        let (cell_like, cell_like_peer) = network.reserve_interface_names();
+        let suffix = uuid::Uuid::new_v4().simple().to_string();
+        let bystander = format!("tst-{}", &suffix[..8]);
+        let bystander_peer = format!("{bystander}-p");
+
+        create_test_pair(handle, &cell_like, &cell_like_peer).await;
+        create_test_pair(handle, &bystander, &bystander_peer).await;
+
+        network.cleanup_leftover_cell_interfaces().await;
+
+        let cell_like_gone =
+            get_link_index(handle, cell_like.clone()).await.is_err();
+        let bystander_kept =
+            get_link_index(handle, bystander.clone()).await.is_ok();
+
+        delete_if_exists(handle, &cell_like).await;
+        delete_if_exists(handle, &bystander).await;
+
+        assert!(
+            cell_like_gone,
+            "sweep must remove leftover nk-<hex> netkit primaries"
+        );
+        assert!(
+            bystander_kept,
+            "sweep must not touch netkit devices it doesn't own"
+        );
     }
 }
