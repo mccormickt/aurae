@@ -43,6 +43,14 @@ pub struct NestedAuraed {
     #[allow(unused)]
     iso_ctl: IsolationControls,
     pub client_socket: AuraeSocket,
+    /// Exit status memoized by the first successful wait. Subsequent
+    /// `shutdown()`/`kill()` calls return it instead of re-signaling:
+    /// the pid was reaped by that first wait, so a second signal would
+    /// either fail with ESRCH — wedging retried teardown before it ever
+    /// reaches the cgroup cleanup — or, after pid reuse, hit an
+    /// unrelated process. This is what keeps `Cell::free` retryable
+    /// after a partial failure and makes `Drop`'s kill safe.
+    exit_status: Option<ExitStatus>,
 }
 
 impl NestedAuraed {
@@ -177,24 +185,77 @@ impl NestedAuraed {
                 let process = procfs::process::Process::new(pid)
                     .map_err(io::Error::other)?;
 
-                Ok(Self { process, pidfd, iso_ctl, client_socket })
+                Ok(Self {
+                    process,
+                    pidfd,
+                    iso_ctl,
+                    client_socket,
+                    exit_status: None,
+                })
             }
         }
     }
 
-    /// Sends a graceful shutdown signal to the nested process.
+    /// Sends a graceful shutdown signal to the nested process. Idempotent:
+    /// once the process has been waited on, returns the memoized exit
+    /// status without signaling again.
     pub fn shutdown(&mut self) -> io::Result<ExitStatus> {
         // TODO: Here, SIGTERM works when using auraescript, but hangs(?) during unit tests.
         //       SIGKILL, however, works. The hang is avoided if the process is not isolated.
         //       Tests have not been done to figure out which namespace is the cause of the hang.
-        self.do_kill(Some(SIGTERM))?;
-        self.wait()
+        self.signal_and_wait(SIGTERM)
     }
 
-    /// Sends a [SIGKILL] signal to the nested process.
+    /// Sends a [SIGKILL] signal to the nested process. Idempotent: once
+    /// the process has been waited on, returns the memoized exit status
+    /// without signaling again.
     pub fn kill(&mut self) -> io::Result<ExitStatus> {
-        self.do_kill(Some(SIGKILL))?;
-        self.wait()
+        self.signal_and_wait(SIGKILL)
+    }
+
+    /// Signal the nested process and reap it, memoizing the exit status.
+    ///
+    /// Already-reaped is success, not an error: a previous teardown
+    /// attempt may have reaped the process and then failed at a later
+    /// step (e.g. cgroup delete) — the retry must fall through to that
+    /// later step instead of failing here forever. ESRCH on the signal
+    /// (with no memoized status — somebody else reaped, or a previous
+    /// wait was interrupted at the wrong moment) is treated the same
+    /// way, with a synthesized clean exit.
+    fn signal_and_wait(&mut self, signal: Signal) -> io::Result<ExitStatus> {
+        if let Some(exit_status) = self.exit_status {
+            trace!(
+                "Pid {} already reaped (status {exit_status}); skipping \
+                 {signal}",
+                self.process.pid
+            );
+            return Ok(exit_status);
+        }
+
+        let already_gone = match self.do_kill(Some(signal)) {
+            Ok(()) => false,
+            Err(e) if e.raw_os_error() == Some(Errno::ESRCH as i32) => true,
+            Err(e) => return Err(e),
+        };
+
+        let exit_status = match self.wait() {
+            Ok(exit_status) => exit_status,
+            // Nothing left to reap, consistent with the ESRCH above.
+            Err(e)
+                if already_gone
+                    && e.raw_os_error() == Some(Errno::ECHILD as i32) =>
+            {
+                trace!(
+                    "Pid {} was already reaped; synthesizing clean exit",
+                    self.process.pid
+                );
+                ExitStatus::from_raw(0)
+            }
+            Err(e) => return Err(e),
+        };
+
+        self.exit_status = Some(exit_status);
+        Ok(exit_status)
     }
 
     fn do_kill<T: Into<Option<Signal>>>(
@@ -270,5 +331,66 @@ impl NestedAuraed {
 
     pub fn pid(&self) -> Pid {
         Pid::from_raw(self.process.pid)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Build a `NestedAuraed` around an arbitrary child process so the
+    /// teardown paths can be exercised without spawning a real nested
+    /// auraed (no certs, no namespaces, no root).
+    fn nested_for(child: &std::process::Child) -> NestedAuraed {
+        NestedAuraed {
+            process: procfs::process::Process::new(child.id() as i32)
+                .expect("child process exists in /proc"),
+            pidfd: -1,
+            iso_ctl: IsolationControls {
+                isolate_process: false,
+                isolate_network: false,
+            },
+            client_socket: AuraeSocket::Path("/dev/null".into()),
+            exit_status: None,
+        }
+    }
+
+    /// A second (and third) teardown call must not re-signal the reaped
+    /// — and possibly recycled — pid: it returns the memoized status.
+    /// This is what lets a retried `Cell::free` proceed past the process
+    /// step to the cgroup cleanup after a partial failure.
+    #[test]
+    // The child IS reaped — by `nested.kill()`'s internal waitpid, which
+    // is the very behavior under test — just not via `Child::wait`.
+    #[allow(clippy::zombie_processes)]
+    fn teardown_is_idempotent_after_reap() {
+        let child =
+            Command::new("sleep").arg("30").spawn().expect("spawn sleep child");
+        let mut nested = nested_for(&child);
+
+        let first = nested.kill().expect("first kill reaps the child");
+        let second = nested.kill().expect("second kill is a no-op");
+        let third = nested.shutdown().expect("shutdown after kill is a no-op");
+        assert_eq!(first, second);
+        assert_eq!(first, third);
+    }
+
+    /// A child that was already reaped elsewhere (ESRCH on signal,
+    /// ECHILD on wait) is treated as exited — synthesized clean status —
+    /// instead of wedging teardown forever.
+    #[test]
+    fn teardown_of_externally_reaped_child_synthesizes_clean_exit() {
+        let mut child = Command::new("true").spawn().expect("spawn true child");
+        // Build while the /proc entry still exists (running or zombie).
+        let mut nested = nested_for(&child);
+        let _ = child.wait().expect("reap the child out from under us");
+
+        let status =
+            nested.kill().expect("teardown of a reaped child must succeed");
+        assert!(status.success(), "synthesized status is a clean exit");
+
+        // And it memoizes like any other teardown.
+        let again = nested.shutdown().expect("subsequent teardown is a no-op");
+        assert_eq!(status, again);
     }
 }

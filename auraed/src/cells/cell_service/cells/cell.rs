@@ -331,8 +331,11 @@ impl Cell {
 
             // Propagate the first teardown failure now that the network
             // state is reclaimed. The state stays Allocated so a retry
-            // (or Drop's kill) can still reach the processes; the
-            // already-reclaimed network cleanup paths are no-ops then.
+            // (or Drop's kill) can finish the job: the nested auraed's
+            // exit status is memoized after the first successful reap,
+            // so the retry skips re-signaling and proceeds straight to
+            // the cgroup delete, and the already-reclaimed network
+            // cleanup paths are no-ops.
             teardown?;
         }
 

@@ -13,6 +13,10 @@
  * SPDX-License-Identifier: Apache-2.0                                        *
 \* -------------------------------------------------------------------------- */
 /* -------------------------------------------------------------------------- *\
+ *                      SPDX-License-Identifier: GPL-2.0                      *
+ *                      SPDX-License-Identifier: MIT                          *
+ *                                                                            *
+ *                +--------------------------------------------+              *
  *                |   █████╗ ██╗   ██╗██████╗  █████╗ ███████╗ |              *
  *                |  ██╔══██╗██║   ██║██╔══██╗██╔══██╗██╔════╝ |              *
  *                |  ███████║██║   ██║██████╔╝███████║█████╗   |              *
@@ -22,13 +26,8 @@
  *                +--------------------------------------------+              *
  *                                                                            *
  *                         Distributed Systems Runtime                        *
+ *                                                                            *
  * -------------------------------------------------------------------------- *
- * Copyright 2022 - 2026, the aurae contributors                              *
- * SPDX-License-Identifier: Apache-2.0                                        *
-\* -------------------------------------------------------------------------- */
-/* -------------------------------------------------------------------------- *\
- *                      SPDX-License-Identifier: GPL-2.0                      *
- *                      SPDX-License-Identifier: MIT                          *
  * Dual Licensed: GNU GENERAL PUBLIC LICENSE 2.0                              *
  * Dual Licensed: MIT License                                                 *
  * Copyright 2023 The Aurae Authors (The Nivenly Foundation)                  *
@@ -55,12 +54,12 @@
 //! Cell netkit pairs run in L3 mode, so packets here carry no Ethernet
 //! header. Reads use `bpf_skb_load_bytes_relative(BPF_HDR_START_NET)`,
 //! which is anchored at the network header whether or not a MAC header
-//! exists — the same code works for a future tc program on an L2 tap.
+//! exists.
 
 #![no_std]
 #![no_main]
 
-use aurae_ebpf_shared::{CellNetConfig, CellNetStats, ipv6_in_prefix};
+use aurae_ebpf_shared::{ipv6_in_prefix, CellNetConfig, CellNetStats};
 use aya_ebpf::bindings::bpf_hdr_start_off::BPF_HDR_START_NET;
 use aya_ebpf::bindings::{TC_ACT_OK, TC_ACT_SHOT};
 use aya_ebpf::helpers::{bpf_redirect_peer, bpf_skb_load_bytes_relative};
