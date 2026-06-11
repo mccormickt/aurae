@@ -45,19 +45,6 @@ pub(crate) enum VmServiceError {
     )]
     NetworkingUnavailable,
 
-    /// A local (non-proxied) VM lifecycle RPC reached an auraed that isn't
-    /// the host daemon — i.e. a nested auraed inside a cell. The host
-    /// proxies `cell_name`-scoped requests here, but a nested auraed can't
-    /// host VMs itself yet: it has no `Network`/IPAM of its own (prefix
-    /// delegation for nested allocation isn't wired). Distinct from
-    /// [`Self::NetworkingUnavailable`], which is a genuine host-side
-    /// networking failure.
-    #[error(
-        "virtual machines cannot be managed inside a cell yet: this auraed \
-         is nested, not the host daemon"
-    )]
-    VmInCellUnsupported,
-
     /// `cell_name` field on the request was syntactically invalid.
     #[error("invalid cell_name: {source}")]
     InvalidCellName {
@@ -103,7 +90,6 @@ impl From<VmServiceError> for Status {
             | VmServiceError::NetworkingUnavailable => {
                 Status::failed_precondition(msg)
             }
-            VmServiceError::VmInCellUnsupported => Status::unimplemented(msg),
             VmServiceError::InvalidCellName { .. } => {
                 Status::invalid_argument(msg)
             }

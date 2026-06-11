@@ -400,6 +400,10 @@ prepare-image:
 	ln -sf ../lib/auraed/auraed /mnt/sbin/init
 	umount /mnt
 
+.PHONY: e2e-vm-in-cell
+e2e-vm-in-cell: aer-debug auraed-debug ## E2E test of VM-in-cell networking through the `aer` CLI (needs root + KVM + a prepared guest image; SKIPs when unavailable)
+	sudo -E bash hack/e2e-vm-in-cell.sh
+
 #------------------------------------------------------------------------------#
 
 # CI Commands

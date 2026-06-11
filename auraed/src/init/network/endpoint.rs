@@ -99,7 +99,6 @@ impl NetworkConfig {
             (FLAG_INTERFACE_NAME, self.interface_name.clone()),
         ]
     }
-
     /// Build the allocator that a nested auraed can use to sub-delegate
     /// /128 addresses to VMs. The cell endpoint occupies the block base and
     /// the nested gateway occupies base+1, so at least three addresses are
@@ -153,38 +152,44 @@ mod tests {
         assert_eq!(pairs[3].0, "--net-interface-name");
         assert_eq!(pairs[3].1, "nk-deadbeef-p");
     }
-
     #[test]
-    fn delegated_block_seeds_nested_vm_ipam() {
+    fn nested_ipam_config_uses_the_delegated_block_as_pool() {
+        // A /112 cell delegates a 16-bit block; its nested auraed seeds an
+        // IPAM whose pool is that block and whose device prefix is /128.
         let config = NetworkConfig {
             host_v6: "fd00:ae::1".parse().unwrap(),
             guest_v6: "fd00:ae::1:0".parse().unwrap(),
             delegated_prefix_len_v6: 112,
-            interface_name: "eth0".to_string(),
+            interface_name: "nk-deadbeef-p".to_string(),
         };
-        let nested = config.nested_ipam_config().expect("delegated pool");
-        assert_eq!(nested.pool_v6.to_string(), "fd00:ae::1:0/112");
-        assert_eq!(nested.device_prefix_v6, 128);
-
-        let allocation = Ipam::new(nested).allocate("vm:one").unwrap();
-        assert_eq!(allocation.host_ip.to_string(), "fd00:ae::1:1");
-        assert_eq!(allocation.guest_ip.to_string(), "fd00:ae::1:2");
-        assert_eq!(allocation.delegated.prefix_len(), 128);
+        let ipam = config.nested_ipam_config().expect("/112 sub-delegates");
+        // First nested allocation is the cell block's base+2 (base is the
+        // cell's own eth0, base+1 the nested gateway).
+        let alloc = Ipam::new(ipam).allocate("vm:one").unwrap();
+        assert_eq!(alloc.guest_ip, "fd00:ae::1:2".parse::<Ipv6Addr>().unwrap());
+        assert_eq!(alloc.host_ip, "fd00:ae::1:1".parse::<Ipv6Addr>().unwrap());
+        assert_eq!(alloc.delegated.prefix_len(), 128);
     }
 
     #[test]
-    fn nested_vm_ipam_requires_three_addresses() {
-        let config = |delegated_prefix_len_v6| NetworkConfig {
+    fn nested_ipam_config_none_for_too_narrow_block() {
+        // A block with fewer than three /128s can't sub-delegate (it has no
+        // room beyond the cell's eth0 + the nested gateway), so its nested
+        // auraed gets no service Network and refuses VM hosting. /128 (single
+        // address) and /127 (two addresses) are both too narrow; /126 (four)
+        // is the first width that can host a VM.
+        let cfg = |len: u8| NetworkConfig {
             host_v6: "fd00:ae::1".parse().unwrap(),
             guest_v6: "fd00:ae::4".parse().unwrap(),
-            delegated_prefix_len_v6,
+            delegated_prefix_len_v6: len,
             interface_name: "eth0".to_string(),
         };
+        assert!(cfg(128).nested_ipam_config().is_none(), "/128 too narrow");
+        assert!(cfg(127).nested_ipam_config().is_none(), "/127 too narrow");
 
-        assert!(config(128).nested_ipam_config().is_none());
-        assert!(config(127).nested_ipam_config().is_none());
-        let nested = config(126).nested_ipam_config().expect("four addresses");
-        let allocation = Ipam::new(nested).allocate("vm:one").unwrap();
-        assert_eq!(allocation.guest_ip.to_string(), "fd00:ae::6");
+        let ipam = cfg(126).nested_ipam_config().expect("/126 sub-delegates");
+        // Block base fd00:ae::4 = eth0, base+1 = gateway, base+2 = first VM.
+        let alloc = Ipam::new(ipam).allocate("vm:one").unwrap();
+        assert_eq!(alloc.guest_ip, "fd00:ae::6".parse::<Ipv6Addr>().unwrap());
     }
 }
