@@ -178,6 +178,7 @@ pub async fn run(
         runtime: &AuraedRuntime,
         context: AuraeContext,
         socket_stream: T,
+        net_config: Option<NetworkConfig>,
     ) -> Result<(), Box<dyn std::error::Error>>
     where
         T: tokio_stream::Stream<Item = Result<IO, IE>> + Send + 'static,
@@ -270,29 +271,39 @@ pub async fn run(
         // `VmService`, which owns the routed TAP of each VM, hold their own
         // clones of it. Both use one pool. The IPAM key prefixes
         // `cell:<name>` and `vm:<id>` keep the two key spaces separate.
-        let network: Option<Network> = if context == AuraeContext::Daemon {
-            match Network::connect(IpamConfig::default()) {
-                Ok(net) => match net.init_host_network().await {
-                    Ok(()) => Some(net),
+        let network: Option<Network> = match context {
+            AuraeContext::Daemon => {
+                match Network::connect(IpamConfig::default()) {
+                    Ok(net) => match net.init_host_network().await {
+                        Ok(()) => Some(net),
+                        Err(e) => {
+                            error!(
+                                "Cell networking unavailable: {e}. Cells with \
+                                 isolate_network=true cannot be allocated."
+                            );
+                            None
+                        }
+                    },
                     Err(e) => {
                         error!(
-                            "Cell networking unavailable: {e}. Cells with \
-                             isolate_network=true cannot be allocated."
+                            "Failed to connect to netlink for cell \
+                             networking: {e}. Cells with \
+                             isolate_network=true cannot start without it."
                         );
                         None
                     }
-                },
-                Err(e) => {
-                    error!(
-                        "Failed to connect to netlink for cell networking: \
-                         {e}. Cells with isolate_network=true cannot start \
-                         without it."
-                    );
-                    None
                 }
             }
-        } else {
-            None
+            // A nested auraed in an isolated cell builds its own `Network`
+            // from the delegated prefix of that cell. It can then host VMs
+            // in the block that the host gave to the cell. Its rtnetlink
+            // handle binds to the netns of the cell, where it already runs.
+            // Without the `--net-*` flags the cell has no isolated network,
+            // the value stays `None`, and the daemon refuses each VM RPC.
+            // `build_nested_network` documents the guard limit for a nested
+            // cell.
+            AuraeContext::Cell => build_nested_network(net_config.as_ref()),
+            _ => None,
         };
 
         let cell_service =
@@ -325,14 +336,12 @@ pub async fn run(
             .set_serving::<RuntimeServiceServer<RuntimeService>>()
             .await;
 
-        // Only the host daemon hosts VMs locally; nested auraeds refuse
-        // local VM RPCs with a clear error (the host still proxies
-        // `cell_name`-scoped requests into them).
-        let vm_service = VmService::new(
-            network,
-            cells_handle,
-            context == AuraeContext::Daemon,
-        );
+        // VMs are hosted by any auraed that has a `Network`: the host
+        // daemon for host VMs, and a nested auraed (seeded above) for VMs
+        // inside its cell. `cell_name`-scoped requests are proxied from the
+        // host into the target cell's nested auraed, which then hosts the VM
+        // locally out of its delegated prefix.
+        let vm_service = VmService::new(network, cells_handle);
         let vm_service_server = VmServiceServer::new(vm_service.clone());
         health_reporter.set_serving::<VmServiceServer<VmService>>().await;
 
@@ -395,11 +404,62 @@ pub async fn run(
 
     let runtime = AURAED_RUNTIME.get_or_init(|| runtime);
 
+    // `init` consumes `net_config` to configure this auraed's own endpoint
+    // (eth0) from inside its netns; clone it so `inner` can also seed a
+    // nested service `Network`/IPAM from the same delegated prefix.
+    let net_config_for_services = net_config.clone();
     let (context, stream) =
         init::init(verbose, nested, socket, net_config).await;
     match stream {
-        SocketStream::Tcp(stream) => inner(runtime, context, stream).await,
-        SocketStream::Unix(stream) => inner(runtime, context, stream).await,
+        SocketStream::Tcp(stream) => {
+            inner(runtime, context, stream, net_config_for_services).await
+        }
+        SocketStream::Unix(stream) => {
+            inner(runtime, context, stream, net_config_for_services).await
+        }
+    }
+}
+
+/// Build the seeded service `Network` for a nested auraed running inside an
+/// isolated cell, so it can host VMs out of the prefix the host delegated.
+/// Returns `None` — VM hosting disabled — when the cell carries no networking
+/// (`net_config` absent), has only a single-address (`/128`) delegation with
+/// no room to sub-delegate, or netlink/forwarding setup fails. The last is
+/// logged so an operator can tell a deliberately unnetworked cell from a
+/// setup failure.
+///
+/// This nested `Network` does not load the cell-net BPF guard (only the host
+/// daemon's [`Network::init_host_network`] does). Cross-tenant isolation is
+/// unaffected: the host guard on this cell's own netkit primary already pins
+/// every packet leaving the cell to the cell's delegated prefix, so neither a
+/// hosted VM nor a nested cell can spoof another *top-level* tenant. The gap
+/// is intra-tenant only — nested cells created inside this cell (which shares
+/// one tenant's delegated block) are not mutually guarded against each other.
+/// Per-cell guarding of nested cells is deferred; hosting VMs (the primary
+/// use) needs no nested guard.
+fn build_nested_network(net_config: Option<&NetworkConfig>) -> Option<Network> {
+    // No `--net-*` flags means a non-isolated cell with no networking — not
+    // an error, so return quietly. A delegated prefix too narrow to
+    // sub-delegate is worth a line, so an operator can tell it apart from a
+    // netlink/forwarding failure (logged below).
+    let net_config = net_config?;
+    let Some(ipam_config) = net_config.nested_ipam_config() else {
+        warn!(
+            "Cell's delegated prefix (/{}) is too narrow to sub-delegate VM \
+             addresses; VMs cannot be hosted in this cell.",
+            net_config.delegated_prefix_len_v6
+        );
+        return None;
+    };
+    match Network::builder().ipam(ipam_config).enable_forwarding().build() {
+        Ok(net) => Some(net),
+        Err(e) => {
+            error!(
+                "Failed to set up nested cell networking: {e}. VMs cannot be \
+                 hosted in this cell."
+            );
+            None
+        }
     }
 }
 

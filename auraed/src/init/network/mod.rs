@@ -53,6 +53,7 @@ mod netlink;
 mod sriov;
 
 use cell::CellInterfaceState;
+use host::enable_forwarding_v6;
 use nat::NatManager;
 use netlink::{
     add_address, add_onlink_default, configure_loopback,
@@ -138,29 +139,71 @@ impl fmt::Debug for Network {
     }
 }
 
-impl Network {
-    /// Connect to netlink and build the network state of the daemon.
-    ///
-    /// `ipam_config` is the only source of the cell pool.
-    /// [`Self::init_host_network`] reads the pool from the shared IPAM when it
-    /// builds the nft rules. Thus the allocator and the ruleset always use
-    /// the same prefix.
-    ///
-    /// A nested auraed configures its own endpoint. It supplies
-    /// [`IpamConfig::default`] and does not use the allocator.
-    pub(crate) fn connect(
-        ipam_config: IpamConfig,
-    ) -> Result<Network, NetworkError> {
+/// Builder for [`Network`]. It holds the configuration that the `Network`
+/// needs before the connection: the IPAM pool, and the request to enable
+/// IPv6 forwarding in the netns. Thus a `Network` starts with the correct
+/// state, and no caller reconfigures a default afterwards. [`Self::build`]
+/// opens the netlink connection and applies the forwarding sysctl in the
+/// netns of the caller. For a nested auraed that netns is the netns of its
+/// cell.
+#[derive(Default)]
+pub(crate) struct NetworkBuilder {
+    ipam: IpamConfig,
+    enable_forwarding: bool,
+}
+
+impl NetworkBuilder {
+    /// Set the pool and the device prefix that the allocator gives out
+    /// from. The host daemon uses the pool of the daemon. A nested auraed
+    /// uses the block that its cell received. Refer to
+    /// [`NetworkConfig::nested_ipam_config`](super::endpoint::NetworkConfig::nested_ipam_config).
+    pub(crate) fn ipam(mut self, config: IpamConfig) -> Self {
+        self.ipam = config;
+        self
+    }
+
+    /// Enable IPv6 forwarding in the netns where [`Self::build`] runs. A
+    /// nested auraed needs it to route between the TAP of each VM and
+    /// `eth0`. The host daemon enables forwarding in
+    /// [`Network::init_host_network`], together with the NAT rules, the
+    /// guard, and the WAN setup.
+    pub(crate) fn enable_forwarding(mut self) -> Self {
+        self.enable_forwarding = true;
+        self
+    }
+
+    /// Open the netlink connection, apply the forwarding sysctl if the
+    /// caller requested it, and build the `Network` with the given IPAM.
+    pub(crate) fn build(self) -> Result<Network, NetworkError> {
         let (connection, handle, _) = rtnetlink::new_connection()?;
         let _ignored = tokio::spawn(connection);
-        Ok(Self {
+        if self.enable_forwarding {
+            enable_forwarding_v6()?;
+        }
+        Ok(Network {
             inner: Arc::new(NetworkInner {
                 handle,
                 nat: NatManager::new(),
                 cell_interfaces: Mutex::new(HashMap::new()),
-                ipam: Ipam::new(ipam_config),
+                ipam: Ipam::new(self.ipam),
             }),
         })
+    }
+}
+
+impl Network {
+    /// Open a netlink connection and build a `Network` with the given IPAM
+    /// and no forwarding. This is the short form of
+    /// `Network::builder().ipam(config).build()`.
+    pub(crate) fn connect(
+        ipam_config: IpamConfig,
+    ) -> Result<Network, NetworkError> {
+        Self::builder().ipam(ipam_config).build()
+    }
+
+    /// Start building a `Network`. See [`NetworkBuilder`].
+    pub(crate) fn builder() -> NetworkBuilder {
+        NetworkBuilder::default()
     }
 
     pub(crate) fn ipam(&self) -> &Ipam {
@@ -262,12 +305,20 @@ impl Network {
 
         set_link_up(&self.inner.handle, link_index, ETH0).await?;
 
-        let addr = Ipv6Net::new(config.guest_v6, config.guest_prefix_len_v6)
-            .map_err(|e| {
-                NetworkError::Other(rtnetlink::Error::NamespaceError(
-                    e.to_string(),
-                ))
-            })?;
+        // Bind only the address of this endpoint at /128, never the full
+        // delegated block. `delegated_prefix_len_v6` is the width of the
+        // block that the host gave to this endpoint. A route realizes that
+        // block: the host routes it to the primary, and a VM-hosting cell
+        // sub-delegates a /128 from it to each TAP with its own dev route.
+        // The block is not on-link on `eth0`. An on-link block would
+        // conflict with those more specific TAP routes, and it would
+        // discard the traffic to an address in the block that no VM uses.
+        // A /128 keeps `eth0` at the one identity address of the endpoint.
+        // The `onlink` default route still reaches the gateway, which is
+        // outside that /128.
+        let addr = Ipv6Net::new(config.guest_v6, 128).map_err(|e| {
+            NetworkError::Other(rtnetlink::Error::NamespaceError(e.to_string()))
+        })?;
         add_address(&self.inner.handle, link_index, ETH0, addr).await?;
 
         add_onlink_default(
@@ -281,10 +332,10 @@ impl Network {
 
         info!(
             "Configured endpoint (source={}→{ETH0}): \
-             guest={}/{}, default via {}",
+             guest={}/128 (delegated /{}), default via {}",
             config.interface_name,
             config.guest_v6,
-            config.guest_prefix_len_v6,
+            config.delegated_prefix_len_v6,
             config.host_v6,
         );
         Ok(())

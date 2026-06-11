@@ -17,7 +17,7 @@ use anyhow::anyhow;
 use net_util::MacAddr;
 use std::{
     fmt::{self, Display},
-    net::{IpAddr, Ipv6Addr, SocketAddr, SocketAddrV6},
+    net::{Ipv6Addr, SocketAddr, SocketAddrV6},
     path::PathBuf,
     sync::{Arc, Mutex},
 };
@@ -145,23 +145,28 @@ pub struct NetSpec {
     pub host_ip_v6: Ipv6Addr,
     /// Guest-side IPv6 address.
     pub guest_ip_v6: Ipv6Addr,
-    /// Delegated IPv6 prefix length (default 128).
+    /// Prefix length of the guest's delegated block. /128 for a VM hosted
+    /// inside a cell (sub-delegated out of the cell's block); /112 for a VM
+    /// the host daemon owns directly (the default device prefix). The guest
+    /// binds `guest_ip_v6` and the host routes the whole block to the TAP.
     pub prefix_len_v6: u8,
 }
 
 impl From<NetSpec> for vmm::vm_config::NetConfig {
     fn from(spec: NetSpec) -> Self {
-        // Advertise the host-side IPv6 with a /128 mask so Cloud Hypervisor
-        // treats the TAP as a single-address point-to-link instead of a
-        // wider subnet that would conflict with the per-VM dev routes.
-        let host_v6_mask = Ipv6Addr::new(
-            0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff,
-        );
+        // `ip`/`mask` stay `None` so Cloud Hypervisor leaves TAP addressing
+        // alone (`open_tap` only calls `set_ip_addr` when an ip is given).
+        // auraed owns the TAP's host address: it must be added with
+        // IFA_F_NODAD, because an address CH adds undergoes DAD, sits
+        // *tentative* on the carrier-up TAP, and a tentative address is
+        // rejected as the dev route's preferred source with EINVAL. The
+        // guest learns its own addressing from the `aurae.*` kernel args,
+        // not from this field.
         vmm::vm_config::NetConfig {
             pci_common: PciDeviceCommonConfig::default(),
             tap: spec.tap,
-            ip: Some(IpAddr::V6(spec.host_ip_v6)),
-            mask: Some(IpAddr::V6(host_v6_mask)),
+            ip: None,
+            mask: None,
             mac: spec.mac,
             host_mac: spec.host_mac,
             mtu: None,
@@ -328,7 +333,7 @@ impl VirtualMachine {
 
 #[cfg(test)]
 mod tests {
-    use std::net::{IpAddr, Ipv6Addr};
+    use std::net::Ipv6Addr;
     use std::path::PathBuf;
 
     use net_util::MacAddr;
@@ -411,22 +416,18 @@ mod tests {
         }
     }
 
-    /// `NetSpec` → `vmm::vm_config::NetConfig` advertises the host-side
-    /// IPv6 + a /128 mask to Cloud Hypervisor. The /128 mask is what
-    /// makes CH treat the TAP as a single-address point-to-link instead
-    /// of advertising a wider subnet that would conflict with the
-    /// per-VM dev routes.
+    /// `NetSpec` → `vmm::vm_config::NetConfig` must NOT hand the host-side
+    /// IP to Cloud Hypervisor: CH would configure it on the TAP itself,
+    /// without IFA_F_NODAD, and the resulting *tentative* address makes the
+    /// kernel reject auraed's dev route (tentative preferred source →
+    /// EINVAL). TAP addressing belongs to auraed alone.
     #[test]
-    fn net_spec_to_net_config_uses_v6_host_ip_and_128_mask() {
+    fn net_spec_to_net_config_leaves_tap_addressing_to_auraed() {
         let spec = sample_net_spec();
-        let host_v6 = spec.host_ip_v6;
         let cfg: vmm::vm_config::NetConfig = spec.into();
 
-        assert_eq!(cfg.ip, Some(IpAddr::V6(host_v6)));
-        let all_ones = Ipv6Addr::new(
-            0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff,
-        );
-        assert_eq!(cfg.mask, Some(IpAddr::V6(all_ones)));
+        assert_eq!(cfg.ip, None);
+        assert_eq!(cfg.mask, None);
         assert_eq!(cfg.tap.as_deref(), Some("vm-7"));
     }
 

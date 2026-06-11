@@ -48,13 +48,6 @@ pub struct VmService {
     /// Shared with `CellService` so `cell_name`-scoped requests can be
     /// proxied into a nested auraed.
     cells: Arc<Mutex<Cells>>,
-    /// True only when this auraed is the host daemon, which is the only
-    /// context that can host VMs locally. A nested auraed (cell/pid1)
-    /// sets this `false` and refuses local VM lifecycle RPCs with
-    /// [`VmServiceError::VmInCellUnsupported`] — the host still proxies
-    /// `cell_name`-scoped requests here, but a nested auraed can't yet
-    /// allocate VMs of its own.
-    is_host_daemon: bool,
     // TODO: ObserveService
 }
 
@@ -69,21 +62,11 @@ impl VmService {
     /// `cells` is shared with [`crate::cells::CellService`] so that
     /// `cell_name`-scoped VM RPCs can look up the target cell's client
     /// socket and proxy the request.
-    ///
-    /// `is_host_daemon` must be `true` only for the host daemon. Nested
-    /// auraeds pass `false` so local VM lifecycle RPCs are refused with a
-    /// clear "not supported inside a cell" error instead of a misleading
-    /// host-networking failure.
-    pub fn new(
-        network: Option<Network>,
-        cells: Arc<Mutex<Cells>>,
-        is_host_daemon: bool,
-    ) -> Self {
+    pub fn new(network: Option<Network>, cells: Arc<Mutex<Cells>>) -> Self {
         Self {
             vms: Arc::new(Mutex::new(VirtualMachines::new(network.clone()))),
             network,
             cells,
-            is_host_daemon,
         }
     }
 
@@ -108,13 +91,11 @@ impl VmService {
             .await;
         }
 
-        // A nested auraed can't host VMs of its own yet — refuse with a
-        // clear error rather than the host-networking failure below.
-        if !self.is_host_daemon {
-            return Err(VmServiceError::VmInCellUnsupported);
-        }
-
-        // Refuse early if the daemon couldn't initialize VM networking.
+        // Refuse early if this auraed has no Network (a non-daemon context,
+        // a cell without `isolate_network`, or a host where netlink/
+        // forwarding setup failed). A nested auraed inside an isolated cell
+        // *does* have one — seeded from the cell's delegated prefix — so it
+        // hosts the proxied VM locally from here.
         if self.network.is_none() {
             return Err(VmServiceError::NetworkingUnavailable);
         }
@@ -204,10 +185,6 @@ impl VmService {
                 },
             )
             .await;
-        }
-
-        if !self.is_host_daemon {
-            return Err(VmServiceError::VmInCellUnsupported);
         }
 
         let id = VmID::new(request.vm_id);

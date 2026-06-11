@@ -38,8 +38,12 @@ use validation::ValidationError;
 /// The default ULA pool fd00:ae::/64. The digits "ae" are for aurae.
 pub const DEFAULT_POOL_V6: &str = "fd00:ae::/64";
 
-/// The default device prefix /128 gives one address to each device.
-pub const DEFAULT_DEVICE_PREFIX_V6: u8 = 128;
+/// The default device prefix /112 gives a 16-bit block to each endpoint. A
+/// process cell uses only the base address of its block, which it binds on
+/// `eth0`. A VM-hosting cell sub-delegates a /128 from the block to each VM
+/// that it runs, and its nested auraed seeds its own IPAM from the block.
+/// The /64 ULA pool holds 2^48 such blocks, thus the extra width is free.
+pub const DEFAULT_DEVICE_PREFIX_V6: u8 = 112;
 
 /// The IPAM key of a VM allocation. Cells and VMs use the same pool. The
 /// prefix `cell:` or `vm:` keeps the two key spaces separate. A cell uses
@@ -297,17 +301,19 @@ mod tests {
         let ipam = Ipam::default();
         let alloc = ipam.allocate("a1").unwrap();
 
-        // The first guest is fd00:ae::2. The host gateway fd00:ae::1 is
-        // the same on each endpoint.
+        // With the default /112 device prefix the first guest block is
+        // block 1, which is fd00:ae::1:0/112. Its base address
+        // fd00:ae::1:0 is the endpoint address of the cell. The host
+        // gateway fd00:ae::1 is the same on each endpoint.
         assert_eq!(
             alloc.guest_ip,
-            Ipv6Addr::new(0xfd00, 0x00ae, 0, 0, 0, 0, 0, 2)
+            Ipv6Addr::new(0xfd00, 0x00ae, 0, 0, 0, 0, 1, 0)
         );
         assert_eq!(
             alloc.host_ip,
             Ipv6Addr::new(0xfd00, 0x00ae, 0, 0, 0, 0, 0, 1)
         );
-        assert_eq!(alloc.delegated.prefix_len(), 128);
+        assert_eq!(alloc.delegated.prefix_len(), 112);
     }
 
     #[test]
@@ -316,9 +322,14 @@ mod tests {
         let alloc1 = ipam.allocate("a1").unwrap();
         let alloc2 = ipam.allocate("a2").unwrap();
 
+        // Block 1 then block 2 under the default /112 prefix.
+        assert_eq!(
+            alloc1.guest_ip,
+            Ipv6Addr::new(0xfd00, 0x00ae, 0, 0, 0, 0, 1, 0)
+        );
         assert_eq!(
             alloc2.guest_ip,
-            Ipv6Addr::new(0xfd00, 0x00ae, 0, 0, 0, 0, 0, 3)
+            Ipv6Addr::new(0xfd00, 0x00ae, 0, 0, 0, 0, 2, 0)
         );
         assert_eq!(alloc1.host_ip, alloc2.host_ip);
     }
@@ -418,11 +429,11 @@ mod tests {
         assert_eq!(reused.guest_ip, alloc1.guest_ip);
 
         // The reuse stack is now empty. a4 comes from `next_block`.
-        // That index is 4, because a1 took 2 and a2 took 3.
+        // That index is 3, because a1 took block 1 and a2 took block 2.
         let fresh = ipam.allocate("a4").unwrap();
         assert_eq!(
             fresh.guest_ip,
-            Ipv6Addr::new(0xfd00, 0x00ae, 0, 0, 0, 0, 0, 4)
+            Ipv6Addr::new(0xfd00, 0x00ae, 0, 0, 0, 0, 3, 0)
         );
     }
 
@@ -472,5 +483,37 @@ mod tests {
         let ipam = Ipam::default();
         let alloc = ipam.allocate("a1").unwrap();
         assert!(alloc.delegated.contains(&alloc.guest_ip));
+    }
+
+    #[test]
+    fn nested_ipam_sub_delegates_within_a_cell_block() {
+        // A nested auraed seeds its IPAM with the cell's delegated /112 block
+        // and a /128 device prefix. The recursion mirrors the host: the block
+        // base (fd00:ae::1:0) is the cell's own eth0 address and stays
+        // reserved; the nested gateway is base+1 (fd00:ae::1:1); the first VM
+        // lands at base+2 (fd00:ae::1:2) — no collision with either.
+        let host = Ipam::default();
+        let cell = host.allocate("cell:vmhost").unwrap();
+        assert_eq!(
+            cell.guest_ip,
+            Ipv6Addr::new(0xfd00, 0x00ae, 0, 0, 0, 0, 1, 0)
+        );
+
+        // The nested auraed builds a fresh allocator over its delegated block
+        // (this is what `Network::builder().ipam(..)` does at construction).
+        let nested = Ipam::new(IpamConfig::new(cell.delegated, 128).unwrap());
+
+        let vm = nested.allocate("vm:one").unwrap();
+        assert_eq!(
+            vm.host_ip,
+            Ipv6Addr::new(0xfd00, 0x00ae, 0, 0, 0, 0, 1, 1),
+            "nested gateway is the cell block's base+1"
+        );
+        assert_eq!(
+            vm.guest_ip,
+            Ipv6Addr::new(0xfd00, 0x00ae, 0, 0, 0, 0, 1, 2),
+            "first VM is the cell block's base+2"
+        );
+        assert_eq!(vm.delegated.prefix_len(), 128);
     }
 }

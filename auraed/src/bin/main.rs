@@ -45,7 +45,7 @@ use std::process::ExitCode;
 use tracing::{error, info};
 
 const DEFAULT_INTERFACE_NAME: &str = "eth0";
-const DEFAULT_GUEST_PREFIX_V6: u8 = 128;
+const DEFAULT_DELEGATED_PREFIX_V6: u8 = 128;
 
 /// Command line options for auraed.
 ///
@@ -113,11 +113,14 @@ struct AuraedOptions {
     /// necessary if another `--net-*` flag is set.
     #[clap(long, value_parser)]
     net_guest_ip_v6: Option<Ipv6Addr>,
-    /// The prefix length of `--net-guest-ip-v6`. The default is 128 and
-    /// gives one address. Use a shorter prefix, for example 80, to give a
-    /// delegated prefix to a nested auraed or to a VM.
+    /// The width of the block that this endpoint receives. `eth0` always
+    /// binds `--net-guest-ip-v6` at /128. This prefix is the block that the
+    /// endpoint can sub-delegate, and the host routes that block to the
+    /// endpoint. A VM-hosting cell takes the /128 of each VM from it. The
+    /// default is /128, thus the endpoint has one address and can
+    /// sub-delegate nothing.
     #[clap(long, value_parser)]
-    net_guest_prefix_v6: Option<u8>,
+    net_delegated_prefix_v6: Option<u8>,
     /// The interface name that the daemon waits for at its start. The
     /// daemon then renames the interface to `eth0`. The parent gives a
     /// cell a unique peer name, for example `nk-a1b2c3d4-p`. A VM usually
@@ -176,7 +179,7 @@ async fn handle_default(
         nested,
         net_host_ip_v6,
         net_guest_ip_v6,
-        net_guest_prefix_v6,
+        net_delegated_prefix_v6,
         net_interface_name,
         subcmd: _,
     } = options;
@@ -189,8 +192,8 @@ async fn handle_default(
         (Some(host_v6), Some(guest_v6)) => Some(NetworkConfig {
             host_v6,
             guest_v6,
-            guest_prefix_len_v6: net_guest_prefix_v6
-                .unwrap_or(DEFAULT_GUEST_PREFIX_V6),
+            delegated_prefix_len_v6: net_delegated_prefix_v6
+                .unwrap_or(DEFAULT_DELEGATED_PREFIX_V6),
             interface_name: net_interface_name
                 .unwrap_or_else(|| DEFAULT_INTERFACE_NAME.to_string()),
         }),

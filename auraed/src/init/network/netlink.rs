@@ -22,6 +22,7 @@
 use super::NetworkError;
 use futures::stream::TryStreamExt;
 use ipnet::Ipv6Net;
+use netlink_packet_route::address::AddressHeaderFlags;
 use netlink_packet_route::link::{LinkAttribute, LinkFlags};
 use nix::libc;
 use rtnetlink::{Handle, LinkUnspec, RouteMessageBuilder};
@@ -108,10 +109,22 @@ pub(super) async fn add_address(
     iface: &str,
     ip: Ipv6Net,
 ) -> Result<(), NetworkError> {
-    handle
-        .address()
-        .add(link_index, IpAddr::V6(ip.addr()), ip.prefix_len())
-        .execute()
+    let mut req = handle.address().add(
+        link_index,
+        IpAddr::V6(ip.addr()),
+        ip.prefix_len(),
+    );
+    // Set IFA_F_NODAD. A TAP is an L2 device, thus the kernel runs DAD on a
+    // new address. The address stays tentative while DAD runs, and it stays
+    // tentative permanently on a TAP with no carrier. The kernel refuses a
+    // tentative address as the preferred source of a route (RTA_PREFSRC) and
+    // returns EINVAL, which stops the route setup of a TAP and of a guest.
+    // The flag on the netlink request applies in the netns of the handle. An
+    // `accept_dad` sysctl from a nested auraed would not reach the netns of
+    // the cell. A netkit pair in L3 mode has IFF_NOARP and runs no DAD, thus
+    // the flag changes nothing there.
+    req.message_mut().header.flags |= AddressHeaderFlags::Nodad;
+    req.execute()
         .await
         .map(|_| trace!("Added address to link {iface}"))
         .or_else(|e| {

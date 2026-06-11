@@ -87,7 +87,7 @@ fn build_network_config(
         return Ok(NetworkConfig {
             host_v6: DEFAULT_GATEWAY_V6,
             guest_v6: DEFAULT_GUEST_V6,
-            guest_prefix_len_v6: DEFAULT_GUEST_PREFIX_LEN_V6,
+            delegated_prefix_len_v6: DEFAULT_GUEST_PREFIX_LEN_V6,
             interface_name: DEFAULT_NET_DEV.to_owned(),
         });
     }
@@ -109,7 +109,7 @@ fn build_network_config(
         // address of the guest. With a /128 prefix the network address is
         // that address.
         guest_v6: prefix_v6.addr(),
-        guest_prefix_len_v6: prefix_v6.prefix_len(),
+        delegated_prefix_len_v6: prefix_v6.prefix_len(),
         interface_name: DEFAULT_NET_DEV.to_owned(),
     })
 }
@@ -261,7 +261,7 @@ impl SystemRuntime for Pid1SystemRuntime {
         info!(
             "IPv6 guest config: v6={}/{} gw={} iface={}",
             net_config.guest_v6,
-            net_config.guest_prefix_len_v6,
+            net_config.delegated_prefix_len_v6,
             net_config.host_v6,
             net_config.interface_name,
         );

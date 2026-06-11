@@ -178,7 +178,7 @@ pub(super) fn is_cell_primary_name(name: &str) -> bool {
         && bytes[3..].iter().all(|b| b.is_ascii_hexdigit())
 }
 
-fn enable_forwarding_v6() -> Result<(), NetworkError> {
+pub(super) fn enable_forwarding_v6() -> Result<(), NetworkError> {
     std::fs::write("/proc/sys/net/ipv6/conf/all/forwarding", "1").map_err(
         |e| NetworkError::ErrorEnablingIpForwarding {
             family: "ipv6",
