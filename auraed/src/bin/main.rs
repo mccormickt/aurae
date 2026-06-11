@@ -128,8 +128,12 @@ struct AuraedOptions {
     /// necessary if another `--net-*` flag is set.
     #[clap(long, value_parser)]
     net_guest_ip_v6: Option<Ipv6Addr>,
-    /// The prefix length of the block delegated to this endpoint. The
-    /// endpoint itself always binds `--net-guest-ip-v6` at /128.
+    /// The width of the block that this endpoint receives. `eth0` always
+    /// binds `--net-guest-ip-v6` at /128. This prefix is the block that the
+    /// endpoint can sub-delegate, and the host routes that block to the
+    /// endpoint. A VM-hosting cell takes the /128 of each VM from it. The
+    /// default is /128, thus the endpoint has one address and can
+    /// sub-delegate nothing.
     #[clap(long, value_parser, alias = "net-guest-prefix-v6")]
     net_delegated_prefix_v6: Option<u8>,
     /// The interface name that the daemon waits for at its start. The

@@ -296,6 +296,17 @@ pub(super) fn is_cell_primary_name(name: &str) -> bool {
         && bytes[3..].iter().all(|b| b.is_ascii_hexdigit())
 }
 
+pub(super) fn enable_forwarding_v6() -> Result<(), NetworkError> {
+    std::fs::write("/proc/sys/net/ipv6/conf/all/forwarding", "1").map_err(
+        |e| NetworkError::ErrorEnablingIpForwarding {
+            family: "ipv6",
+            msg: e.to_string(),
+        },
+    )?;
+    trace!("Enabled IPv6 forwarding");
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::netlink::get_link_index;
