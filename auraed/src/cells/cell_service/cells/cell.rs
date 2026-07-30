@@ -19,6 +19,7 @@ use super::{
 };
 use client::AuraeSocket;
 use std::io;
+use std::time::Instant;
 use tracing::info;
 
 // TODO https://github.com/aurae-runtime/aurae/issues/199 &&
@@ -49,18 +50,18 @@ impl Cell {
         Self { cell_name, spec: cell_spec, state: CellState::Unallocated }
     }
 
-    /// Signal the nested auraed and delete the cgroup. Shared by
-    /// `free` (graceful `shutdown`) and `kill` (forceful `kill`).
+    /// Deletes the cgroup after successful process teardown.
     fn teardown_process_and_cgroup(
         cell_name: &CellName,
         cgroup: &Cgroup,
-        signal: impl FnOnce() -> io::Result<std::process::ExitStatus>,
+        signal_result: io::Result<std::process::ExitStatus>,
     ) -> Result<()> {
-        let _exit_status =
-            signal().map_err(|e| CellsError::FailedToKillCellChildren {
+        let _exit_status = signal_result.map_err(|e| {
+            CellsError::FailedToKillCellChildren {
                 cell_name: cell_name.clone(),
                 source: e,
-            })?;
+            }
+        })?;
 
         cgroup.delete().map_err(|e| CellsError::FailedToFreeCell {
             cell_name: cell_name.clone(),
@@ -94,7 +95,7 @@ impl Cell {
         ) {
             Ok(cgroup) => cgroup,
             Err(e) => {
-                let _best_effort = auraed.kill();
+                let _best_effort = auraed.kill().await;
                 return Err(CellsError::AbortedAllocateCell {
                     cell_name: self.cell_name.clone(),
                     source: e,
@@ -103,7 +104,7 @@ impl Cell {
         };
 
         if let Err(e) = cgroup.add_task(pid) {
-            let _best_effort = auraed.kill();
+            let _best_effort = auraed.kill().await;
             let _best_effort = cgroup.delete();
 
             return Err(CellsError::AbortedAllocateCell {
@@ -134,9 +135,12 @@ impl Cell {
             &mut self.state
         {
             children.broadcast_free().await;
-            Self::teardown_process_and_cgroup(&self.cell_name, cgroup, || {
-                nested_auraed.shutdown()
-            })?;
+            let signal_result = nested_auraed.shutdown().await;
+            Self::teardown_process_and_cgroup(
+                &self.cell_name,
+                cgroup,
+                signal_result,
+            )?;
         }
 
         // set cell state to freed, independent of the current state
@@ -147,21 +151,55 @@ impl Cell {
     /// Sends a [SIGKILL] to the [NestedAuraed], and deletes the underlying cgroup.
     /// The [Cell::state] will be set to [CellState::Freed] regardless of it's state prior to this call.
     /// A [Cell] should never be reused once in the [CellState::Freed] state.
-    ///
-    /// Stays synchronous so [`Drop`] can call it.
-    pub fn kill(&mut self) -> Result<()> {
+    pub(crate) async fn kill(&mut self) -> Result<()> {
         if let CellState::Allocated { cgroup, nested_auraed, children } =
             &mut self.state
         {
-            children.broadcast_kill();
-            Self::teardown_process_and_cgroup(&self.cell_name, cgroup, || {
-                nested_auraed.kill()
-            })?;
+            children.broadcast_kill().await;
+            let signal_result = nested_auraed.kill().await;
+            Self::teardown_process_and_cgroup(
+                &self.cell_name,
+                cgroup,
+                signal_result,
+            )?;
         }
 
         // set cell state to freed, independent of the current state
         self.state = CellState::Freed;
         Ok(())
+    }
+
+    /// Performs bounded synchronous cleanup for Drop and ignores errors.
+    pub(super) fn kill_for_drop(&mut self) {
+        let deadline = Instant::now() + super::nested_auraed::REAP_TIMEOUT;
+        self.signal_kill_for_drop();
+        self.reap_kill_for_drop(deadline);
+    }
+
+    pub(super) fn signal_kill_for_drop(&mut self) {
+        if let CellState::Allocated { nested_auraed, children, .. } =
+            &mut self.state
+        {
+            children.signal_kill_for_drop();
+            let _best_effort = nested_auraed.signal_kill_for_drop();
+        }
+    }
+
+    pub(super) fn reap_kill_for_drop(&mut self, deadline: Instant) {
+        if let CellState::Allocated { cgroup, nested_auraed, children } =
+            &mut self.state
+        {
+            children.reap_kill_for_drop(deadline);
+            let signal_result = nested_auraed.reap_for_drop(deadline);
+            let _best_effort = Self::teardown_process_and_cgroup(
+                &self.cell_name,
+                cgroup,
+                signal_result,
+            );
+        }
+
+        // set cell state to freed, independent of the current state
+        self.state = CellState::Freed;
     }
 
     pub fn client_socket(&self) -> Result<AuraeSocket> {
@@ -250,8 +288,7 @@ impl Drop for Cell {
     /// but cache reconciliation may result in a drop in other circumstances.
     /// Here we have a chance to clean up, no matter the circumstance.
     fn drop(&mut self) {
-        // We use kill here to be aggressive in cleaning up if anything has been left behind.
-        let _best_effort = self.kill();
+        self.kill_for_drop();
     }
 }
 
