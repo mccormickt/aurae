@@ -36,7 +36,7 @@ use rtnetlink::Handle;
 use std::collections::HashMap;
 use std::fmt;
 use std::net::Ipv6Addr;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 use tracing::{info, warn};
 
@@ -44,6 +44,7 @@ use crate::cells::cell_service::cells::CellName;
 use crate::init::network::endpoint::NetworkConfig;
 use crate::init::network::ipam::{Ipam, IpamConfig};
 
+pub(crate) mod bpf;
 mod cell;
 pub(crate) mod endpoint;
 mod host;
@@ -52,6 +53,7 @@ pub(crate) mod nat;
 mod netlink;
 mod sriov;
 
+use bpf::CellNetGuard;
 use cell::CellInterfaceState;
 use host::enable_forwarding_v6;
 use nat::NatManager;
@@ -104,6 +106,13 @@ pub enum NetworkError {
     CellInterfacesPoisoned,
     #[error("Failed to rename link `{old}` to `{new}`: {source}")]
     ErrorRenamingLink { old: String, new: String, source: rtnetlink::Error },
+    #[error("Failed to enable cell-net BPF guard for `{iface}`: {source}")]
+    BpfGuardFailed { iface: String, source: Box<bpf::CellGuardError> },
+    #[error(
+        "cell-net BPF guard is not loaded; refusing to create an unguarded \
+         cell interface for `{iface}`"
+    )]
+    GuardNotLoaded { iface: String },
     #[error(transparent)]
     Other(#[from] rtnetlink::Error),
 }
@@ -123,6 +132,8 @@ struct NetworkInner {
     nat: NatManager,
     /// The host interface state for each cell.
     cell_interfaces: Mutex<HashMap<CellName, CellInterfaceState>>,
+    /// The eBPF guard that enforces cell source addresses.
+    cell_guard: OnceLock<CellNetGuard>,
     /// The IPAM allocator.
     ipam: Ipam,
 }
@@ -185,6 +196,7 @@ impl NetworkBuilder {
                 handle,
                 nat: NatManager::new(),
                 cell_interfaces: Mutex::new(HashMap::new()),
+                cell_guard: OnceLock::new(),
                 ipam: Ipam::new(self.ipam),
             }),
         })
