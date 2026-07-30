@@ -26,6 +26,8 @@ path = "src/bin/main.rs"
 
 [dependencies]
 anyhow = { workspace = true }
+async-recursion = "1.1.1"
+async-trait = "0.1.83"
 client = { workspace = true }
 aurae-ebpf-shared = { path = "../ebpf-shared" }
 aya = { version = "0.13.1" }
