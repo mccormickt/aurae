@@ -29,11 +29,12 @@ fn generate_cell_name(parent_name: Option<&str>) -> String {
 struct CellBuilder {
     parent: Option<String>,
     isolate_process: bool,
+    isolate_network: bool,
 }
 
 impl CellBuilder {
     pub fn new() -> Self {
-        Self { parent: None, isolate_process: false }
+        Self { parent: None, isolate_process: false, isolate_network: false }
     }
 
     pub fn parent_cell_name(&mut self, parent_cell_name: String) -> &mut Self {
@@ -46,6 +47,11 @@ impl CellBuilder {
         self
     }
 
+    pub fn isolate_network(&mut self) -> &mut Self {
+        self.isolate_network = true;
+        self
+    }
+
     pub fn build(&self) -> Cell {
         let cell_name = generate_cell_name(self.parent.as_deref());
         Cell {
@@ -53,7 +59,7 @@ impl CellBuilder {
             cpu: None,
             cpuset: None,
             memory: None,
-            isolate_network: false,
+            isolate_network: self.isolate_network,
             isolate_process: self.isolate_process,
         }
     }
@@ -75,6 +81,11 @@ impl CellServiceAllocateRequestBuilder {
 
     pub fn isolate_process(&mut self) -> &mut Self {
         let _ = self.cell_builder.isolate_process();
+        self
+    }
+
+    pub fn isolate_network(&mut self) -> &mut Self {
+        let _ = self.cell_builder.isolate_network();
         self
     }
 

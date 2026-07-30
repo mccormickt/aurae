@@ -17,10 +17,21 @@ use super::{
     CellName, CellSpec, Cells, CellsCache, CellsError, Result, cgroups::Cgroup,
     nested_auraed::NestedAuraed,
 };
+use crate::init::network::Network;
+use crate::init::network::endpoint::NetworkConfig;
+use crate::init::network::ipam::Allocation;
 use client::AuraeSocket;
+use std::fs::File;
 use std::io;
-use std::time::Instant;
-use tracing::info;
+use std::os::fd::AsFd;
+use std::time::{Duration, Instant};
+use tracing::{info, warn};
+
+/// The maximum time that `Cell::allocate` waits for the Unix socket of
+/// the nested auraed. The child first runs `init_endpoint`, which has its
+/// own poll timeout of 5 s, and then creates the socket. A limit of 10 s
+/// gives a sufficient margin and does not block the caller.
+const CHILD_READY_TIMEOUT: Duration = Duration::from_secs(10);
 
 // TODO https://github.com/aurae-runtime/aurae/issues/199 &&
 //      aurae.io/signals, which is more accurate
@@ -41,7 +52,24 @@ pub struct Cell {
 #[derive(Debug)]
 enum CellState {
     Unallocated,
-    Allocated { cgroup: Cgroup, nested_auraed: NestedAuraed, children: Cells },
+    CleanupPending {
+        nested_auraed: Option<NestedAuraed>,
+        cgroup: Option<Cgroup>,
+        ipam_allocation: Option<Allocation>,
+        network: Option<Network>,
+    },
+    Allocated {
+        cgroup: Cgroup,
+        nested_auraed: NestedAuraed,
+        children: Cells,
+        /// `Some` only if `iso_ctl.isolate_network` is set on this cell.
+        /// `free()` then releases the IPAM slot and deletes the host-side
+        /// primary.
+        ipam_allocation: Option<Allocation>,
+        /// The cell keeps this handle. `free()` can use the
+        /// `Network` of the host without a parameter from the caller.
+        network: Option<Network>,
+    },
     Freed,
 }
 
@@ -50,7 +78,23 @@ impl Cell {
         Self { cell_name, spec: cell_spec, state: CellState::Unallocated }
     }
 
-    /// Deletes the cgroup after successful process teardown.
+    pub(super) fn can_allocate(&self) -> bool {
+        matches!(self.state, CellState::Unallocated | CellState::Freed)
+    }
+
+    /// The key of the IPAM slot of a cell. The allocate, free, and kill
+    /// paths must calculate the same key, so that each path uses the key of
+    /// the reservation. The function is an associated function and not a
+    /// method. A teardown path can call it while it holds a mutable
+    /// borrow of `self.state`.
+    fn ipam_key(cell_name: &CellName) -> String {
+        format!("cell:{cell_name}")
+    }
+
+    /// Signal the nested auraed and delete the cgroup. Shared by
+    /// `free` (graceful `shutdown`) and `kill` (forceful `kill`).
+    /// Callers should reclaim the network and IPAM state before
+    /// propagating errors.
     fn teardown_process_and_cgroup(
         cell_name: &CellName,
         cgroup: &Cgroup,
@@ -70,24 +114,184 @@ impl Cell {
         Ok(())
     }
 
-    /// Creates the underlying cgroup.
-    /// Does nothing if [Cell] has been previously allocated.
+    /// Remove the cell network and release its address.
+    ///
+    /// The allocation stays in the state until both operations succeed.
+    async fn release_network(
+        cell_name: &CellName,
+        allocation: &mut Option<Allocation>,
+        network: &Option<Network>,
+    ) -> Result<()> {
+        if allocation.is_none() {
+            return Ok(());
+        }
+        let Some(net) = network.as_ref() else {
+            return Err(CellsError::NetworkUnavailable {
+                cell_name: cell_name.clone(),
+            });
+        };
+
+        net.destroy_cell_interface(cell_name).await.map_err(|source| {
+            CellsError::NetworkSetupFailed {
+                cell_name: cell_name.clone(),
+                source: Box::new(source),
+            }
+        })?;
+
+        let key = Self::ipam_key(cell_name);
+        let _released = net.ipam().release(&key).map_err(|source| {
+            CellsError::IpamFailed { cell_name: cell_name.clone(), source }
+        })?;
+        *allocation = None;
+        Ok(())
+    }
+
+    async fn retry_pending_cleanup(&mut self) -> Result<()> {
+        let CellState::CleanupPending {
+            nested_auraed,
+            cgroup,
+            ipam_allocation,
+            network,
+        } = &mut self.state
+        else {
+            return Ok(());
+        };
+
+        let process_result = if let Some(auraed) = nested_auraed.as_mut() {
+            auraed.kill().await.map(|_status| ()).map_err(|source| {
+                CellsError::FailedToKillCellChildren {
+                    cell_name: self.cell_name.clone(),
+                    source,
+                }
+            })
+        } else {
+            Ok(())
+        };
+        if process_result.is_ok() {
+            *nested_auraed = None;
+        }
+
+        let cgroup_result = if let Some(cell_cgroup) = cgroup.as_ref() {
+            cell_cgroup.delete().map_err(|source| {
+                CellsError::FailedToFreeCell {
+                    cell_name: self.cell_name.clone(),
+                    source,
+                }
+            })
+        } else {
+            Ok(())
+        };
+        if cgroup_result.is_ok() {
+            *cgroup = None;
+        }
+
+        let network_result =
+            Self::release_network(&self.cell_name, ipam_allocation, network)
+                .await;
+
+        process_result?;
+        cgroup_result?;
+        network_result?;
+        self.state = CellState::Freed;
+        Ok(())
+    }
+
+    async fn rollback_allocation(
+        &mut self,
+        nested_auraed: Option<NestedAuraed>,
+        cgroup: Option<Cgroup>,
+        ipam_allocation: Option<Allocation>,
+        network: Option<Network>,
+    ) {
+        self.state = CellState::CleanupPending {
+            nested_auraed,
+            cgroup,
+            ipam_allocation,
+            network,
+        };
+        if let Err(error) = self.retry_pending_cleanup().await {
+            warn!("Cell {}: rollback failed: {error}", self.cell_name);
+        }
+    }
+
+    /// Allocate the cell. The function reserves an IPAM slot if
+    /// `isolate_network` is true. It starts the nested auraed, which owns
+    /// the network namespace of the cell. It creates the cgroup and puts the nested
+    /// auraed into it. Then it creates the host-side primary and moves the
+    /// peer into the network namespace.
+    ///
+    /// On an error the function releases the resources again. It stops the
+    /// nested auraed, deletes the cgroup, and releases the IPAM slot.
     // Here is where we define the "default" cgroup parameters for Aurae cells
-    pub(crate) async fn allocate(&mut self) -> Result<()> {
+    pub(crate) async fn allocate(
+        &mut self,
+        network: Option<Network>,
+    ) -> Result<()> {
         let CellState::Unallocated = &self.state else {
             return Ok(());
         };
 
-        let name = self.cell_name.leaf().to_string();
+        let key = Self::ipam_key(&self.cell_name);
 
-        let mut auraed = NestedAuraed::new(name, self.spec.iso_ctl.clone())
-            .map_err(|e| CellsError::FailedToAllocateCell {
-                cell_name: self.cell_name.clone(),
-                source: e,
+        // Step 1: reserve an IPAM slot if the cell needs an isolated
+        // network. The allocator is part of `Network`. A `Network`
+        // handle gives an allocator.
+        let allocation = if self.spec.iso_ctl.isolate_network {
+            let Some(net) = network.as_ref() else {
+                return Err(CellsError::NetworkUnavailable {
+                    cell_name: self.cell_name.clone(),
+                });
+            };
+            let allocation = net.ipam().allocate(&key).map_err(|e| {
+                CellsError::IpamFailed {
+                    cell_name: self.cell_name.clone(),
+                    source: e,
+                }
             })?;
+            Some(allocation)
+        } else {
+            None
+        };
+
+        // Step 2: reserve the unique primary and peer names before the
+        // start of the child. The peer name must be in the environment of
+        // the child, and the environment is fixed at the exec. Step 5
+        // creates the links.
+        let interface_names = match (&allocation, &network) {
+            (Some(_), Some(net)) => Some(net.reserve_interface_names()),
+            _ => None,
+        };
+
+        // Step 3: build the CLI arguments. The child auraed parses them at
+        // its start and configures its endpoint. It renames the peer to
+        // `eth0` and adds the addresses and routes.
+        let net_config = match (allocation.as_ref(), interface_names.as_ref()) {
+            (Some(alloc), Some((_, peer))) => {
+                Some(NetworkConfig::from_allocation(alloc, peer.clone()))
+            }
+            _ => None,
+        };
+
+        // Step 4: spawn the nested auraed.
+        let name = self.cell_name.leaf().to_string();
+        let auraed = match NestedAuraed::new(
+            name,
+            self.spec.iso_ctl.clone(),
+            net_config,
+        ) {
+            Ok(a) => a,
+            Err(e) => {
+                self.rollback_allocation(None, None, allocation, network).await;
+                return Err(CellsError::FailedToAllocateCell {
+                    cell_name: self.cell_name.clone(),
+                    source: e,
+                });
+            }
+        };
 
         let pid = auraed.pid();
 
+        // Step 5: cgroup setup.
         let cgroup = match Cgroup::new(
             self.cell_name.clone(),
             self.spec.cgroup_spec.clone(),
@@ -95,7 +299,13 @@ impl Cell {
         ) {
             Ok(cgroup) => cgroup,
             Err(e) => {
-                let _best_effort = auraed.kill().await;
+                self.rollback_allocation(
+                    Some(auraed),
+                    None,
+                    allocation,
+                    network,
+                )
+                .await;
                 return Err(CellsError::AbortedAllocateCell {
                     cell_name: self.cell_name.clone(),
                     source: e,
@@ -104,9 +314,13 @@ impl Cell {
         };
 
         if let Err(e) = cgroup.add_task(pid) {
-            let _best_effort = auraed.kill().await;
-            let _best_effort = cgroup.delete();
-
+            self.rollback_allocation(
+                Some(auraed),
+                Some(cgroup),
+                allocation,
+                network,
+            )
+            .await;
             return Err(CellsError::AbortedAllocateCell {
                 cell_name: self.cell_name.clone(),
                 source: e,
@@ -115,61 +329,168 @@ impl Cell {
 
         info!("Attach nested Auraed pid {} to cgroup {}", pid, self.cell_name);
 
+        // Step 6: create the host-side primary and move the peer into the
+        // network namespace of the cell. An error here rolls back all steps.
+        if let (Some(cell_allocation), Some(net), Some((primary, peer))) =
+            (&allocation, &network, &interface_names)
+        {
+            let netns_path = format!("/proc/{}/ns/net", pid.as_raw());
+            let netns_file = match File::open(&netns_path) {
+                Ok(f) => f,
+                Err(e) => {
+                    self.rollback_allocation(
+                        Some(auraed),
+                        Some(cgroup),
+                        allocation,
+                        network,
+                    )
+                    .await;
+                    return Err(CellsError::FailedToAllocateCell {
+                        cell_name: self.cell_name.clone(),
+                        source: e,
+                    });
+                }
+            };
+            if let Err(e) = net
+                .create_cell_interface(
+                    &self.cell_name,
+                    cell_allocation,
+                    netns_file.as_fd(),
+                    primary,
+                    peer,
+                )
+                .await
+            {
+                self.rollback_allocation(
+                    Some(auraed),
+                    Some(cgroup),
+                    allocation,
+                    network,
+                )
+                .await;
+                return Err(CellsError::NetworkSetupFailed {
+                    cell_name: self.cell_name.clone(),
+                    source: Box::new(e),
+                });
+            }
+        }
+
+        // Step 7: wait for the end of the startup of the nested auraed.
+        // Its Unix socket appears only after `CellSystemRuntime::init`
+        // completes, which includes `init_endpoint` if the CLI flags are
+        // set. Thus the socket shows that the cell is reachable. If the
+        // socket does not appear before the timeout, the child probably
+        // failed in `init_endpoint`. Stop the child and roll back, so that
+        // the caller sees the failure here and not at the next gRPC
+        // call.
+        if let Err(e) =
+            wait_for_client_socket(&auraed.client_socket, CHILD_READY_TIMEOUT)
+                .await
+        {
+            self.rollback_allocation(
+                Some(auraed),
+                Some(cgroup),
+                allocation,
+                network,
+            )
+            .await;
+            return Err(CellsError::FailedToAllocateCell {
+                cell_name: self.cell_name.clone(),
+                source: e,
+            });
+        }
+
         self.state = CellState::Allocated {
             cgroup,
             nested_auraed: auraed,
-            children: Cells::new(self.cell_name.clone()),
+            children: Cells::new(self.cell_name.clone(), network.clone()),
+            ipam_allocation: allocation,
+            network,
         };
 
         Ok(())
     }
 
-    /// Broadcasts a graceful shutdown signal to all [NestedAuraed] and
-    /// deletes the underlying cgroup and all descendants.
+    /// Stop a cell and release all resources.
     ///
-    /// The [Cell::state] will be set to [CellState::Freed] regardless of it's state prior to this call.
-    ///
-    /// A [Cell] should never be reused once in the [CellState::Freed] state.
+    /// The state stays allocated if a cleanup step fails.
     pub(crate) async fn free(&mut self) -> Result<()> {
-        if let CellState::Allocated { cgroup, nested_auraed, children } =
-            &mut self.state
+        if matches!(self.state, CellState::CleanupPending { .. }) {
+            return self.retry_pending_cleanup().await;
+        }
+
+        if let CellState::Allocated {
+            cgroup,
+            nested_auraed,
+            children,
+            ipam_allocation,
+            network,
+        } = &mut self.state
         {
-            children.broadcast_free().await;
+            let children_teardown = children.broadcast_free().await;
+
             let signal_result = nested_auraed.shutdown().await;
-            Self::teardown_process_and_cgroup(
+            let teardown = Self::teardown_process_and_cgroup(
                 &self.cell_name,
                 cgroup,
                 signal_result,
-            )?;
+            );
+            let network_teardown = Self::release_network(
+                &self.cell_name,
+                ipam_allocation,
+                network,
+            )
+            .await;
+            teardown?;
+            network_teardown?;
+            children_teardown?;
         }
 
-        // set cell state to freed, independent of the current state
         self.state = CellState::Freed;
         Ok(())
     }
 
-    /// Sends a [SIGKILL] to the [NestedAuraed], and deletes the underlying cgroup.
-    /// The [Cell::state] will be set to [CellState::Freed] regardless of it's state prior to this call.
-    /// A [Cell] should never be reused once in the [CellState::Freed] state.
+    /// Kill a cell and release all resources.
     pub(crate) async fn kill(&mut self) -> Result<()> {
-        if let CellState::Allocated { cgroup, nested_auraed, children } =
-            &mut self.state
+        if matches!(self.state, CellState::CleanupPending { .. }) {
+            return self.retry_pending_cleanup().await;
+        }
+
+        if let CellState::Allocated {
+            cgroup,
+            nested_auraed,
+            children,
+            ipam_allocation,
+            network,
+        } = &mut self.state
         {
-            children.broadcast_kill().await;
+            let children_teardown = children.broadcast_kill().await;
+
             let signal_result = nested_auraed.kill().await;
-            Self::teardown_process_and_cgroup(
+            let teardown = Self::teardown_process_and_cgroup(
                 &self.cell_name,
                 cgroup,
                 signal_result,
-            )?;
+            );
+            let network_teardown = Self::release_network(
+                &self.cell_name,
+                ipam_allocation,
+                network,
+            )
+            .await;
+            teardown?;
+            network_teardown?;
+            children_teardown?;
         }
 
-        // set cell state to freed, independent of the current state
         self.state = CellState::Freed;
         Ok(())
     }
 
-    /// Performs bounded synchronous cleanup for Drop and ignores errors.
+    /// Performs bounded synchronous cleanup during `Drop`.
+    ///
+    /// This path keeps the network allocation. The daemon cannot confirm
+    /// an asynchronous link deletion from `Drop`.
     pub(super) fn kill_for_drop(&mut self) {
         let deadline = Instant::now() + super::nested_auraed::REAP_TIMEOUT;
         self.signal_kill_for_drop();
@@ -177,29 +498,67 @@ impl Cell {
     }
 
     pub(super) fn signal_kill_for_drop(&mut self) {
-        if let CellState::Allocated { nested_auraed, children, .. } =
-            &mut self.state
-        {
-            children.signal_kill_for_drop();
-            let _best_effort = nested_auraed.signal_kill_for_drop();
+        match &mut self.state {
+            CellState::CleanupPending { nested_auraed, .. } => {
+                if let Some(auraed) = nested_auraed.as_mut() {
+                    let _best_effort = auraed.signal_kill_for_drop();
+                }
+            }
+            CellState::Allocated { nested_auraed, children, .. } => {
+                children.signal_kill_for_drop();
+                let _best_effort = nested_auraed.signal_kill_for_drop();
+            }
+            CellState::Unallocated | CellState::Freed => {}
         }
     }
 
     pub(super) fn reap_kill_for_drop(&mut self, deadline: Instant) {
-        if let CellState::Allocated { cgroup, nested_auraed, children } =
-            &mut self.state
+        if let CellState::CleanupPending {
+            nested_auraed,
+            cgroup,
+            ipam_allocation,
+            ..
+        } = &mut self.state
         {
-            children.reap_kill_for_drop(deadline);
-            let signal_result = nested_auraed.reap_for_drop(deadline);
-            let _best_effort = Self::teardown_process_and_cgroup(
-                &self.cell_name,
-                cgroup,
-                signal_result,
-            );
+            if let Some(auraed) = nested_auraed.as_mut() {
+                let _best_effort = auraed.reap_for_drop(deadline);
+            }
+            if let Some(cell_cgroup) = cgroup.as_ref() {
+                let _best_effort = cell_cgroup.delete();
+            }
+            if ipam_allocation.is_some() {
+                warn!(
+                    "Cell {}: retained the network allocation during Drop",
+                    self.cell_name
+                );
+            }
+            return;
         }
 
-        // set cell state to freed, independent of the current state
-        self.state = CellState::Freed;
+        let CellState::Allocated {
+            cgroup,
+            nested_auraed,
+            children,
+            ipam_allocation,
+            ..
+        } = &mut self.state
+        else {
+            return;
+        };
+
+        children.reap_kill_for_drop(deadline);
+        let signal_result = nested_auraed.reap_for_drop(deadline);
+        let _best_effort = Self::teardown_process_and_cgroup(
+            &self.cell_name,
+            cgroup,
+            signal_result,
+        );
+        if ipam_allocation.is_some() {
+            warn!(
+                "Cell {}: retained the network allocation during Drop",
+                self.cell_name
+            );
+        }
     }
 
     pub fn client_socket(&self) -> Result<AuraeSocket> {
@@ -228,6 +587,42 @@ impl Cell {
         };
 
         Some(cgroup.v2())
+    }
+}
+
+/// Wait for the Unix socket file of the nested auraed. The child creates
+/// this socket as the last step of `CellSystemRuntime::init`. Thus the
+/// socket shows the end of the startup of the child. The function polls
+/// the file system, because a local `stat` call takes microseconds. It
+/// does not connect, because a connection makes the daemon do a TLS
+/// handshake that this function does not need.
+///
+/// An `AuraeSocket::Addr` is always ready. That variant is for TCP, where
+/// the address is immediately available and the connect call blocks.
+async fn wait_for_client_socket(
+    socket: &AuraeSocket,
+    timeout: Duration,
+) -> io::Result<()> {
+    let path = match socket {
+        AuraeSocket::Path(p) => p.clone(),
+        AuraeSocket::Addr(_) => return Ok(()),
+    };
+    let start = Instant::now();
+    loop {
+        if path.exists() {
+            return Ok(());
+        }
+        if start.elapsed() >= timeout {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!(
+                    "nested auraed socket {} did not appear within {}s",
+                    path.display(),
+                    timeout.as_secs()
+                ),
+            ));
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
     }
 }
 
@@ -284,9 +679,6 @@ impl CellsCache for Cell {
 }
 
 impl Drop for Cell {
-    /// During normal behavior, cells are freed before being dropped,
-    /// but cache reconciliation may result in a drop in other circumstances.
-    /// Here we have a chance to clean up, no matter the circumstance.
     fn drop(&mut self) {
         self.kill_for_drop();
     }
@@ -295,6 +687,7 @@ impl Drop for Cell {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::init::network::ipam::IpamConfig;
     use crate::{AURAED_RUNTIME, AuraedRuntime};
     use test_helpers::*;
 
@@ -310,14 +703,34 @@ mod tests {
         let mut cell = Cell::new(cell_name, CellSpec::new_for_tests());
         assert!(matches!(cell.state, CellState::Unallocated));
 
-        cell.allocate().await.expect("failed to allocate");
+        cell.allocate(None).await.expect("failed to allocate");
         assert!(matches!(cell.state, CellState::Allocated { .. }));
 
         cell.free().await.expect("failed to free");
         assert!(matches!(cell.state, CellState::Freed));
 
         // Calling allocate again should do nothing
-        cell.allocate().await.expect("failed to allocate 2");
+        cell.allocate(None).await.expect("failed to allocate 2");
         assert!(matches!(cell.state, CellState::Freed));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn free_retries_pending_network_cleanup() {
+        let cell_name = CellName::random_for_tests();
+        let network = Network::connect(IpamConfig::default()).expect("network");
+        let key = Cell::ipam_key(&cell_name);
+        let allocation = network.ipam().allocate(&key).expect("allocation");
+        let mut cell = Cell::new(cell_name, CellSpec::new_for_tests());
+        cell.state = CellState::CleanupPending {
+            nested_auraed: None,
+            cgroup: None,
+            ipam_allocation: Some(allocation),
+            network: Some(network.clone()),
+        };
+
+        cell.free().await.expect("cleanup");
+
+        assert!(matches!(cell.state, CellState::Freed));
+        let _reused = network.ipam().allocate(&key).expect("reused allocation");
     }
 }

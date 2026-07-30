@@ -14,6 +14,8 @@
 \* -------------------------------------------------------------------------- */
 
 use super::{CellName, cgroups::error::CgroupsError};
+use crate::init::network::NetworkError;
+use crate::init::network::ipam::IpamError;
 use std::io;
 use thiserror::Error;
 use tracing::error;
@@ -42,4 +44,13 @@ pub enum CellsError {
     CgroupIsNotACell { cell_name: CellName },
     #[error("cgroup '{cell_name}` not found on host")]
     CgroupNotFound { cell_name: CellName },
+    #[error(
+        "cell '{cell_name}' requested isolate_network but the daemon has no \
+         Network available"
+    )]
+    NetworkUnavailable { cell_name: CellName },
+    #[error("cell '{cell_name}' IPAM allocation failed: {source}")]
+    IpamFailed { cell_name: CellName, source: IpamError },
+    #[error("cell '{cell_name}' network setup failed: {source}")]
+    NetworkSetupFailed { cell_name: CellName, source: Box<NetworkError> },
 }
