@@ -22,7 +22,7 @@
 
 use super::nat::NatManager;
 use super::netlink::{get_link_name, netlink_errno};
-use super::{CELL_INTERFACE_ALIAS, Network, NetworkError};
+use super::{CELL_INTERFACE_ALIAS, CellNetGuard, Network, NetworkError};
 use futures::stream::TryStreamExt;
 use netlink_packet_route::AddressFamily;
 use netlink_packet_route::link::{InfoKind, LinkAttribute, LinkInfo};
@@ -175,6 +175,23 @@ impl Network {
             return Err(e);
         }
 
+        // nftables is the mandatory source-enforcement layer. Load eBPF as
+        // an optional early source guard; missing artifacts, kernel
+        // support, or BPF privileges must not regress nft-isolated cells.
+        let guard_mode = match CellNetGuard::load() {
+            Ok(guard) => {
+                let _ = self.inner.cell_guard.set(guard);
+                "bpf"
+            }
+            Err(error) => {
+                warn!(
+                    "Cell-net BPF guard unavailable: {error}. Isolated cells \
+                     will use nft/host-stack mode."
+                );
+                "nft"
+            }
+        };
+
         if let Err(source) = sysctls.enable_forwarding() {
             if let Err(cleanup_error) = self.nft(NatManager::uninstall).await {
                 warn!(
@@ -201,11 +218,13 @@ impl Network {
             Some(wan) => info!(
                 "Host network ready for v6={pool_v6}: per-cell anti-spoof, \
                  host/sibling isolation, and NAT egress via '{wan}'. Host \
-                 firewall chains can still deny this traffic."
+                 firewall chains can still deny this traffic \
+                 (guard={guard_mode})."
             ),
             None => warn!(
                 "Host network ready for v6={pool_v6}, but there is no IPv6 \
-                 default route — cells remain isolated with no egress."
+                 default route — cells remain isolated with no egress \
+                 (guard={guard_mode})."
             ),
         }
         Ok(())

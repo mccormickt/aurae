@@ -21,6 +21,7 @@
 //! while the peer is still in the host network namespace and admin-down. Thus a cell
 //! cannot send an unfiltered packet.
 
+use super::bpf::SchedClassifierLink;
 use super::netlink::{
     configure_routed_endpoint, get_link_index, netlink_errno,
 };
@@ -32,7 +33,8 @@ use netlink_packet_route::link::{LinkAttribute, NetkitMode, NetkitPolicy};
 use nix::libc;
 use rtnetlink::{LinkNetkit, LinkUnspec};
 use std::os::fd::{AsRawFd, BorrowedFd};
-use tracing::{info, trace};
+use std::sync::{Arc, Mutex};
+use tracing::{info, trace, warn};
 
 /// Host-side state for the interface of one cell. The destroy, hard-kill,
 /// and rollback paths use it to undo `create_cell_interface`.
@@ -43,7 +45,18 @@ pub(super) struct CellInterfaceState {
     /// The delegated prefix of the cell. It is half of the `cell_src`
     /// binding.
     delegated: Ipv6Net,
-    source_bound: bool,
+    /// Index of the primary. It keys the eBPF guard maps.
+    ifindex: u32,
+    /// Cleanup flags are shared by snapshots of this state so each successful
+    /// step remains complete across asynchronous teardown and retries.
+    enforcement: Arc<Mutex<CellEnforcementState>>,
+}
+
+struct CellEnforcementState {
+    /// Owns the tcx attachment until source cleanup begins.
+    bpf_link: Option<SchedClassifierLink>,
+    bpf_armed: bool,
+    nft_bound: bool,
 }
 
 impl Network {
@@ -120,11 +133,50 @@ impl Network {
                 source: e,
             })?;
 
+        let ifindex =
+            match get_link_index(&self.inner.handle, primary.to_string()).await
+            {
+                Ok(index) => index,
+                Err(error) => {
+                    self.delete_primary_best_effort(primary).await;
+                    return Err(error);
+                }
+            };
+
+        // The nft binding below is the mandatory source policy. Arm the BPF
+        // guard when it is available, but keep the nft path if the attach
+        // is unsupported on this host.
+        let bpf_link = match self.inner.cell_guard.get() {
+            Some(cell_guard) => {
+                match cell_guard.arm_for_cell(
+                    primary,
+                    ifindex,
+                    allocation.delegated,
+                ) {
+                    Ok(link) => Some(link),
+                    Err(error) => {
+                        warn!(
+                            "Cell interface `{primary}`: cell-net BPF attach \
+                             failed: {error}. Using nft/host-stack mode."
+                        );
+                        None
+                    }
+                }
+            }
+            None => None,
+        };
+
+        let bpf_armed = bpf_link.is_some();
         // Track the pair before a later operation can fail.
         let state = CellInterfaceState {
             primary: primary.to_string(),
             delegated: allocation.delegated,
-            source_bound: false,
+            ifindex,
+            enforcement: Arc::new(Mutex::new(CellEnforcementState {
+                bpf_link,
+                bpf_armed,
+                nft_bound: false,
+            })),
         };
         let _ = self.cell_interfaces().insert(cell_name.clone(), state);
 
@@ -143,8 +195,12 @@ impl Network {
                 Err(cleanup_error) => Err(cleanup_error),
             };
         }
-        if let Some(state) = self.cell_interfaces().get_mut(cell_name) {
-            state.source_bound = true;
+        if let Some(state) = self.cell_interfaces().get(cell_name) {
+            state
+                .enforcement
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .nft_bound = true;
         }
 
         // Move the peer into the network namespace of the cell. Each cell has a unique
@@ -180,12 +236,121 @@ impl Network {
             };
         }
 
+        let guard_mode = if bpf_armed { "bpf" } else { "nft" };
         info!(
             "Created cell interface for {cell_name}: primary={primary} \
-             peer={peer}, host={}, guest={} (guard on)",
+             peer={peer}, host={}, guest={} (guard={guard_mode})",
             allocation.host_ip, allocation.guest_ip,
         );
         Ok(())
+    }
+
+    /// Remove both source-enforcement layers. Each successful step updates
+    /// shared state, all pending steps are attempted, and the first failure
+    /// is returned so a later teardown can retry only what remains.
+    async fn cleanup_cell_enforcement(
+        &self,
+        state: &CellInterfaceState,
+    ) -> Result<(), NetworkError> {
+        let nft_bound = state
+            .enforcement
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .nft_bound;
+        let mut first_error = None;
+
+        if nft_bound {
+            let primary = state.primary.clone();
+            let delegated = state.delegated;
+            match self
+                .nft(move |nat| nat.unbind_cell_source(&primary, delegated))
+                .await
+            {
+                Ok(()) => {
+                    state
+                        .enforcement
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .nft_bound = false;
+                }
+                Err(error) => first_error = Some(error),
+            }
+        }
+
+        let mut enforcement =
+            state.enforcement.lock().unwrap_or_else(|poisoned| {
+                warn!(
+                    "Cell interface `{}` enforcement mutex poisoned; \
+                     recovering for cleanup",
+                    state.primary
+                );
+                poisoned.into_inner()
+            });
+
+        if enforcement.bpf_armed {
+            let link = enforcement.bpf_link.take();
+            let result = match self.inner.cell_guard.get() {
+                Some(cell_guard) => cell_guard
+                    .disarm_source(state.ifindex, link)
+                    .map_err(|source| NetworkError::BpfGuardFailed {
+                        iface: state.primary.clone(),
+                        source: Box::new(source),
+                    }),
+                None => Err(NetworkError::GuardNotLoaded {
+                    iface: state.primary.clone(),
+                }),
+            };
+            match result {
+                Ok(()) => enforcement.bpf_armed = false,
+                Err(error) if first_error.is_none() => {
+                    first_error = Some(error);
+                }
+                Err(error) => warn!(
+                    "Additional cleanup failure for cell interface `{}`: \
+                     {error}",
+                    state.primary
+                ),
+            }
+        }
+
+        first_error.map_or(Ok(()), Err)
+    }
+
+    /// Delete a host-side primary by name. The function is best-effort.
+    /// The rollback path of `create_cell_interface` and the hard-kill path
+    /// use it. The function logs errors and does not return them, because
+    /// the callers are on a failure path and must keep the initial cause.
+    pub(crate) async fn delete_primary_best_effort(&self, primary: &str) {
+        match get_link_index(&self.inner.handle, primary.to_string()).await {
+            Ok(idx) => {
+                match self.inner.handle.link().del(idx).execute().await {
+                    Ok(()) => {}
+                    // The kernel deletes the pair when the network namespace of the
+                    // cell ends. That can occur before this delete.
+                    Err(e) if netlink_errno(&e) == Some(-libc::ENODEV) => {
+                        trace!(
+                            "Primary `{primary}` disappeared before delete \
+                             (netns teardown won the race)"
+                        );
+                    }
+                    Err(e) => {
+                        warn!(
+                            "Rollback: failed to delete primary `{primary}` \
+                             (index {idx}): {e}. Host interface may leak."
+                        );
+                    }
+                }
+            }
+            Err(NetworkError::DeviceNotFound { .. }) => {
+                // The primary is already gone.
+            }
+            Err(e) => {
+                warn!(
+                    "Rollback: could not look up primary `{primary}` for \
+                     deletion: {e}. Host interface may leak."
+                );
+            }
+        }
     }
 
     /// Remove the host link and the source binding for a cell.
@@ -195,9 +360,8 @@ impl Network {
         &self,
         cell_name: &CellName,
     ) -> Result<(), NetworkError> {
-        let Some(state) = self.cell_interfaces().get(cell_name).cloned() else {
-            return Ok(());
-        };
+        let state = self.cell_interfaces().get(cell_name).cloned();
+        let Some(state) = state else { return Ok(()) };
         let primary = &state.primary;
 
         let index = match get_link_index(&self.inner.handle, primary.clone())
@@ -228,14 +392,7 @@ impl Network {
             }
         }
 
-        // Remove the source binding, so that a leftover element cannot
-        // accept a recycled interface name.
-        if state.source_bound {
-            let primary = primary.clone();
-            let delegated = state.delegated;
-            self.nft(move |nat| nat.unbind_cell_source(&primary, delegated))
-                .await?;
-        }
+        self.cleanup_cell_enforcement(&state).await?;
         let _ = self.cell_interfaces().remove(cell_name);
         info!(
             "Destroyed cell interface for {cell_name}: primary={primary} \
@@ -283,5 +440,8 @@ mod tests {
             .await
             .expect_err("device is already gone");
         assert_eq!(netlink_errno(&err), Some(-libc::ENODEV));
+
+        // The best-effort path stays silent on an already-gone primary.
+        network.delete_primary_best_effort(&primary).await;
     }
 }

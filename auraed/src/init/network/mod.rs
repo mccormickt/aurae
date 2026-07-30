@@ -36,7 +36,7 @@ use rtnetlink::Handle;
 use std::collections::HashMap;
 use std::fmt;
 use std::net::Ipv6Addr;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 use tracing::{info, warn};
 
@@ -44,6 +44,7 @@ use crate::cells::cell_service::cells::CellName;
 use crate::init::network::endpoint::NetworkConfig;
 use crate::init::network::ipam::{Ipam, IpamConfig};
 
+pub(crate) mod bpf;
 mod cell;
 pub(crate) mod endpoint;
 mod host;
@@ -52,6 +53,7 @@ pub(crate) mod nat;
 mod netlink;
 mod sriov;
 
+use bpf::CellNetGuard;
 use cell::CellInterfaceState;
 use host::{HostSysctlState, enable_forwarding_v6};
 use nat::NatManager;
@@ -113,6 +115,10 @@ pub enum NetworkError {
     TapAlreadyTracked { tap: String },
     #[error("Failed to rename link `{old}` to `{new}`: {source}")]
     ErrorRenamingLink { old: String, new: String, source: rtnetlink::Error },
+    #[error("Failed to enable cell-net BPF guard for `{iface}`: {source}")]
+    BpfGuardFailed { iface: String, source: Box<bpf::CellGuardError> },
+    #[error("cell-net BPF state for `{iface}` exists without a loaded guard")]
+    GuardNotLoaded { iface: String },
     #[error(transparent)]
     Other(#[from] rtnetlink::Error),
 }
@@ -137,6 +143,9 @@ struct NetworkInner {
     host_sysctls: Mutex<Option<HostSysctlState>>,
     /// Source-enforcement state for each routed VM TAP in this netns.
     tap_interfaces: Mutex<HashMap<String, TapInterfaceState>>,
+    /// Optional eBPF source guard. nftables is the mandatory enforcement
+    /// and fallback path.
+    cell_guard: OnceLock<CellNetGuard>,
     /// The IPAM allocator.
     ipam: Ipam,
 }
@@ -159,6 +168,10 @@ impl fmt::Debug for Network {
             .len();
         f.debug_struct("Network")
             .field("nat_installed", &self.inner.nat.is_installed())
+            .field(
+                "cell_net_guard_loaded",
+                &self.inner.cell_guard.get().is_some(),
+            )
             .field("cell_interface_count", &cell_count)
             .field("tap_interface_count", &tap_count)
             .finish()
@@ -181,6 +194,7 @@ impl Network {
                 cell_interfaces: Mutex::new(HashMap::new()),
                 host_sysctls: Mutex::new(None),
                 tap_interfaces: Mutex::new(HashMap::new()),
+                cell_guard: OnceLock::new(),
                 ipam: Ipam::new(ipam_config),
             }),
         })

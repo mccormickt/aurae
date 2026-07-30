@@ -363,6 +363,7 @@ impl Cell {
         else {
             unreachable!("successful allocation owns all required resources")
         };
+
         self.state = CellState::Allocated {
             cgroup,
             nested_auraed,

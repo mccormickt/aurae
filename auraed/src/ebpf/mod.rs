@@ -20,7 +20,7 @@ pub use tracepoint::SchedProcessForkTracepointProgram;
 pub use tracepoint::SignalSignalGenerateTracepointProgram;
 
 mod bpf_context;
-mod bpf_file;
+pub(crate) mod bpf_file;
 pub(crate) mod kprobe;
 pub(crate) mod perf_buffer_reader;
 pub(crate) mod perf_event_broadcast;
