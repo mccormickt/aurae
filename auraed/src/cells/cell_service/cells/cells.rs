@@ -16,6 +16,7 @@
 use super::{Cell, CellName, CellSpec, CellsError, Result, cgroups::Cgroup};
 use crate::cells::cell_service::cells::cells_cache::CellsCache;
 use std::collections::HashMap;
+use std::time::Instant;
 use tracing::warn;
 
 type Cache = HashMap<CellName, Cell>;
@@ -35,7 +36,7 @@ pub struct Cells {
 
 impl Cells {
     pub fn new(parent: CellName) -> Self {
-        Self { parent: Some(parent), ..Self::default() }
+        Self { parent: Some(parent), cache: Cache::default() }
     }
 
     /// If `cell_name` does not sit directly under our `parent`, return the
@@ -208,7 +209,7 @@ impl Cells {
         Err(CellsError::CgroupNotFound { cell_name: cell_name.clone() })
     }
 
-    /// Free all cells concurrently, allowing each to perform its own netlink + process-reap work        
+    /// Frees sibling cells concurrently.
     pub(crate) async fn broadcast_free(&mut self) {
         let results =
             futures::future::join_all(self.cache.values_mut().map(|cell| {
@@ -224,33 +225,46 @@ impl Cells {
         }
     }
 
-    pub(crate) fn broadcast_kill(&mut self) {
-        let killed_cells = self.do_broadcast_sync(|cell| cell.kill());
+    /// Kills sibling cells concurrently.
+    pub(crate) async fn broadcast_kill(&mut self) {
+        let results =
+            futures::future::join_all(self.cache.values_mut().map(|cell| {
+                let name = cell.name().clone();
+                async move { (name, cell.kill().await.is_ok()) }
+            }))
+            .await;
 
-        for cell_name in killed_cells {
-            let _ = self.cache.remove(&cell_name);
+        for (cell_name, killed) in results {
+            if killed {
+                let _ = self.cache.remove(&cell_name);
+            }
         }
     }
 
-    fn do_broadcast_sync<F>(&mut self, f: F) -> Vec<CellName>
-    where
-        F: Fn(&mut Cell) -> Result<()>,
-    {
-        self.cache
-            .values_mut()
-            .flat_map(|cell| {
-                f(cell)?;
+    /// Performs synchronous best-effort cleanup during Drop.
+    pub(crate) fn broadcast_kill_for_drop(&mut self) {
+        let deadline = Instant::now() + super::nested_auraed::REAP_TIMEOUT;
+        self.signal_kill_for_drop();
+        self.reap_kill_for_drop(deadline);
+    }
 
-                // We clone here because we need a way to reference the cell
-                // for the loop to remove it from the cache. Instead of
-                // cloning, we could make [Cell::state] `pub(crate)` and
-                // check the state of the cell, removing the ones in the
-                // [CellState::Freed] state, but that would expose internal
-                // functionality of the cell. We could also create an
-                // `is_freed` fn on the cell.
-                Ok::<_, CellsError>(cell.name().clone())
-            })
-            .collect()
+    pub(super) fn signal_kill_for_drop(&mut self) {
+        for cell in self.cache.values_mut() {
+            cell.signal_kill_for_drop();
+        }
+    }
+
+    pub(super) fn reap_kill_for_drop(&mut self, deadline: Instant) {
+        for cell in self.cache.values_mut() {
+            cell.reap_kill_for_drop(deadline);
+        }
+        self.cache.clear();
+    }
+}
+
+impl Drop for Cells {
+    fn drop(&mut self) {
+        self.broadcast_kill_for_drop();
     }
 }
 

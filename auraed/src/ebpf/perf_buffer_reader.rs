@@ -16,7 +16,7 @@
 use anyhow::Context;
 use aya::{
     Ebpf,
-    maps::perf::PerfEventArray,
+    maps::perf::{Events, PerfEventArray},
     util::{nr_cpus, online_cpus},
 };
 use bytes::BytesMut;
