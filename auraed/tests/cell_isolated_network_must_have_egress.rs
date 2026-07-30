@@ -111,7 +111,6 @@ async fn cell_isolated_network_must_have_egress() {
     .expect("free re-allocated cell");
 }
 
-
 fn has_host_v6_egress() -> bool {
     std::process::Command::new("ping")
         .args(["-6", "-c", "1", "-W", "2", "2606:4700:4700::1111"])
