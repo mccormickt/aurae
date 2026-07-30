@@ -15,9 +15,9 @@
 
 use super::{Cell, CellName, CellSpec, CellsError, Result, cgroups::Cgroup};
 use crate::cells::cell_service::cells::cells_cache::CellsCache;
+use crate::init::network::Network;
 use std::collections::HashMap;
 use std::time::Instant;
-use tracing::warn;
 
 type Cache = HashMap<CellName, Cell>;
 
@@ -26,6 +26,10 @@ type Cache = HashMap<CellName, Cell>;
 pub struct Cells {
     parent: Option<CellName>,
     cache: Cache,
+    /// `CellService` also holds this handle. The network setup of a
+    /// cell can find the `Network` of the host. It is `None` outside the
+    /// daemon context, and such a cell cannot set `isolate_network`.
+    network: Option<Network>,
 }
 
 // TODO: add to the impl
@@ -35,8 +39,16 @@ pub struct Cells {
 // [ ] Get Cgroup and pids from executable_name
 
 impl Cells {
-    pub fn new(parent: CellName) -> Self {
-        Self { parent: Some(parent), cache: Cache::default() }
+    /// Build the root `Cells` collection of `CellService`. It has no
+    /// parent. each cell name is a top-level name.
+    pub fn new_root(network: Option<Network>) -> Self {
+        Self { parent: None, cache: HashMap::new(), network }
+    }
+
+    /// Build a child `Cells` collection below `parent`. `Cell::allocate`
+    /// uses it. The descendants share one `Network`.
+    pub fn new(parent: CellName, network: Option<Network>) -> Self {
+        Self { parent: Some(parent), cache: HashMap::new(), network }
     }
 
     /// If `cell_name` does not sit directly under our `parent`, return the
@@ -71,27 +83,20 @@ impl Cells {
                 .await;
         }
 
-        if Cgroup::exists(&cell_name) {
-            return if self.cache.contains_key(&cell_name) {
-                Err(CellsError::CellExists { cell_name })
-            } else {
-                Err(CellsError::CgroupIsNotACell {
-                    cell_name: cell_name.clone(),
-                })
-            };
+        if let Some(cell) = self.cache.get(&cell_name)
+            && !cell.can_allocate()
+        {
+            return Err(CellsError::CellExists { cell_name });
         }
 
-        // From here, we know the cgroup doesn't exist, so remove from cache
-        // if it does
-        if let Some(_removed) = self.cache.remove(&cell_name) {
-            // TODO: Should we not remove the cell (that has no cgroup) from
-            //       the cache and force the user to call Free? Free will also
-            //       return an error, but we may be calling other logic in
-            //       free that we want to run.
-            warn!(
-                "Found cached cell ('{cell_name}') without cgroup. Did you forget to call free on the cell?"
-            );
+        if Cgroup::exists(&cell_name) {
+            return Err(CellsError::CgroupIsNotACell {
+                cell_name: cell_name.clone(),
+            });
         }
+
+        let _ = self.cache.remove(&cell_name);
+        let network = self.network.clone();
 
         let cell = self
             .cache
@@ -100,7 +105,7 @@ impl Cells {
 
         // TODO: Should we remove the cell from the cache here if the call to
         //       allocate fails?
-        cell.allocate().await?;
+        cell.allocate(network).await?;
 
         Ok(cell)
     }
@@ -115,14 +120,18 @@ impl Cells {
             return Box::pin(CellsCache::free(child, cell_name)).await;
         }
 
-        self.handle_cgroup_does_not_exist(cell_name)?;
-
         let res = match self.cache.get_mut(cell_name) {
             Some(cell) => cell.free().await,
             None => {
-                return Err(CellsError::CgroupIsNotACell {
-                    cell_name: cell_name.clone(),
-                });
+                return if Cgroup::exists(cell_name) {
+                    Err(CellsError::CgroupIsNotACell {
+                        cell_name: cell_name.clone(),
+                    })
+                } else {
+                    Err(CellsError::CellNotFound {
+                        cell_name: cell_name.clone(),
+                    })
+                };
             }
         };
 
@@ -157,13 +166,7 @@ impl Cells {
             });
         };
 
-        let res = f(cell);
-
-        if matches!(res, Err(CellsError::CellNotAllocated { .. })) {
-            let _ = self.cache.remove(cell_name);
-        }
-
-        res
+        f(cell)
     }
 
     pub(crate) fn get_all<F, R>(&self, f: F) -> Result<Vec<Result<R>>>
@@ -198,7 +201,7 @@ impl Cells {
             return Ok(());
         }
 
-        let Some(_removed) = self.cache.remove(cell_name) else {
+        let Some(_cell) = self.cache.get(cell_name) else {
             // Cell doesn't exist & cgroup doesn't exist
             return Err(CellsError::CellNotFound {
                 cell_name: cell_name.clone(),
@@ -210,35 +213,51 @@ impl Cells {
     }
 
     /// Frees sibling cells concurrently.
-    pub(crate) async fn broadcast_free(&mut self) {
+    pub(crate) async fn broadcast_free(&mut self) -> Result<()> {
         let results =
             futures::future::join_all(self.cache.values_mut().map(|cell| {
                 let name = cell.name().clone();
-                async move { (name, cell.free().await.is_ok()) }
+                async move { (name, cell.free().await) }
             }))
             .await;
 
-        for (cell_name, freed) in results {
-            if freed {
-                let _ = self.cache.remove(&cell_name);
+        let mut first_error = None;
+        for (cell_name, result) in results {
+            match result {
+                Ok(()) => {
+                    let _ = self.cache.remove(&cell_name);
+                }
+                Err(error) if first_error.is_none() => {
+                    first_error = Some(error)
+                }
+                Err(_error) => {}
             }
         }
+        first_error.map_or(Ok(()), Err)
     }
 
     /// Kills sibling cells concurrently.
-    pub(crate) async fn broadcast_kill(&mut self) {
+    pub(crate) async fn broadcast_kill(&mut self) -> Result<()> {
         let results =
             futures::future::join_all(self.cache.values_mut().map(|cell| {
                 let name = cell.name().clone();
-                async move { (name, cell.kill().await.is_ok()) }
+                async move { (name, cell.kill().await) }
             }))
             .await;
 
-        for (cell_name, killed) in results {
-            if killed {
-                let _ = self.cache.remove(&cell_name);
+        let mut first_error = None;
+        for (cell_name, result) in results {
+            match result {
+                Ok(()) => {
+                    let _ = self.cache.remove(&cell_name);
+                }
+                Err(error) if first_error.is_none() => {
+                    first_error = Some(error)
+                }
+                Err(_error) => {}
             }
         }
+        first_error.map_or(Ok(()), Err)
     }
 
     /// Performs synchronous best-effort cleanup during Drop.

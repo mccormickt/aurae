@@ -18,6 +18,7 @@
 //! The Aurae daemon assumes that if the current process id (PID) is 1 to
 //! run itself as an initialization program, otherwise bypass the init module.
 
+use self::network::endpoint::NetworkConfig;
 pub use self::system_runtimes::SocketStream;
 use self::system_runtimes::{
     CellSystemRuntime, ContainerSystemRuntime, DaemonSystemRuntime,
@@ -28,7 +29,7 @@ use std::io::{BufReader, Read};
 mod fileio;
 mod fs;
 mod logging;
-mod network;
+pub(crate) mod network;
 mod power;
 mod system_runtimes;
 
@@ -79,14 +80,15 @@ pub async fn init(
     verbose: bool,
     nested: bool,
     socket_address: Option<String>,
+    net_config: Option<NetworkConfig>,
 ) -> (Context, SocketStream) {
     let context = Context::get(nested);
     let init_result = init_with_runtimes(
         context,
         verbose,
         socket_address,
-        Pid1SystemRuntime {},
-        CellSystemRuntime {},
+        Pid1SystemRuntime { net_config: net_config.clone() },
+        CellSystemRuntime { net_config },
         ContainerSystemRuntime {},
         DaemonSystemRuntime {},
     )

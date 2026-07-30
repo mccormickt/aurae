@@ -15,4 +15,4 @@
 
 pub(crate) use cell_service::CellService;
 
-mod cell_service;
+pub(crate) mod cell_service;
