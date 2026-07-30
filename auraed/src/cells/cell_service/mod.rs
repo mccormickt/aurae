@@ -17,7 +17,7 @@ use error::Result;
 
 #[allow(clippy::module_inception)]
 mod cell_service;
-mod cells;
+pub(crate) mod cells;
 mod error;
 mod executables;
 mod validation;

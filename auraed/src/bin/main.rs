@@ -37,11 +37,15 @@
 // Keep the entrypoint warnings clean even when clippy isn't run separately.
 #![warn(clippy::all, clippy::pedantic, clippy::unwrap_used)]
 
-use auraed::{AuraedRuntime, prep_oci_spec_for_spawn, run};
+use auraed::{AuraedRuntime, NetworkConfig, prep_oci_spec_for_spawn, run};
 use clap::{Parser, Subcommand};
+use std::net::Ipv6Addr;
 use std::path::PathBuf;
 use std::process::ExitCode;
 use tracing::{error, info};
+
+const DEFAULT_INTERFACE_NAME: &str = "eth0";
+const DEFAULT_GUEST_PREFIX_V6: u8 = 128;
 
 /// Command line options for auraed.
 ///
@@ -98,6 +102,29 @@ struct AuraedOptions {
     /// Run auraed as a nested instance of itself in an Aurae cell.
     #[clap(long)]
     nested: bool,
+    /// The IPv6 gateway address of the auraed endpoint. The parent auraed
+    /// sets it for a nested auraed in an isolated cell network namespace. The VM boot
+    /// path also sets it. The daemon binds the related
+    /// `--net-guest-ip-v6` on `eth0` and adds a default route through this
+    /// address. The flag is necessary if another `--net-*` flag is set.
+    #[clap(long, value_parser)]
+    net_host_ip_v6: Option<Ipv6Addr>,
+    /// The IPv6 address on `eth0` in the network namespace of the daemon. The flag is
+    /// necessary if another `--net-*` flag is set.
+    #[clap(long, value_parser)]
+    net_guest_ip_v6: Option<Ipv6Addr>,
+    /// The prefix length of `--net-guest-ip-v6`. The default is 128 and
+    /// gives one address. Use a shorter prefix, for example 80, to give a
+    /// delegated prefix to a nested auraed or to a VM.
+    #[clap(long, value_parser)]
+    net_guest_prefix_v6: Option<u8>,
+    /// The interface name that the daemon waits for at its start. The
+    /// daemon then renames the interface to `eth0`. The parent gives a
+    /// cell a unique peer name, for example `nk-a1b2c3d4-p`. A VM usually
+    /// has `eth0` already. The default is `eth0`, and the daemon then does
+    /// no rename.
+    #[clap(long, value_parser)]
+    net_interface_name: Option<String>,
     // Subcommands for the project
     #[clap(subcommand)]
     subcmd: Option<SubCommands>,
@@ -147,8 +174,33 @@ async fn handle_default(
         library_dir,
         verbose,
         nested,
+        net_host_ip_v6,
+        net_guest_ip_v6,
+        net_guest_prefix_v6,
+        net_interface_name,
         subcmd: _,
     } = options;
+
+    // A networked endpoint needs both `host_v6` and `guest_v6`. The
+    // `prefix_v6` and `interface_name` values are optional and have
+    // defaults. The function ignores them if the two addresses are
+    // absent.
+    let net_config = match (net_host_ip_v6, net_guest_ip_v6) {
+        (Some(host_v6), Some(guest_v6)) => Some(NetworkConfig {
+            host_v6,
+            guest_v6,
+            guest_prefix_len_v6: net_guest_prefix_v6
+                .unwrap_or(DEFAULT_GUEST_PREFIX_V6),
+            interface_name: net_interface_name
+                .unwrap_or_else(|| DEFAULT_INTERFACE_NAME.to_string()),
+        }),
+        (None, None) => None,
+        _ => {
+            return Err("partial network config: --net-host-ip-v6 and \
+                        --net-guest-ip-v6 must be set together"
+                .into());
+        }
+    };
 
     // Destructure the default runtime into individual variables
     let AuraedRuntime {
@@ -171,7 +223,7 @@ async fn handle_default(
     };
 
     // Run the auraed daemon with the configured runtime
-    run(runtime, socket, verbose, nested).await?;
+    run(runtime, socket, verbose, nested, net_config).await?;
     Ok(())
 }
 
