@@ -29,13 +29,13 @@ default: all ## Build all eBPF probes (debug)
 
 all: build ## Build all eBPF probes (debug)
 
-install: ## Install the eBPF probes to /var/lib/aurae/probes (release only)
+install: ## Install the eBPF probes to /var/lib/aurae/ebpf (release only)
 ifeq ($(uid), 0)
 	@mkdir -p $(aurae_ebpf)
-	@cp -v  ./target/bpfel-unknown-none/release/instrument* $(aurae_ebpf)
+	@cp -v  ./target/bpfel-unknown-none/release/instrument* ./target/bpfel-unknown-none/release/guard* $(aurae_ebpf)
 else
 	@sudo -E mkdir -p $(aurae_ebpf)
-	@sudo -E cp -v  ./target/bpfel-unknown-none/release/instrument* $(aurae_ebpf)
+	@sudo -E cp -v  ./target/bpfel-unknown-none/release/instrument* ./target/bpfel-unknown-none/release/guard* $(aurae_ebpf)
 endif
 .PHONY: build ## Build all eBPF probes (debug)
 build: nightly bpf-linker

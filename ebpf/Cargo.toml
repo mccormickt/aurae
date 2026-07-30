@@ -35,6 +35,10 @@ path = "src/probe-tracepoint-sched-sched-process-fork.rs"
 name = "instrument-kprobe-taskstats-exit"
 path = "src/probe-kprobe-taskstats-exit.rs"
 
+[[bin]]
+name = "guard-tcx-cell-net"
+path = "src/guard-tcx-cell-net.rs"
+
 [profile.dev]
 opt-level = 3
 debug = false
