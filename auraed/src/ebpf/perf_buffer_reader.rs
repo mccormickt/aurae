@@ -16,7 +16,7 @@
 use anyhow::Context;
 use aya::{
     Ebpf,
-    maps::perf::PerfEventArray,
+    maps::perf::{Events, PerfEventArray},
     util::{nr_cpus, online_cpus},
 };
 use bytes::BytesMut;
@@ -32,6 +32,10 @@ use super::perf_event_broadcast::PerfEventBroadcast;
 
 /// Size (in pages) for the circular per-CPU buffers that BPF perfbuf creates.
 const PER_CPU_BUFFER_SIZE_IN_PAGES: usize = 2;
+
+fn should_clear_ready(events: &Events) -> bool {
+    events.read == 0 && events.lost == 0
+}
 
 pub trait PerfBufferReader<T: Clone + Send + 'static> {
     fn read_from_perf_buffer(
@@ -121,15 +125,9 @@ pub trait PerfBufferReader<T: Clone + Send + 'static> {
                         }
                     };
 
-                    // `AsyncFd` caches readiness: without clearing it the
-                    // next `readable_mut().await` returns immediately and
-                    // this loop spins. `read_events` reports `Ok(read: 0)`
-                    // on an empty buffer rather than `WouldBlock`, so a
-                    // drained read is the signal that we would have
-                    // blocked — clear then, and only then, so a busy
-                    // buffer keeps draining without re-arming epoll for
-                    // every batch.
-                    if events.read == 0 {
+                    // Aya returns an all-zero result instead of WouldBlock
+                    // after draining. Clear cached readiness only then.
+                    if should_clear_ready(&events) {
                         guard.clear_ready();
                         continue;
                     }
@@ -162,5 +160,17 @@ pub trait PerfBufferReader<T: Clone + Send + 'static> {
         }
 
         Ok(PerfEventBroadcast::new(tx))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn readiness_is_cleared_only_for_an_empty_result() {
+        assert!(should_clear_ready(&Events { read: 0, lost: 0 }));
+        assert!(!should_clear_ready(&Events { read: 1, lost: 0 }));
+        assert!(!should_clear_ready(&Events { read: 0, lost: 1 }));
     }
 }

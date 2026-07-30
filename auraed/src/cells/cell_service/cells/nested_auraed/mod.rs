@@ -15,6 +15,7 @@
 
 pub use isolation_controls::IsolationControls;
 pub use nested_auraed::NestedAuraed;
+pub(crate) use nested_auraed::REAP_TIMEOUT;
 
 mod isolation_controls;
 #[allow(clippy::module_inception)]
