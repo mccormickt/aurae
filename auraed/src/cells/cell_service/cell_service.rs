@@ -184,7 +184,7 @@ impl CellService {
 
         // The cells that remain failed to shut down for some reason.
         // Forcefully kill any remaining cells that failed to shut down
-        cells.broadcast_kill();
+        cells.broadcast_kill().await;
 
         Ok(())
     }
