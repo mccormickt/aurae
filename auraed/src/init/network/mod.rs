@@ -13,361 +13,350 @@
  * SPDX-License-Identifier: Apache-2.0                                        *
 \* -------------------------------------------------------------------------- */
 
-use futures::stream::TryStreamExt;
-use ipnetwork::{IpNetwork, Ipv4Network, Ipv6Network};
-use netlink_packet_route::address::AddressAttribute;
-use netlink_packet_route::link::LinkAttribute;
-use nix::libc::EEXIST;
-use rtnetlink::{Handle, LinkUnspec, RouteMessageBuilder};
-use std::collections::HashMap;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
-use std::str;
-use std::thread;
-use std::time::Duration;
-use tracing::{error, info, trace, warn};
+//! Cell and endpoint networking.
+//!
+//! The parts, outermost first:
+//!   * [`Network`] gives the daemon or a nested auraed access to netlink,
+//!     the nft table, and the IPAM allocator. [`Network::connect`] builds
+//!     it.
+//!   * [`host`] does the host-side init: forwarding, the nft ruleset, and
+//!     the reconciliation of leftover interfaces. It runs in the daemon
+//!     only.
+//!   * [`cell`] does the per-cell interface lifecycle.
+//!   * [`netlink`] has the stateless link, address, and route helpers.
+//!   * [`nat`] is the enforcement layer.
+//!   * [`ipam`] and [`endpoint`] do the address allocation and hold the
+//!     configuration that a nested auraed applies to itself.
+//!
+//! `init_endpoint` is in this module and not in [`cell`], because it runs
+//! in the network namespace of the endpoint. A cell or a VM configures itself with it.
 
+use ipnet::Ipv6Net;
+use rtnetlink::Handle;
+use std::collections::HashMap;
+use std::fmt;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+use tracing::{info, warn};
+
+use crate::cells::cell_service::cells::CellName;
+use crate::init::network::endpoint::NetworkConfig;
+use crate::init::network::ipam::{Ipam, IpamConfig};
+
+mod cell;
+pub(crate) mod endpoint;
+mod host;
+pub(crate) mod ipam;
+pub(crate) mod nat;
+mod netlink;
 mod sriov;
 
+use cell::CellInterfaceState;
+use nat::NatManager;
+use netlink::{
+    add_address, add_onlink_default, configure_loopback, rename_link,
+    set_link_up, wait_for_link,
+};
+
 #[derive(thiserror::Error, Debug)]
-pub(crate) enum NetworkError {
+pub enum NetworkError {
     #[error("Failed to initialize network: {0}")]
     FailedToConnect(#[from] std::io::Error),
     #[error("Could not find link `{iface}`")]
     DeviceNotFound { iface: String },
     #[error("Error adding address `{ip}` to link `{iface}`: {source}")]
-    ErrorAddingAddress {
-        iface: String,
-        ip: IpNetwork,
-        source: rtnetlink::Error,
-    },
+    ErrorAddingAddress { iface: String, ip: Ipv6Net, source: rtnetlink::Error },
     #[error("Failed to set link up for device `{iface}`: {source}")]
     ErrorSettingLinkUp { iface: String, source: rtnetlink::Error },
-    #[error("Failed to set link down for device `{iface}`: {source}")]
-    ErrorSettingLinkDown { iface: String, source: rtnetlink::Error },
+    #[error("Error adding route to `{route}` for device `{iface}`: {source}")]
+    ErrorAddingRoute { iface: String, route: Ipv6Net, source: rtnetlink::Error },
+    #[error("Failed to enable IP forwarding ({family}): {msg}")]
+    ErrorEnablingIpForwarding { family: &'static str, msg: String },
     #[error(
-        "Error adding route from `{route_source}` to {route_destination}` for device `{iface}`: {source}"
+        "Failed to configure the host network during {operation}: {source}"
     )]
-    ErrorAddingRoute {
-        iface: String,
-        route_source: IpNetwork,
-        route_destination: IpNetwork,
+    ErrorConfiguringHost {
+        operation: &'static str,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error(
+        "Failed to create interface pair `{primary}` <-> `{peer}`: {source}"
+    )]
+    ErrorCreatingInterface {
+        primary: String,
+        peer: String,
         source: rtnetlink::Error,
     },
+    #[error("Failed to move link `{iface}` into target netns: {source}")]
+    ErrorMovingLinkToNetns { iface: String, source: rtnetlink::Error },
+    #[error("Failed to delete link `{iface}` (index {index}): {source}")]
+    ErrorDeletingLink { iface: String, index: u32, source: rtnetlink::Error },
+    #[error(
+        "Timed out waiting for link `{iface}` to appear after {timeout_ms} ms"
+    )]
+    TimedOutWaitingForLink { iface: String, timeout_ms: u64 },
+    #[error(
+        "cell_interfaces mutex poisoned — daemon network state is unrecoverable"
+    )]
+    CellInterfacesPoisoned,
+    #[error("Failed to rename link `{old}` to `{new}`: {source}")]
+    ErrorRenamingLink { old: String, new: String, source: rtnetlink::Error },
     #[error(transparent)]
     Other(#[from] rtnetlink::Error),
 }
 
-pub(crate) struct Config {
-    pub device: String,
-    pub address: String,
-    pub gateway: String,
-    pub subnet: String,
+/// A cloneable handle to the network state of the host.
+///
+/// The shared state contains netlink, nftables, interface, and IPAM state.
+/// The last handle removes the nftables table.
+#[derive(Clone)]
+pub(crate) struct Network {
+    inner: Arc<NetworkInner>,
 }
 
-pub(crate) struct Network(Handle);
+struct NetworkInner {
+    handle: Handle,
+    /// The nftables state and its lifecycle.
+    nat: NatManager,
+    /// The host interface state for each cell.
+    cell_interfaces: Mutex<HashMap<CellName, CellInterfaceState>>,
+    /// The IPAM allocator.
+    ipam: Ipam,
+}
+
+impl fmt::Debug for Network {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // `Handle` does not implement `Debug`. Report the nat state.
+        let cell_count =
+            self.inner.cell_interfaces.lock().map(|g| g.len()).unwrap_or(0);
+        f.debug_struct("Network")
+            .field("nat_installed", &self.inner.nat.is_installed())
+            .field("cell_interface_count", &cell_count)
+            .finish()
+    }
+}
 
 impl Network {
-    #[allow(clippy::result_large_err)]
-    pub(crate) fn connect() -> Result<Network, NetworkError> {
+    /// Connect to netlink and build the network state of the daemon.
+    ///
+    /// `ipam_config` is the only source of the cell pool.
+    /// [`Self::init_host_network`] reads the pool from the shared IPAM when it
+    /// builds the nft rules. Thus the allocator and the ruleset always use
+    /// the same prefix.
+    ///
+    /// A nested auraed configures its own endpoint. It supplies
+    /// [`IpamConfig::default`] and does not use the allocator.
+    pub(crate) fn connect(
+        ipam_config: IpamConfig,
+    ) -> Result<Network, NetworkError> {
         let (connection, handle, _) = rtnetlink::new_connection()?;
         let _ignored = tokio::spawn(connection);
-        Ok(Self(handle))
+        Ok(Self {
+            inner: Arc::new(NetworkInner {
+                handle,
+                nat: NatManager::new(),
+                cell_interfaces: Mutex::new(HashMap::new()),
+                ipam: Ipam::new(ipam_config),
+            }),
+        })
     }
 
-    pub(crate) async fn init(
+    pub(crate) fn ipam(&self) -> &Ipam {
+        &self.inner.ipam
+    }
+
+    /// Set up the local NIC of an auraed that runs in its own network namespace. The
+    /// cell runtime and the pid1 VM runtime both use this function.
+    /// The shared netlink handle is bound to the network namespace of the caller.
+    ///
+    /// Steps:
+    /// 1. Set the loopback up. A new network namespace has `lo` down, and an
+    ///    application that binds to localhost then fails.
+    /// 2. Wait a maximum of 5 s for a link with the name
+    ///    `config.interface_name`. The parent gives a cell a unique name
+    ///    `nk-<hex>-p` and moves that link into this network namespace. A VM usually
+    ///    has `eth0` immediately. A poll loop is sufficient, because
+    ///    rtnetlink calls complete in milliseconds. If the poll becomes
+    ///    unreliable, use RTNLGRP_LINK notifications.
+    /// 3. Rename `interface_name` to `eth0`. The unique outer name
+    ///    prevented a conflict with the `eth0` of the host. In this network namespace
+    ///    the name `eth0` is free, and it is the usual name of the primary
+    ///    NIC. The step does nothing if the name is already `eth0`, which
+    ///    is the usual condition for a VM.
+    /// 4. Set `eth0` up.
+    /// 5. Add `guest_v6/<prefix>` to `eth0`.
+    /// 6. Add an `onlink` default route through the host gateway. The
+    ///    `onlink` flag is necessary, because the gateway address is
+    ///    outside the prefix of the endpoint.
+    ///
+    /// A cell endpoint is a netkit peer in L3 mode. It has `ARPHRD_NONE`
+    /// and `IFF_NOARP`, no MAC address, and no link-local address. The
+    /// `via` gateway still operates, because a neighbour on a NOARP device
+    /// is `NUD_NOARP`. The kernel does not resolve a link-layer address and
+    /// sends the packets directly to the device.
+    pub(crate) async fn init_endpoint(
         &self,
-        config: &Config,
+        config: &NetworkConfig,
     ) -> Result<(), NetworkError> {
-        configure_loopback(&self.0).await?;
-        configure_nic(&self.0, config).await?;
+        const ETH0: &str = "eth0";
+        const TIMEOUT: Duration = Duration::from_secs(5);
+        const POLL: Duration = Duration::from_millis(50);
+
+        configure_loopback(&self.inner.handle).await?;
+
+        // Resolve the NIC one time and use its index below. A rename does
+        // not change the ifindex. The index stays valid.
+        let link_index = wait_for_link(
+            &self.inner.handle,
+            &config.interface_name,
+            TIMEOUT,
+            POLL,
+        )
+        .await?;
+        if config.interface_name != ETH0 {
+            rename_link(
+                &self.inner.handle,
+                link_index,
+                &config.interface_name,
+                ETH0,
+            )
+            .await?;
+        }
+
+        set_link_up(&self.inner.handle, link_index, ETH0).await?;
+
+        let addr = Ipv6Net::new(config.guest_v6, config.guest_prefix_len_v6)
+            .map_err(|e| {
+                NetworkError::Other(rtnetlink::Error::NamespaceError(
+                    e.to_string(),
+                ))
+            })?;
+        add_address(&self.inner.handle, link_index, ETH0, addr).await?;
+
+        add_onlink_default(
+            &self.inner.handle,
+            link_index,
+            ETH0,
+            config.host_v6,
+            config.guest_v6,
+        )
+        .await?;
+
+        info!(
+            "Configured endpoint (source={}→{ETH0}): \
+             guest={}/{}, default via {}",
+            config.interface_name,
+            config.guest_v6,
+            config.guest_prefix_len_v6,
+            config.host_v6,
+        );
         Ok(())
     }
+}
 
-    pub(crate) async fn show_network_info(&self) {
-        info!("=== Network Interfaces ===");
-
-        info!("Addresses:");
-        let links_result = get_links(&self.0).await;
-
-        match links_result {
-            Ok(links) => {
-                for (_, iface) in links {
-                    if let Err(e) = dump_addresses(&self.0, &iface).await {
-                        error!(
-                            "Could not dump addresses for iface {iface}. Error={e:?}"
-                        );
-                    };
-                }
-            }
-            Err(e) => {
-                error!("{e:?}");
-            }
+impl Drop for NetworkInner {
+    /// Remove the nftables state when the last handle is dropped.
+    fn drop(&mut self) {
+        if let Err(e) = self.nat.uninstall() {
+            warn!("Failed to uninstall NAT ruleset: {e}");
         }
-        info!("==========================");
     }
 }
 
-async fn configure_loopback(handle: &Handle) -> Result<(), NetworkError> {
-    const LOOPBACK_DEV: &str = "lo";
-    const LOOPBACK_IPV6: &str = "::1";
-    const LOOPBACK_IPV6_SUBNET: &str = "/128";
-    const LOOPBACK_IPV4: &str = "127.0.0.1";
-    const LOOPBACK_IPV4_SUBNET: &str = "/8";
+/// Helpers for the root-only tests in the child modules. They change real
+/// netlink state. They use device names with the prefix `tst-` and
+/// addresses from fd00:dead:beef::/48. Thus they cannot interfere with the
+/// interfaces of a live cell.
+#[cfg(test)]
+pub(crate) mod testutil {
+    use super::netlink::get_link_index;
+    use super::{Handle, Ipv6Net};
+    use futures::stream::TryStreamExt;
+    use netlink_packet_route::link::{NetkitMode, NetkitPolicy};
+    use netlink_packet_route::route::{RouteAddress, RouteAttribute};
+    use rtnetlink::{LinkNetkit, RouteMessageBuilder};
+    use std::net::Ipv6Addr;
 
-    trace!("configure {LOOPBACK_DEV}");
-
-    add_address(
-        handle,
-        LOOPBACK_DEV.to_owned(),
-        format!("{LOOPBACK_IPV6}{LOOPBACK_IPV6_SUBNET}")
-            .parse::<Ipv6Network>()
-            .expect("valid ipv6 address"),
-    )
-    .await?;
-
-    add_address(
-        handle,
-        LOOPBACK_DEV.to_owned(),
-        format!("{LOOPBACK_IPV4}{LOOPBACK_IPV4_SUBNET}")
-            .parse::<Ipv4Network>()
-            .expect("valid ipv4 address"),
-    )
-    .await?;
-
-    set_link_up(handle, LOOPBACK_DEV.to_owned()).await?;
-
-    info!("Successfully configured {}", LOOPBACK_DEV);
-    Ok(())
-}
-
-async fn configure_nic(
-    handle: &Handle,
-    config: &Config,
-) -> Result<(), NetworkError> {
-    trace!("configure {0}", config.device);
-
-    let ipv6_addr = format!("{0}{1}", config.address, config.subnet)
-        .parse::<Ipv6Network>()
-        .expect("valid ipv6 address");
-
-    let gateway =
-        config.gateway.to_string().parse::<Ipv6Network>().expect("gateway");
-
-    add_address(handle, config.device.clone(), ipv6_addr).await?;
-
-    set_link_up(handle, config.device.clone()).await?;
-
-    add_route_v6(
-        handle,
-        config.device.clone(),
-        &"::/0".parse::<Ipv6Network>().expect("valid ipv6 address"),
-        &gateway,
-    )
-    .await?;
-
-    info!("Successfully configured {0}", config.device);
-    Ok(())
-}
-
-async fn add_address(
-    handle: &Handle,
-    iface: String,
-    ip: impl Into<IpNetwork>,
-) -> Result<(), NetworkError> {
-    let ip = ip.into();
-    let link_index = get_link_index(handle, iface.clone()).await?;
-
-    handle
-        .address()
-        .add(link_index, ip.ip(), ip.prefix())
-        .execute()
-        .await
-        .map(|_| trace!("Added address to link {iface}"))
-        .or_else(|e| {
-            if let rtnetlink::Error::NetlinkError(msg) = &e {
-                let dup_code: i32 = -EEXIST;
-                if msg
-                    .code
-                    .map(|c| c.get())
-                    .map(|c| c == dup_code)
-                    .unwrap_or(false)
-                {
-                    warn!("Address {ip} already present on {iface}, ignoring");
-                    return Ok(());
-                }
-            }
-            Err(NetworkError::ErrorAddingAddress { iface, ip, source: e })
-        })?;
-
-    Ok(())
-}
-
-async fn set_link_up(
-    handle: &Handle,
-    iface: String,
-) -> Result<(), NetworkError> {
-    let link_index = get_link_index(handle, iface.clone()).await?;
-    let msg = LinkUnspec::new_with_index(link_index).up().build();
-
-    handle
-        .link()
-        .set(msg)
-        .execute()
-        .await
-        .map(|_| {
-            // TODO: replace sleep with an await mechanism that checks if device is up (with a timeout)
-            // TODO: https://github.com/aurae-runtime/auraed/issues/40
-            info!("Waiting for link '{iface}' to become up");
-            thread::sleep(Duration::from_secs(3));
-            info!("Waited 3 seconds, assuming link '{iface}' is up");
-        })
-        .map_err(|e| NetworkError::ErrorSettingLinkUp { iface, source: e })
-}
-
-#[allow(unused)]
-async fn set_link_down(
-    handle: &Handle,
-    iface: String,
-) -> Result<(), NetworkError> {
-    let link_index = get_link_index(handle, iface.clone()).await?;
-    let msg = LinkUnspec::new_with_index(link_index).down().build();
-
-    handle
-        .link()
-        .set(msg)
-        .execute()
-        .await
-        .map(|_| {
-            trace!("Set link {iface} down");
-        })
-        .map_err(|e| NetworkError::ErrorSettingLinkDown { iface, source: e })
-}
-
-async fn get_link_index(
-    handle: &Handle,
-    iface: String,
-) -> Result<u32, NetworkError> {
-    let link = handle
-        .link()
-        .get()
-        .match_name(iface.clone())
-        .execute()
-        .try_next()
-        .await;
-
-    if let Ok(Some(link)) = link {
-        Ok(link.header.index)
-    } else {
-        Err(NetworkError::DeviceNotFound { iface })
-    }
-}
-
-#[allow(unused)]
-async fn add_route_v4(
-    handle: &Handle,
-    iface: String,
-    source: &Ipv4Network,
-    dest: &Ipv4Network,
-) -> Result<(), NetworkError> {
-    let link_index = get_link_index(handle, iface.clone()).await?;
-
-    let route = RouteMessageBuilder::<Ipv4Addr>::new()
-        .destination_prefix(dest.ip(), dest.prefix())
-        .output_interface(link_index)
-        .pref_source(source.ip())
-        .build();
-    handle.route().add(route).execute().await.map_err(|e| {
-        NetworkError::ErrorAddingRoute {
-            iface,
-            route_source: IpNetwork::V4(*source),
-            route_destination: IpNetwork::V4(*dest),
-            source: e,
-        }
-    })?;
-
-    Ok(())
-}
-
-async fn add_route_v6(
-    handle: &Handle,
-    iface: String,
-    source: &Ipv6Network,
-    dest: &Ipv6Network,
-) -> Result<(), NetworkError> {
-    let link_index = get_link_index(handle, iface.clone()).await?;
-
-    let route = RouteMessageBuilder::<Ipv6Addr>::new()
-        .destination_prefix(dest.ip(), dest.prefix())
-        .output_interface(link_index)
-        .pref_source(source.ip())
-        .build();
-    handle.route().add(route).execute().await.map_err(|e| {
-        NetworkError::ErrorAddingRoute {
-            iface,
-            route_source: IpNetwork::V6(*source),
-            route_destination: IpNetwork::V6(*dest),
-            source: e,
-        }
-    })?;
-
-    Ok(())
-}
-
-async fn get_links(
-    handle: &Handle,
-) -> Result<HashMap<u32, String>, NetworkError> {
-    let mut result = HashMap::new();
-    let mut links = handle.link().get().execute();
-
-    'outer: while let Some(link_msg) = links.try_next().await? {
-        for nla in link_msg.attributes.into_iter() {
-            if let LinkAttribute::IfName(name) = nla {
-                let _ = result.insert(link_msg.header.index, name);
-                continue 'outer;
-            }
-        }
-        warn!("link with index {} has no name", link_msg.header.index);
+    pub(crate) async fn create_test_pair(
+        handle: &Handle,
+        primary: &str,
+        peer: &str,
+    ) {
+        handle
+            .link()
+            .add(
+                LinkNetkit::new(primary, peer, NetkitMode::L3)
+                    .policy(NetkitPolicy::Pass)
+                    .peer_policy(NetkitPolicy::Pass)
+                    .build(),
+            )
+            .execute()
+            .await
+            .expect("create test netkit pair");
     }
 
-    Ok(result)
-}
-
-async fn dump_addresses(
-    handle: &Handle,
-    iface: &str,
-) -> Result<(), NetworkError> {
-    let mut links = handle.link().get().match_name(iface.to_string()).execute();
-    if let Some(link_msg) = links.try_next().await? {
-        info!("{}:", iface);
-        for nla in link_msg.attributes.into_iter() {
-            if let LinkAttribute::IfName(name) = nla {
-                info!("\tindex: {}", link_msg.header.index);
-                info!("\tname: {name}");
-            }
+    pub(crate) async fn delete_if_exists(handle: &Handle, name: &str) {
+        if let Ok(idx) = get_link_index(handle, name.to_string()).await {
+            let _ = handle.link().del(idx).execute().await;
         }
+    }
 
-        let mut address_msg = handle
-            .address()
-            .get()
-            .set_link_index_filter(link_msg.header.index)
-            .execute();
-
-        while let Some(msg) = address_msg.try_next().await? {
-            for nla_address in msg.attributes.into_iter() {
-                if let AddressAttribute::Address(addr) = nla_address {
-                    match &addr {
-                        IpAddr::V4(ip_addr) => {
-                            info!("\t ipv4: {ip_addr}");
-                        }
-                        IpAddr::V6(ip_addr) => {
-                            info!("\t ipv6: {ip_addr}");
-                        }
+    /// Find the oif of the v6 route to `dest`, if such a route exists.
+    pub(crate) async fn route_oif(
+        handle: &Handle,
+        dest: Ipv6Net,
+    ) -> Option<u32> {
+        let msg = RouteMessageBuilder::<Ipv6Addr>::new().build();
+        let mut routes = handle.route().get(msg).execute();
+        while let Ok(Some(route)) = routes.try_next().await {
+            if route.header.destination_prefix_length != dest.prefix_len() {
+                continue;
+            }
+            let mut matches_dest = false;
+            let mut oif = None;
+            for attr in &route.attributes {
+                match attr {
+                    RouteAttribute::Destination(RouteAddress::Inet6(a)) => {
+                        matches_dest = *a == dest.addr();
                     }
+                    RouteAttribute::Oif(i) => oif = Some(*i),
+                    _ => {}
                 }
             }
+            if matches_dest {
+                return oif;
+            }
         }
-        Ok(())
-    } else {
-        Err(NetworkError::DeviceNotFound { iface: iface.to_string() })
+        None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The nft ruleset must use the same prefix as the allocator. If the
+    /// two prefixes differ, each cell loses its egress, and the anti-spoof
+    /// rule drops all of its traffic.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn ipam_pool_is_the_single_source_of_truth_for_the_pool() {
+        let pool: Ipv6Net = "fd00:beef::/48".parse().expect("valid pool");
+        let network =
+            Network::connect(IpamConfig::new(pool, 128).expect("valid config"))
+                .expect("netlink connect");
+
+        assert_eq!(
+            network.ipam().pool(),
+            pool,
+            "connect() must seed the allocator from the config that \
+             init_host_network reads back when building the nft rules"
+        );
+        let alloc = network.ipam().allocate("cell:test").expect("allocate");
+        assert!(
+            network.ipam().pool().contains(&alloc.guest_ip),
+            "allocator handed out an address outside the pool the nft \
+             rules are built from"
+        );
     }
 }

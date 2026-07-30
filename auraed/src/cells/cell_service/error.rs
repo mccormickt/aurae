@@ -51,7 +51,14 @@ impl From<CellsServiceError> for Status {
                 CellsError::FailedToAllocateCell { .. }
                 | CellsError::AbortedAllocateCell { .. }
                 | CellsError::FailedToKillCellChildren { .. }
-                | CellsError::FailedToFreeCell { .. } => Status::internal(msg),
+                | CellsError::FailedToFreeCell { .. }
+                | CellsError::IpamFailed { .. }
+                | CellsError::NetworkSetupFailed { .. } => {
+                    Status::internal(msg)
+                }
+                CellsError::NetworkUnavailable { .. } => {
+                    Status::failed_precondition(msg)
+                }
                 CellsError::CellNotAllocated { cell_name } => {
                     CellsServiceError::CellsError(CellsError::CellNotFound {
                         cell_name,
