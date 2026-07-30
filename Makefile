@@ -394,7 +394,7 @@ prepare-image:
 # TODO: certificate provisioning
 	cp -vR /etc/aurae /mnt/etc/
 	mkdir -p /mnt/var/lib/aurae/ebpf
-	cp -v ./ebpf/target/bpfel-unknown-none/release/instrument* /mnt/var/lib/aurae/ebpf/
+	cp -v ./ebpf/target/bpfel-unknown-none/release/instrument* ./ebpf/target/bpfel-unknown-none/release/guard* /mnt/var/lib/aurae/ebpf/
 	mkdir -p /mnt/lib/auraed
 	cp -v ./target/x86_64-unknown-linux-musl/debug/auraed /mnt/lib/auraed/
 	ln -sf ../lib/auraed/auraed /mnt/sbin/init
