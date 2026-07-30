@@ -23,6 +23,7 @@ use super::{
         ValidatedCellServiceStartRequest, ValidatedCellServiceStopRequest,
     },
 };
+use crate::init::network::Network;
 use crate::{cells::cell_service::cells::CellsError, observe::ObserveService};
 use ::validation::ValidatedType;
 use backoff::backoff::Backoff;
@@ -115,9 +116,15 @@ impl CellService {
     ///
     /// # Arguments
     /// * `observe_service` - An instance of ObserveService to manage log channels.
-    pub fn new(observe_service: ObserveService) -> Self {
+    /// * `network` - The `Network` handle of the host. It is `None` if
+    ///   cell networking is not available, which is true outside the
+    ///   daemon context.
+    pub fn new(
+        observe_service: ObserveService,
+        network: Option<Network>,
+    ) -> Self {
         CellService {
-            cells: Default::default(),
+            cells: Arc::new(Mutex::new(Cells::new_root(network))),
             executables: Default::default(),
             observe_service,
         }
@@ -179,13 +186,14 @@ impl CellService {
     pub(crate) async fn free_all(&self) -> Result<()> {
         let mut cells = self.cells.lock().await;
 
-        // Attempt to gracefully free all cells
-        cells.broadcast_free().await;
+        // Request a graceful stop.
+        let graceful_result = cells.broadcast_free().await;
 
-        // The cells that remain failed to shut down for some reason.
-        // Forcefully kill any remaining cells that failed to shut down
-        cells.broadcast_kill();
+        // Kill each cell that remains.
+        let kill_result = cells.broadcast_kill().await;
 
+        graceful_result?;
+        kill_result?;
         Ok(())
     }
 
@@ -597,10 +605,13 @@ mod tests {
         let _ = AURAED_RUNTIME.set(AuraedRuntime::default());
 
         // Create a new instance of CellService for testing
-        let service = CellService::new(ObserveService::new(
-            LogChannel::new(String::from("test")),
-            (None, None, None),
-        ));
+        let service = CellService::new(
+            ObserveService::new(
+                LogChannel::new(String::from("test")),
+                (None, None, None),
+            ),
+            None,
+        );
 
         // Allocate a parent cell for testing
         let parent_cell_name = format!("ae-test-{}", uuid::Uuid::new_v4());
@@ -700,7 +711,7 @@ mod tests {
             LogChannel::new(String::from("test")),
             (None, None, None),
         );
-        let service = CellService::new(observe_service.clone());
+        let service = CellService::new(observe_service.clone(), None);
 
         let executable_name = format!("exec-{}", uuid::Uuid::new_v4().simple());
 

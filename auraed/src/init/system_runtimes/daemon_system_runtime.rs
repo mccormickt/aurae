@@ -37,6 +37,11 @@ impl SystemRuntime for DaemonSystemRuntime {
         logging::init(verbose, false)?;
         info!("Running as a daemon.");
 
+        // The main loop of the daemon in `lib.rs::run::inner` sets the
+        // forwarding sysctls and installs the NAT rules. It holds the
+        // `Network` while the daemon runs and removes it at the
+        // shutdown.
+
         // Running as a daemon supports both TCP and Unix sockets for listening, depending on the
         // socket address that's passed in.
         let sockaddr = socket_address.unwrap_or_else(|| {

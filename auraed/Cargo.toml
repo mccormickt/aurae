@@ -38,7 +38,7 @@ chrono = { workspace = true }
 clone3 = "0.2.3"
 fancy-regex = { workspace = true }
 futures = "0.3.28"
-ipnetwork = "0.21.1"
+ipnet = "2.10.1"
 iter_tools = "0.24.0"
 lazy_static = { workspace = true }
 libcgroups = { version = "0.5.7", default-features = false, features = [
@@ -49,6 +49,7 @@ libcontainer = { version = "0.5.7", default-features = false, features = [
 ] }
 log = "0.4.21"
 netlink-packet-route = "0.28.0"
+nftables = "0.6.3"
 nix = { workspace = true, features = ["sched", "mount", "signal", "net", "dir", "user", "process", "hostname"] }
 oci-spec = "0.8.4"
 once_cell = "1"
@@ -86,7 +87,6 @@ hypervisor = { git = "https://github.com/cloud-hypervisor/cloud-hypervisor", tag
 ] }
 net_util = { git = "https://github.com/cloud-hypervisor/cloud-hypervisor", tag = "v44.0" }
 vmm-sys-util = "0.12.1"
-vm-memory = "0.16.1"
 seccompiler = "0.4.0"
 
 [dev-dependencies]
