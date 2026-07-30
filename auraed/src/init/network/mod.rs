@@ -36,7 +36,7 @@ use rtnetlink::Handle;
 use std::collections::HashMap;
 use std::fmt;
 use std::net::Ipv6Addr;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 use tracing::{info, warn};
 
@@ -44,6 +44,7 @@ use crate::cells::cell_service::cells::CellName;
 use crate::init::network::endpoint::NetworkConfig;
 use crate::init::network::ipam::{Ipam, IpamConfig};
 
+pub(crate) mod bpf;
 mod cell;
 pub(crate) mod endpoint;
 mod host;
@@ -52,6 +53,7 @@ pub(crate) mod nat;
 mod netlink;
 mod sriov;
 
+use bpf::CellNetGuard;
 use cell::CellInterfaceState;
 use host::{HostSysctlState, enable_forwarding_v6};
 use nat::NatManager;
@@ -109,6 +111,13 @@ pub enum NetworkError {
     PoolRouteConflict { pool: Ipv6Net, route: Ipv6Net },
     #[error("Failed to rename link `{old}` to `{new}`: {source}")]
     ErrorRenamingLink { old: String, new: String, source: rtnetlink::Error },
+    #[error("Failed to enable cell-net BPF guard for `{iface}`: {source}")]
+    BpfGuardFailed { iface: String, source: Box<bpf::CellGuardError> },
+    #[error(
+        "cell-net BPF guard is not loaded; refusing to create an unguarded \
+         cell interface for `{iface}`"
+    )]
+    GuardNotLoaded { iface: String },
     #[error(transparent)]
     Other(#[from] rtnetlink::Error),
 }
@@ -131,6 +140,8 @@ struct NetworkInner {
     /// Original host-global sysctl values, captured only after host network
     /// initialization succeeds.
     host_sysctls: Mutex<Option<HostSysctlState>>,
+    /// The eBPF guard that enforces cell source addresses.
+    cell_guard: OnceLock<CellNetGuard>,
     /// The IPAM allocator.
     ipam: Ipam,
 }
@@ -194,6 +205,7 @@ impl NetworkBuilder {
                 nat: NatManager::new(),
                 cell_interfaces: Mutex::new(HashMap::new()),
                 host_sysctls: Mutex::new(None),
+                cell_guard: OnceLock::new(),
                 ipam: Ipam::new(self.ipam),
             }),
         })

@@ -21,7 +21,7 @@
 //! and calls `init_endpoint` to configure its own endpoint.
 
 use super::netlink::{get_link_name, netlink_errno};
-use super::{CELL_INTERFACE_ALIAS, Network, NetworkError};
+use super::{CELL_INTERFACE_ALIAS, CellNetGuard, Network, NetworkError};
 use futures::stream::TryStreamExt;
 use netlink_packet_route::AddressFamily;
 use netlink_packet_route::link::{InfoKind, LinkAttribute, LinkInfo};
@@ -130,6 +130,33 @@ impl Network {
             }
             return Err(NetworkError::FailedToConnect(e));
         }
+
+        // Load the guard before enabling forwarding. This keeps startup
+        // fail-closed if the eBPF program is unavailable.
+        let guard = match CellNetGuard::load() {
+            Ok(guard) => guard,
+            Err(source) => {
+                let error = NetworkError::BpfGuardFailed {
+                    iface: "<host>".to_string(),
+                    source: Box::new(source),
+                };
+                error!("{error}; refusing to start cells");
+                if let Err(cleanup_error) = self.inner.nat.uninstall() {
+                    warn!(
+                        "Failed to remove nft rules after guard load failed: \
+                         {cleanup_error}"
+                    );
+                }
+                if let Err(restore_error) = sysctls.restore() {
+                    warn!(
+                        "Failed to restore sysctls after guard load failed: \
+                         {restore_error}"
+                    );
+                }
+                return Err(error);
+            }
+        };
+        let _ = self.inner.cell_guard.set(guard);
 
         if let Err(source) = sysctls.enable_forwarding() {
             if let Err(cleanup_error) = self.inner.nat.uninstall() {
