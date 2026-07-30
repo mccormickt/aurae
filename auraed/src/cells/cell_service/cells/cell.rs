@@ -400,6 +400,21 @@ impl Cell {
             });
         }
 
+        // Step 8: the child is up, thus its `eth0` is up. Only now is this
+        // cell a valid `bpf_redirect_peer` target for a sibling cell. A
+        // failure here removes the cell-to-cell fast path only, and the
+        // traffic then goes through the host stack. Log the failure and
+        // continue, and do not delete a cell that operates.
+        if let Some(net) = network.as_ref()
+            && let Err(e) = net.publish_cell_redirect(&self.cell_name)
+        {
+            warn!(
+                "Cell {}: failed to publish cell-to-cell redirect: {e}. \
+                 Sibling traffic will take the host stack instead.",
+                self.cell_name
+            );
+        }
+
         self.state = CellState::Allocated {
             cgroup,
             nested_auraed: auraed,

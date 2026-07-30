@@ -29,7 +29,7 @@ anyhow = { workspace = true }
 async-recursion = "1.1.1"
 async-trait = "0.1.83"
 client = { workspace = true }
-aurae-ebpf-shared = { path = "../ebpf-shared" }
+aurae-ebpf-shared = { path = "../ebpf-shared", features = ["user"] }
 aya = { version = "0.13.1" }
 backoff = { version = "0.4.0", features = ["tokio"] }
 bytes = "1.2.1"
