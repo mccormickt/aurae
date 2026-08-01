@@ -121,6 +121,19 @@ pub trait PerfBufferReader<T: Clone + Send + 'static> {
                         }
                     };
 
+                    // `AsyncFd` caches readiness: without clearing it the
+                    // next `readable_mut().await` returns immediately and
+                    // this loop spins. `read_events` reports `Ok(read: 0)`
+                    // on an empty buffer rather than `WouldBlock`, so a
+                    // drained read is the signal that we would have
+                    // blocked — clear then, and only then, so a busy
+                    // buffer keeps draining without re-arming epoll for
+                    // every batch.
+                    if events.read == 0 {
+                        guard.clear_ready();
+                        continue;
+                    }
+
                     if events.lost > 0 {
                         error!(
                             "buffer full, dropped {} perf events - this should never happen!",
