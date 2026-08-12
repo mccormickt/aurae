@@ -48,16 +48,24 @@ pub struct Cell {
     state: CellState,
 }
 
+#[derive(Debug)]
+struct CellNetwork {
+    network: Network,
+    allocation: Allocation,
+}
+
+#[derive(Debug)]
+struct PendingCleanup {
+    nested_auraed: Option<NestedAuraed>,
+    cgroup: Option<Cgroup>,
+    cell_network: Option<CellNetwork>,
+}
+
 #[allow(clippy::large_enum_variant)]
 #[derive(Debug)]
 enum CellState {
     Unallocated,
-    CleanupPending {
-        nested_auraed: Option<NestedAuraed>,
-        cgroup: Option<Cgroup>,
-        ipam_allocation: Option<Allocation>,
-        network: Option<Network>,
-    },
+    CleanupPending(PendingCleanup),
     Allocated {
         cgroup: Cgroup,
         nested_auraed: NestedAuraed,
@@ -65,10 +73,7 @@ enum CellState {
         /// `Some` only if `iso_ctl.isolate_network` is set on this cell.
         /// `free()` then releases the IPAM slot and deletes the host-side
         /// primary.
-        ipam_allocation: Option<Allocation>,
-        /// The cell keeps this handle. `free()` can use the
-        /// `Network` of the host without a parameter from the caller.
-        network: Option<Network>,
+        cell_network: Option<CellNetwork>,
     },
     Freed,
 }
@@ -119,59 +124,49 @@ impl Cell {
     /// The allocation stays in the state until both operations succeed.
     async fn release_network(
         cell_name: &CellName,
-        allocation: &mut Option<Allocation>,
-        network: &Option<Network>,
+        cell_network: &mut Option<CellNetwork>,
     ) -> Result<()> {
-        if allocation.is_none() {
+        let Some(resource) = cell_network.as_ref() else {
             return Ok(());
-        }
-        let Some(net) = network.as_ref() else {
-            return Err(CellsError::NetworkUnavailable {
-                cell_name: cell_name.clone(),
-            });
         };
 
-        net.destroy_cell_interface(cell_name).await.map_err(|source| {
-            CellsError::NetworkSetupFailed {
+        resource.network.destroy_cell_interface(cell_name).await.map_err(
+            |source| CellsError::NetworkSetupFailed {
                 cell_name: cell_name.clone(),
                 source: Box::new(source),
-            }
-        })?;
+            },
+        )?;
 
         let key = Self::ipam_key(cell_name);
-        let _released = net.ipam().release(&key).map_err(|source| {
-            CellsError::IpamFailed { cell_name: cell_name.clone(), source }
-        })?;
-        *allocation = None;
+        let _released =
+            resource.network.ipam().release(&key).map_err(|source| {
+                CellsError::IpamFailed { cell_name: cell_name.clone(), source }
+            })?;
+        *cell_network = None;
         Ok(())
     }
 
     async fn retry_pending_cleanup(&mut self) -> Result<()> {
-        let CellState::CleanupPending {
-            nested_auraed,
-            cgroup,
-            ipam_allocation,
-            network,
-        } = &mut self.state
-        else {
+        let CellState::CleanupPending(cleanup) = &mut self.state else {
             return Ok(());
         };
 
-        let process_result = if let Some(auraed) = nested_auraed.as_mut() {
-            auraed.kill().await.map(|_status| ()).map_err(|source| {
-                CellsError::FailedToKillCellChildren {
-                    cell_name: self.cell_name.clone(),
-                    source,
-                }
-            })
-        } else {
-            Ok(())
-        };
+        let process_result =
+            if let Some(auraed) = cleanup.nested_auraed.as_mut() {
+                auraed.kill().await.map(|_status| ()).map_err(|source| {
+                    CellsError::FailedToKillCellChildren {
+                        cell_name: self.cell_name.clone(),
+                        source,
+                    }
+                })
+            } else {
+                Ok(())
+            };
         if process_result.is_ok() {
-            *nested_auraed = None;
+            cleanup.nested_auraed = None;
         }
 
-        let cgroup_result = if let Some(cell_cgroup) = cgroup.as_ref() {
+        let cgroup_result = if let Some(cell_cgroup) = cleanup.cgroup.as_ref() {
             cell_cgroup.delete().map_err(|source| {
                 CellsError::FailedToFreeCell {
                     cell_name: self.cell_name.clone(),
@@ -182,11 +177,11 @@ impl Cell {
             Ok(())
         };
         if cgroup_result.is_ok() {
-            *cgroup = None;
+            cleanup.cgroup = None;
         }
 
         let network_result =
-            Self::release_network(&self.cell_name, ipam_allocation, network)
+            Self::release_network(&self.cell_name, &mut cleanup.cell_network)
                 .await;
 
         process_result?;
@@ -196,19 +191,8 @@ impl Cell {
         Ok(())
     }
 
-    async fn rollback_allocation(
-        &mut self,
-        nested_auraed: Option<NestedAuraed>,
-        cgroup: Option<Cgroup>,
-        ipam_allocation: Option<Allocation>,
-        network: Option<Network>,
-    ) {
-        self.state = CellState::CleanupPending {
-            nested_auraed,
-            cgroup,
-            ipam_allocation,
-            network,
-        };
+    async fn rollback_allocation(&mut self, cleanup: PendingCleanup) {
+        self.state = CellState::CleanupPending(cleanup);
         if let Err(error) = self.retry_pending_cleanup().await {
             warn!("Cell {}: rollback failed: {error}", self.cell_name);
         }
@@ -225,7 +209,7 @@ impl Cell {
     // Here is where we define the "default" cgroup parameters for Aurae cells
     pub(crate) async fn allocate(
         &mut self,
-        network: Option<Network>,
+        host_network: Option<Network>,
     ) -> Result<()> {
         let CellState::Unallocated = &self.state else {
             return Ok(());
@@ -236,19 +220,19 @@ impl Cell {
         // Step 1: reserve an IPAM slot if the cell needs an isolated
         // network. The allocator is part of `Network`. A `Network`
         // handle gives an allocator.
-        let allocation = if self.spec.iso_ctl.isolate_network {
-            let Some(net) = network.as_ref() else {
+        let cell_network = if self.spec.iso_ctl.isolate_network {
+            let Some(network) = host_network.as_ref() else {
                 return Err(CellsError::NetworkUnavailable {
                     cell_name: self.cell_name.clone(),
                 });
             };
-            let allocation = net.ipam().allocate(&key).map_err(|e| {
+            let allocation = network.ipam().allocate(&key).map_err(|e| {
                 CellsError::IpamFailed {
                     cell_name: self.cell_name.clone(),
                     source: e,
                 }
             })?;
-            Some(allocation)
+            Some(CellNetwork { network: network.clone(), allocation })
         } else {
             None
         };
@@ -257,20 +241,22 @@ impl Cell {
         // start of the child. The peer name must be in the environment of
         // the child, and the environment is fixed at the exec. Step 5
         // creates the links.
-        let interface_names = match (&allocation, &network) {
-            (Some(_), Some(net)) => Some(net.reserve_interface_names()),
-            _ => None,
-        };
+        let interface_names = cell_network
+            .as_ref()
+            .map(|cell_network| cell_network.network.reserve_interface_names());
 
         // Step 3: build the CLI arguments. The child auraed parses them at
         // its start and configures its endpoint. It renames the peer to
         // `eth0` and adds the addresses and routes.
-        let net_config = match (allocation.as_ref(), interface_names.as_ref()) {
-            (Some(alloc), Some((_, peer))) => {
-                Some(NetworkConfig::from_allocation(alloc, peer.clone()))
-            }
-            _ => None,
-        };
+        let net_config = cell_network
+            .as_ref()
+            .zip(interface_names.as_ref())
+            .map(|(cell_network, (_, peer))| {
+                NetworkConfig::from_allocation(
+                    &cell_network.allocation,
+                    peer.clone(),
+                )
+            });
 
         // Step 4: spawn the nested auraed.
         let name = self.cell_name.leaf().to_string();
@@ -281,7 +267,12 @@ impl Cell {
         ) {
             Ok(a) => a,
             Err(e) => {
-                self.rollback_allocation(None, None, allocation, network).await;
+                self.rollback_allocation(PendingCleanup {
+                    nested_auraed: None,
+                    cgroup: None,
+                    cell_network,
+                })
+                .await;
                 return Err(CellsError::FailedToAllocateCell {
                     cell_name: self.cell_name.clone(),
                     source: e,
@@ -299,12 +290,11 @@ impl Cell {
         ) {
             Ok(cgroup) => cgroup,
             Err(e) => {
-                self.rollback_allocation(
-                    Some(auraed),
-                    None,
-                    allocation,
-                    network,
-                )
+                self.rollback_allocation(PendingCleanup {
+                    nested_auraed: Some(auraed),
+                    cgroup: None,
+                    cell_network,
+                })
                 .await;
                 return Err(CellsError::AbortedAllocateCell {
                     cell_name: self.cell_name.clone(),
@@ -314,12 +304,11 @@ impl Cell {
         };
 
         if let Err(e) = cgroup.add_task(pid) {
-            self.rollback_allocation(
-                Some(auraed),
-                Some(cgroup),
-                allocation,
-                network,
-            )
+            self.rollback_allocation(PendingCleanup {
+                nested_auraed: Some(auraed),
+                cgroup: Some(cgroup),
+                cell_network,
+            })
             .await;
             return Err(CellsError::AbortedAllocateCell {
                 cell_name: self.cell_name.clone(),
@@ -331,19 +320,18 @@ impl Cell {
 
         // Step 6: create the host-side primary and move the peer into the
         // network namespace of the cell. An error here rolls back all steps.
-        if let (Some(cell_allocation), Some(net), Some((primary, peer))) =
-            (&allocation, &network, &interface_names)
+        if let (Some(cell_network_ref), Some((primary, peer))) =
+            (cell_network.as_ref(), interface_names.as_ref())
         {
             let netns_path = format!("/proc/{}/ns/net", pid.as_raw());
             let netns_file = match File::open(&netns_path) {
                 Ok(f) => f,
                 Err(e) => {
-                    self.rollback_allocation(
-                        Some(auraed),
-                        Some(cgroup),
-                        allocation,
-                        network,
-                    )
+                    self.rollback_allocation(PendingCleanup {
+                        nested_auraed: Some(auraed),
+                        cgroup: Some(cgroup),
+                        cell_network,
+                    })
                     .await;
                     return Err(CellsError::FailedToAllocateCell {
                         cell_name: self.cell_name.clone(),
@@ -351,22 +339,22 @@ impl Cell {
                     });
                 }
             };
-            if let Err(e) = net
+            if let Err(e) = cell_network_ref
+                .network
                 .create_cell_interface(
                     &self.cell_name,
-                    cell_allocation,
+                    &cell_network_ref.allocation,
                     netns_file.as_fd(),
                     primary,
                     peer,
                 )
                 .await
             {
-                self.rollback_allocation(
-                    Some(auraed),
-                    Some(cgroup),
-                    allocation,
-                    network,
-                )
+                self.rollback_allocation(PendingCleanup {
+                    nested_auraed: Some(auraed),
+                    cgroup: Some(cgroup),
+                    cell_network,
+                })
                 .await;
                 return Err(CellsError::NetworkSetupFailed {
                     cell_name: self.cell_name.clone(),
@@ -387,12 +375,11 @@ impl Cell {
             wait_for_client_socket(&auraed.client_socket, CHILD_READY_TIMEOUT)
                 .await
         {
-            self.rollback_allocation(
-                Some(auraed),
-                Some(cgroup),
-                allocation,
-                network,
-            )
+            self.rollback_allocation(PendingCleanup {
+                nested_auraed: Some(auraed),
+                cgroup: Some(cgroup),
+                cell_network,
+            })
             .await;
             return Err(CellsError::FailedToAllocateCell {
                 cell_name: self.cell_name.clone(),
@@ -403,9 +390,8 @@ impl Cell {
         self.state = CellState::Allocated {
             cgroup,
             nested_auraed: auraed,
-            children: Cells::new(self.cell_name.clone(), network.clone()),
-            ipam_allocation: allocation,
-            network,
+            children: Cells::new(self.cell_name.clone(), host_network),
+            cell_network,
         };
 
         Ok(())
@@ -415,7 +401,7 @@ impl Cell {
     ///
     /// The state stays allocated if a cleanup step fails.
     pub(crate) async fn free(&mut self) -> Result<()> {
-        if matches!(self.state, CellState::CleanupPending { .. }) {
+        if matches!(self.state, CellState::CleanupPending(_)) {
             return self.retry_pending_cleanup().await;
         }
 
@@ -423,8 +409,7 @@ impl Cell {
             cgroup,
             nested_auraed,
             children,
-            ipam_allocation,
-            network,
+            cell_network,
         } = &mut self.state
         {
             let children_teardown = children.broadcast_free().await;
@@ -435,12 +420,8 @@ impl Cell {
                 cgroup,
                 signal_result,
             );
-            let network_teardown = Self::release_network(
-                &self.cell_name,
-                ipam_allocation,
-                network,
-            )
-            .await;
+            let network_teardown =
+                Self::release_network(&self.cell_name, cell_network).await;
             teardown?;
             network_teardown?;
             children_teardown?;
@@ -452,7 +433,7 @@ impl Cell {
 
     /// Kill a cell and release all resources.
     pub(crate) async fn kill(&mut self) -> Result<()> {
-        if matches!(self.state, CellState::CleanupPending { .. }) {
+        if matches!(self.state, CellState::CleanupPending(_)) {
             return self.retry_pending_cleanup().await;
         }
 
@@ -460,8 +441,7 @@ impl Cell {
             cgroup,
             nested_auraed,
             children,
-            ipam_allocation,
-            network,
+            cell_network,
         } = &mut self.state
         {
             let children_teardown = children.broadcast_kill().await;
@@ -472,12 +452,8 @@ impl Cell {
                 cgroup,
                 signal_result,
             );
-            let network_teardown = Self::release_network(
-                &self.cell_name,
-                ipam_allocation,
-                network,
-            )
-            .await;
+            let network_teardown =
+                Self::release_network(&self.cell_name, cell_network).await;
             teardown?;
             network_teardown?;
             children_teardown?;
@@ -499,8 +475,8 @@ impl Cell {
 
     pub(super) fn signal_kill_for_drop(&mut self) {
         match &mut self.state {
-            CellState::CleanupPending { nested_auraed, .. } => {
-                if let Some(auraed) = nested_auraed.as_mut() {
+            CellState::CleanupPending(cleanup) => {
+                if let Some(auraed) = cleanup.nested_auraed.as_mut() {
                     let _best_effort = auraed.signal_kill_for_drop();
                 }
             }
@@ -513,20 +489,14 @@ impl Cell {
     }
 
     pub(super) fn reap_kill_for_drop(&mut self, deadline: Instant) {
-        if let CellState::CleanupPending {
-            nested_auraed,
-            cgroup,
-            ipam_allocation,
-            ..
-        } = &mut self.state
-        {
-            if let Some(auraed) = nested_auraed.as_mut() {
+        if let CellState::CleanupPending(cleanup) = &mut self.state {
+            if let Some(auraed) = cleanup.nested_auraed.as_mut() {
                 let _best_effort = auraed.reap_for_drop(deadline);
             }
-            if let Some(cell_cgroup) = cgroup.as_ref() {
+            if let Some(cell_cgroup) = cleanup.cgroup.as_ref() {
                 let _best_effort = cell_cgroup.delete();
             }
-            if ipam_allocation.is_some() {
+            if cleanup.cell_network.is_some() {
                 warn!(
                     "Cell {}: retained the network allocation during Drop",
                     self.cell_name
@@ -539,7 +509,7 @@ impl Cell {
             cgroup,
             nested_auraed,
             children,
-            ipam_allocation,
+            cell_network,
             ..
         } = &mut self.state
         else {
@@ -553,7 +523,7 @@ impl Cell {
             cgroup,
             signal_result,
         );
-        if ipam_allocation.is_some() {
+        if cell_network.is_some() {
             warn!(
                 "Cell {}: retained the network allocation during Drop",
                 self.cell_name
@@ -721,12 +691,14 @@ mod tests {
         let key = Cell::ipam_key(&cell_name);
         let allocation = network.ipam().allocate(&key).expect("allocation");
         let mut cell = Cell::new(cell_name, CellSpec::new_for_tests());
-        cell.state = CellState::CleanupPending {
+        cell.state = CellState::CleanupPending(PendingCleanup {
             nested_auraed: None,
             cgroup: None,
-            ipam_allocation: Some(allocation),
-            network: Some(network.clone()),
-        };
+            cell_network: Some(CellNetwork {
+                network: network.clone(),
+                allocation,
+            }),
+        });
 
         cell.free().await.expect("cleanup");
 
