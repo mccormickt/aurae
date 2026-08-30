@@ -38,8 +38,10 @@ use validation::ValidationError;
 /// The default ULA pool fd00:ae::/64. The digits "ae" are for aurae.
 pub const DEFAULT_POOL_V6: &str = "fd00:ae::/64";
 
-/// The default device prefix /128 gives one address to each device.
-pub const DEFAULT_DEVICE_PREFIX_V6: u8 = 128;
+/// The default device prefix /112 delegates a 16-bit block to each cell.
+/// The cell binds only the block's first address at /128 and can
+/// sub-delegate the remainder to nested VMs.
+pub const DEFAULT_DEVICE_PREFIX_V6: u8 = 112;
 
 /// The runtime errors of the IPAM allocator. A construction error, for
 /// example a parse error or an invalid prefix range, uses
@@ -63,8 +65,10 @@ pub type Result<T> = std::result::Result<T, IpamError>;
 /// `pool_prefix <= device_prefix`.
 #[derive(Debug, Clone)]
 pub struct IpamConfig {
-    pub(crate) pool_v6: Ipv6Net,
-    pub(crate) device_prefix_v6: u8,
+    /// The complete pool from which cell delegations are allocated.
+    pub pool_v6: Ipv6Net,
+    /// The prefix length of each block delegated to a cell.
+    pub device_prefix_v6: u8,
 }
 
 impl Default for IpamConfig {
@@ -78,6 +82,8 @@ impl Default for IpamConfig {
 }
 
 impl IpamConfig {
+    /// Validate and build a pool configuration. `device_prefix_v6` must be
+    /// between the pool prefix length and 128, inclusive.
     pub fn new(
         pool_v6: Ipv6Net,
         device_prefix_v6: u8,
@@ -290,17 +296,17 @@ mod tests {
         let ipam = Ipam::default();
         let alloc = ipam.allocate("a1").unwrap();
 
-        // The first guest is fd00:ae::2. The host gateway fd00:ae::1 is
-        // the same on each endpoint.
+        // The first guest is the base of block 1 at /112. The host gateway
+        // fd00:ae::1 is the same on each endpoint.
         assert_eq!(
             alloc.guest_ip,
-            Ipv6Addr::new(0xfd00, 0x00ae, 0, 0, 0, 0, 0, 2)
+            Ipv6Addr::new(0xfd00, 0x00ae, 0, 0, 0, 0, 1, 0)
         );
         assert_eq!(
             alloc.host_ip,
             Ipv6Addr::new(0xfd00, 0x00ae, 0, 0, 0, 0, 0, 1)
         );
-        assert_eq!(alloc.delegated.prefix_len(), 128);
+        assert_eq!(alloc.delegated.prefix_len(), 112);
     }
 
     #[test]
@@ -311,7 +317,7 @@ mod tests {
 
         assert_eq!(
             alloc2.guest_ip,
-            Ipv6Addr::new(0xfd00, 0x00ae, 0, 0, 0, 0, 0, 3)
+            Ipv6Addr::new(0xfd00, 0x00ae, 0, 0, 0, 0, 2, 0)
         );
         assert_eq!(alloc1.host_ip, alloc2.host_ip);
     }
@@ -411,11 +417,11 @@ mod tests {
         assert_eq!(reused.guest_ip, alloc1.guest_ip);
 
         // The reuse stack is now empty. a4 comes from `next_block`.
-        // That index is 4, because a1 took 2 and a2 took 3.
+        // That index is 3, because a1 took block 1 and a2 took block 2.
         let fresh = ipam.allocate("a4").unwrap();
         assert_eq!(
             fresh.guest_ip,
-            Ipv6Addr::new(0xfd00, 0x00ae, 0, 0, 0, 0, 0, 4)
+            Ipv6Addr::new(0xfd00, 0x00ae, 0, 0, 0, 0, 3, 0)
         );
     }
 

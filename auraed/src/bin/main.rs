@@ -37,15 +37,19 @@
 // Keep the entrypoint warnings clean even when clippy isn't run separately.
 #![warn(clippy::all, clippy::pedantic, clippy::unwrap_used)]
 
-use auraed::{AuraedRuntime, NetworkConfig, prep_oci_spec_for_spawn, run};
+use auraed::{
+    AuraedRuntime, IpamConfig, NetworkConfig, prep_oci_spec_for_spawn,
+    run_with_network,
+};
 use clap::{Parser, Subcommand};
+use ipnet::Ipv6Net;
 use std::net::Ipv6Addr;
 use std::path::PathBuf;
 use std::process::ExitCode;
 use tracing::{error, info};
 
 const DEFAULT_INTERFACE_NAME: &str = "eth0";
-const DEFAULT_GUEST_PREFIX_V6: u8 = 128;
+const DEFAULT_DELEGATED_PREFIX_V6: u8 = 128;
 
 /// Command line options for auraed.
 ///
@@ -102,6 +106,17 @@ struct AuraedOptions {
     /// Run auraed as a nested instance of itself in an Aurae cell.
     #[clap(long)]
     nested: bool,
+    /// Enable host-side cell networking. This opt-in changes host routing,
+    /// nftables, and IPv6 forwarding state while auraed is running.
+    #[clap(long)]
+    cell_networking: bool,
+    /// IPv6 pool delegated to cells. Requires `--cell-networking`.
+    #[clap(long, value_parser, requires = "cell_networking")]
+    cell_network_pool_v6: Option<Ipv6Net>,
+    /// Prefix length of each block delegated to a cell. The default /112
+    /// leaves 16 bits for VMs nested in that cell.
+    #[clap(long, value_parser, requires = "cell_networking")]
+    cell_network_prefix_v6: Option<u8>,
     /// The IPv6 gateway address of the auraed endpoint. The parent auraed
     /// sets it for a nested auraed in an isolated cell network namespace. The VM boot
     /// path also sets it. The daemon binds the related
@@ -113,11 +128,10 @@ struct AuraedOptions {
     /// necessary if another `--net-*` flag is set.
     #[clap(long, value_parser)]
     net_guest_ip_v6: Option<Ipv6Addr>,
-    /// The prefix length of `--net-guest-ip-v6`. The default is 128 and
-    /// gives one address. Use a shorter prefix, for example 80, to give a
-    /// delegated prefix to a nested auraed or to a VM.
-    #[clap(long, value_parser)]
-    net_guest_prefix_v6: Option<u8>,
+    /// The prefix length of the block delegated to this endpoint. The
+    /// endpoint itself always binds `--net-guest-ip-v6` at /128.
+    #[clap(long, value_parser, alias = "net-guest-prefix-v6")]
+    net_delegated_prefix_v6: Option<u8>,
     /// The interface name that the daemon waits for at its start. The
     /// daemon then renames the interface to `eth0`. The parent gives a
     /// cell a unique peer name, for example `nk-a1b2c3d4-p`. A VM usually
@@ -174,9 +188,12 @@ async fn handle_default(
         library_dir,
         verbose,
         nested,
+        cell_networking,
+        cell_network_pool_v6,
+        cell_network_prefix_v6,
         net_host_ip_v6,
         net_guest_ip_v6,
-        net_guest_prefix_v6,
+        net_delegated_prefix_v6,
         net_interface_name,
         subcmd: _,
     } = options;
@@ -189,8 +206,8 @@ async fn handle_default(
         (Some(host_v6), Some(guest_v6)) => Some(NetworkConfig {
             host_v6,
             guest_v6,
-            guest_prefix_len_v6: net_guest_prefix_v6
-                .unwrap_or(DEFAULT_GUEST_PREFIX_V6),
+            delegated_prefix_len_v6: net_delegated_prefix_v6
+                .unwrap_or(DEFAULT_DELEGATED_PREFIX_V6),
             interface_name: net_interface_name
                 .unwrap_or_else(|| DEFAULT_INTERFACE_NAME.to_string()),
         }),
@@ -200,6 +217,16 @@ async fn handle_default(
                         --net-guest-ip-v6 must be set together"
                 .into());
         }
+    };
+
+    let host_ipam_config = if cell_networking {
+        let defaults = IpamConfig::default();
+        Some(IpamConfig::new(
+            cell_network_pool_v6.unwrap_or(defaults.pool_v6),
+            cell_network_prefix_v6.unwrap_or(defaults.device_prefix_v6),
+        )?)
+    } else {
+        None
     };
 
     // Destructure the default runtime into individual variables
@@ -223,7 +250,15 @@ async fn handle_default(
     };
 
     // Run the auraed daemon with the configured runtime
-    run(runtime, socket, verbose, nested, net_config).await?;
+    run_with_network(
+        runtime,
+        socket,
+        verbose,
+        nested,
+        net_config,
+        host_ipam_config,
+    )
+    .await?;
     Ok(())
 }
 

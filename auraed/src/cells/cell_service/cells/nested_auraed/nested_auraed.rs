@@ -49,6 +49,30 @@ fn reap_timed_out(pid: i32) -> io::Error {
     )
 }
 
+fn cleanup_failed_spawn(pid: i32, pidfd: Option<&OwnedFd>) {
+    let signaled = pidfd.is_some_and(|pidfd| {
+        (unsafe {
+            libc::syscall(
+                libc::SYS_pidfd_send_signal,
+                pidfd.as_raw_fd(),
+                SIGKILL as libc::c_int,
+                std::ptr::null::<libc::siginfo_t>(),
+                0,
+            )
+        }) == 0
+    });
+    if !signaled {
+        let _ = nix::sys::signal::kill(Pid::from_raw(pid), SIGKILL);
+    }
+    loop {
+        match waitpid(Pid::from_raw(pid), None) {
+            Ok(_) | Err(Errno::ECHILD) => break,
+            Err(Errno::EINTR) => continue,
+            Err(_) => break,
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct NestedAuraed {
     process: procfs::process::Process,
@@ -169,12 +193,26 @@ impl NestedAuraed {
         }
 
         // Execute the clone system call and create the new process with the relevant namespaces.
+        let parent_pid = unsafe { libc::getpid() };
         match unsafe { clone.call() }? {
             0 => {
                 // child
                 let command = {
                     unsafe {
                         command.pre_exec(move || {
+                            if libc::prctl(
+                                libc::PR_SET_PDEATHSIG,
+                                libc::SIGKILL,
+                            ) == -1
+                            {
+                                return Err(io::Error::last_os_error());
+                            }
+                            if libc::getppid() != parent_pid {
+                                return Err(io::Error::new(
+                                    io::ErrorKind::BrokenPipe,
+                                    "parent auraed exited before child exec",
+                                ));
+                            }
                             isolation.isolate_process(&iso_ctl)?;
                             isolation.isolate_network(&iso_ctl)?;
                             Ok(())
@@ -182,22 +220,31 @@ impl NestedAuraed {
                     }
                 };
 
-                let e = command.exec();
-                error!("Unexpected exit from child command: {e:#?}");
-                Err(e)
+                // `CLONE_VFORK` suspends the parent while this child shares
+                // its address space. If exec fails, do not unwind or return
+                // into the parent's Rust/Tokio control flow. The parent
+                // observes the exited child and rolls the allocation back.
+                let _exec_error = command.exec();
+                unsafe { libc::_exit(127) }
             }
             pid => {
                 // parent
                 info!("Nested auraed running with host pid {}", pid.clone());
                 if pidfd < 0 {
+                    cleanup_failed_spawn(pid, None);
                     return Err(io::Error::other(
                         "clone3 did not return a pidfd",
                     ));
                 }
                 // clone3 created this descriptor for the parent.
                 let pidfd = unsafe { OwnedFd::from_raw_fd(pidfd) };
-                let process = procfs::process::Process::new(pid)
-                    .map_err(io::Error::other)?;
+                let process = match procfs::process::Process::new(pid) {
+                    Ok(process) => process,
+                    Err(error) => {
+                        cleanup_failed_spawn(pid, Some(&pidfd));
+                        return Err(io::Error::other(error));
+                    }
+                };
 
                 Ok(Self {
                     process,
@@ -433,6 +480,14 @@ impl NestedAuraed {
 
     pub fn pid(&self) -> Pid {
         Pid::from_raw(self.process.pid)
+    }
+}
+
+impl Drop for NestedAuraed {
+    fn drop(&mut self) {
+        let deadline = Instant::now() + REAP_TIMEOUT;
+        let _ = self.signal_kill_for_drop();
+        let _ = self.reap_for_drop(deadline);
     }
 }
 

@@ -24,11 +24,11 @@
 use super::netlink::{
     configure_routed_endpoint, get_link_index, netlink_errno,
 };
-use super::{Network, NetworkError};
+use super::{CELL_INTERFACE_ALIAS, Network, NetworkError};
 use crate::cells::cell_service::cells::CellName;
 use crate::init::network::ipam::Allocation;
 use ipnet::Ipv6Net;
-use netlink_packet_route::link::{NetkitMode, NetkitPolicy};
+use netlink_packet_route::link::{LinkAttribute, NetkitMode, NetkitPolicy};
 use nix::libc;
 use rtnetlink::{LinkNetkit, LinkUnspec};
 use std::os::fd::{AsRawFd, BorrowedFd};
@@ -107,6 +107,9 @@ impl Network {
                 LinkNetkit::new(primary, peer, NetkitMode::L3)
                     .policy(NetkitPolicy::Pass)
                     .peer_policy(NetkitPolicy::Pass)
+                    .append_extra_attribute(LinkAttribute::IfAlias(
+                        CELL_INTERFACE_ALIAS.to_string(),
+                    ))
                     .build(),
             )
             .execute()
