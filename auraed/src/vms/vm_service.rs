@@ -21,21 +21,39 @@ use proto::vms::{
     VmServiceListResponse, VmServiceStartRequest, VmServiceStartResponse,
     VmServiceStopRequest, VmServiceStopResponse, vm_service_server,
 };
-use std::{path::PathBuf, sync::Arc};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 use tokio::sync::Mutex;
 use tonic::{Request, Response, Status};
 use tracing::error;
 use validation::ValidatedField;
 
 use crate::cells::cell_service::cells::{CellName, Cells};
+use crate::init::Context;
 use crate::init::network::Network;
 
 use super::{
+    VmControlToken,
     error::{Result, VmServiceError},
     proxy::proxy_to_cell,
     virtual_machine::{MountSpec, VmID, VmSpec},
     virtual_machines::VirtualMachines,
 };
+
+const VM_CONTROL_TOKEN_HEADER: &str = "x-aurae-vm-control";
+
+#[derive(Debug, Clone)]
+enum VmServiceAccess {
+    /// The daemon's externally authenticated server owns this service.
+    Host,
+    /// A nested auraed accepts only the capability inherited from its host.
+    Cell(VmControlToken),
+    /// Other contexts and manually started nested daemons fail closed.
+    Disabled,
+}
 
 /// VmService struct manages the lifecycle of virtual machines.
 #[derive(Debug, Clone)]
@@ -48,6 +66,8 @@ pub struct VmService {
     /// Shared with `CellService` so `cell_name`-scoped requests can be
     /// proxied into a nested auraed.
     cells: Arc<Mutex<Cells>>,
+    access: VmServiceAccess,
+    artifact_root: PathBuf,
     // TODO: ObserveService
 }
 
@@ -62,11 +82,44 @@ impl VmService {
     /// `cells` is shared with [`crate::cells::CellService`] so that
     /// `cell_name`-scoped VM RPCs can look up the target cell's client
     /// socket and proxy the request.
-    pub fn new(network: Option<Network>, cells: Arc<Mutex<Cells>>) -> Self {
+    pub fn new(
+        network: Option<Network>,
+        cells: Arc<Mutex<Cells>>,
+        context: Context,
+        control_token: Option<VmControlToken>,
+        artifact_root: PathBuf,
+    ) -> Self {
+        let access = match (context, control_token) {
+            (Context::Daemon, _) => VmServiceAccess::Host,
+            (Context::Cell, Some(token)) => VmServiceAccess::Cell(token),
+            _ => VmServiceAccess::Disabled,
+        };
         Self {
             vms: Arc::new(Mutex::new(VirtualMachines::new(network.clone()))),
             network,
             cells,
+            access,
+            artifact_root,
+        }
+    }
+
+    fn authorize<T>(&self, request: &Request<T>) -> Result<()> {
+        match &self.access {
+            VmServiceAccess::Host => Ok(()),
+            VmServiceAccess::Cell(expected)
+                if request
+                    .metadata()
+                    .get(VM_CONTROL_TOKEN_HEADER)
+                    .and_then(|value| value.to_str().ok())
+                    == Some(expected.expose_secret()) =>
+            {
+                Ok(())
+            }
+            VmServiceAccess::Cell(_) | VmServiceAccess::Disabled => {
+                Err(VmServiceError::ProxiedStatus(Status::permission_denied(
+                    "VmService requires the parent cell-control capability",
+                )))
+            }
         }
     }
 
@@ -100,8 +153,6 @@ impl VmService {
             return Err(VmServiceError::NetworkingUnavailable);
         }
 
-        let mut vms = self.vms.lock().await;
-
         let Some(vm) = request.machine else {
             return Err(VmServiceError::MissingMachineConfig {});
         };
@@ -112,23 +163,40 @@ impl VmService {
         };
 
         let mut mounts = vec![MountSpec {
-            host_path: PathBuf::from(root_drive.image_path.as_str()),
+            host_path: validate_artifact_path(
+                &self.artifact_root,
+                &root_drive.image_path,
+            )?,
             read_only: root_drive.read_only,
         }];
-        mounts.extend(vm.drive_mounts.into_iter().map(|m| MountSpec {
-            host_path: PathBuf::from(m.image_path.as_str()),
-            read_only: m.read_only,
-        }));
+        mounts.extend(
+            vm.drive_mounts
+                .into_iter()
+                .map(|mount| {
+                    Ok(MountSpec {
+                        host_path: validate_artifact_path(
+                            &self.artifact_root,
+                            &mount.image_path,
+                        )?,
+                        read_only: mount.read_only,
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?,
+        );
 
         let spec = VmSpec {
             memory_size: vm.mem_size_mb,
             vcpu_count: vm.vcpu_count,
-            kernel_image_path: PathBuf::from(vm.kernel_img_path.as_str()),
+            kernel_image_path: validate_artifact_path(
+                &self.artifact_root,
+                &vm.kernel_img_path,
+            )?,
             kernel_args: vm.kernel_args,
             mounts,
             net: vec![],
         };
 
+        let mut vms = self.vms.lock().await;
         let vm = vms.create(id.clone(), spec).map_err(|e| {
             VmServiceError::FailedToAllocateError { id, source: e }
         })?;
@@ -188,50 +256,43 @@ impl VmService {
         }
 
         let id = VmID::new(request.vm_id);
+        let network = self
+            .network
+            .as_ref()
+            .ok_or(VmServiceError::NetworkingUnavailable)?;
+        let mut vms = self.vms.lock().await;
 
-        // Phase 1: boot the VM under the lock and extract the host-side TAP
-        // to configure. `start_boot` does no awaiting, so the lock is held
-        // only for the (fast) Cloud Hypervisor boot call.
-        let tap_endpoint = {
-            let mut vms = self.vms.lock().await;
-            vms.start_boot(&id).map_err(|e| {
-                VmServiceError::FailedToStartError { id: id.clone(), source: e }
-            })?
-        };
+        // Retain the VM lock through TAP setup. Otherwise a concurrent Free
+        // can delete this VM, recycle its address, and let Start configure
+        // the old TAP for a new allocation (an ABA race).
+        let tap_endpoint = vms.start_boot(&id).map_err(|e| {
+            VmServiceError::FailedToStartError { id: id.clone(), source: e }
+        })?;
 
-        // Phase 2: configure the host side of the TAP *without* holding the
-        // VMs lock. This waits for the device to appear and brings the link
-        // up (a multi-second operation); serializing all VM RPCs behind it
-        // would needlessly block unrelated VMs.
-        if let Some(endpoint) = tap_endpoint {
-            let network = self
-                .network
-                .as_ref()
-                .ok_or(VmServiceError::NetworkingUnavailable)?;
-            if let Err(e) = network
+        if let Some(endpoint) = tap_endpoint
+            && let Err(e) = network
                 .configure_tap_endpoint(
                     &endpoint.tap,
                     endpoint.host_ip,
                     endpoint.delegated,
                 )
                 .await
-            {
-                error!(
-                    "Failed to configure TAP endpoint for VM {id}: {e}. \
-                     Tearing down."
-                );
-                // Phase 3: roll back under the lock — stop + delete the VM,
-                // drop it from the cache, release its IPAM slot.
-                self.vms.lock().await.rollback_failed_start(&id);
-                return Err(VmServiceError::FailedToStartError {
-                    id,
-                    source: anyhow!("Failed to configure TAP endpoint: {e}"),
-                });
-            }
+        {
+            error!(
+                "Failed to configure TAP endpoint for VM {id}: {e}. \
+                 Tearing down."
+            );
+            let source = match vms.rollback_failed_start(&id) {
+                Ok(()) => anyhow!("Failed to configure TAP endpoint: {e}"),
+                Err(cleanup) => anyhow!(
+                    "Failed to configure TAP endpoint: {e}; rollback also \
+                     failed and VM state was retained for retry: {cleanup}"
+                ),
+            };
+            return Err(VmServiceError::FailedToStartError { id, source });
         }
 
-        // Phase 4: read back the guest auraed address.
-        let addr = self.vms.lock().await.guest_socket(&id).unwrap_or_default();
+        let addr = vms.guest_socket(&id).unwrap_or_default();
 
         Ok(VmServiceStartResponse { auraed_address: addr })
     }
@@ -352,12 +413,40 @@ fn validated_cell_name(
     }
 }
 
+/// Resolve a VM artifact to a regular file below the daemon-owned VM root.
+/// Passing the canonical path to Cloud Hypervisor avoids a later symlink
+/// traversal after this validation.
+fn validate_artifact_path(root: &Path, requested: &str) -> Result<PathBuf> {
+    let invalid = |source| VmServiceError::InvalidArtifactPath {
+        path: requested.to_string(),
+        source,
+    };
+    let root = fs::canonicalize(root).map_err(|e| {
+        invalid(anyhow!("artifact root {}: {e}", root.display()))
+    })?;
+    let path = fs::canonicalize(requested)
+        .map_err(|e| invalid(anyhow!("could not resolve path: {e}")))?;
+    if !path.starts_with(&root) {
+        return Err(invalid(anyhow!(
+            "resolved path escapes {}",
+            root.display()
+        )));
+    }
+    let metadata = fs::metadata(&path)
+        .map_err(|e| invalid(anyhow!("could not inspect path: {e}")))?;
+    if !metadata.file_type().is_file() {
+        return Err(invalid(anyhow!("path is not a regular file")));
+    }
+    Ok(path)
+}
+
 #[tonic::async_trait]
 impl vm_service_server::VmService for VmService {
     async fn allocate(
         &self,
         request: Request<VmServiceAllocateRequest>,
     ) -> std::result::Result<Response<VmServiceAllocateResponse>, Status> {
+        self.authorize(&request)?;
         let req = request.into_inner();
         Ok(Response::new(self.allocate(req).await?))
     }
@@ -366,6 +455,7 @@ impl vm_service_server::VmService for VmService {
         &self,
         request: Request<VmServiceFreeRequest>,
     ) -> std::result::Result<Response<VmServiceFreeResponse>, Status> {
+        self.authorize(&request)?;
         let req = request.into_inner();
         Ok(Response::new(self.free(req).await?))
     }
@@ -374,6 +464,7 @@ impl vm_service_server::VmService for VmService {
         &self,
         request: Request<VmServiceStartRequest>,
     ) -> std::result::Result<Response<VmServiceStartResponse>, Status> {
+        self.authorize(&request)?;
         let req = request.into_inner();
         Ok(Response::new(self.start(req).await?))
     }
@@ -382,6 +473,7 @@ impl vm_service_server::VmService for VmService {
         &self,
         request: Request<VmServiceStopRequest>,
     ) -> std::result::Result<Response<VmServiceStopResponse>, Status> {
+        self.authorize(&request)?;
         let req = request.into_inner();
         Ok(Response::new(self.stop(req).await?))
     }
@@ -390,7 +482,70 @@ impl vm_service_server::VmService for VmService {
         &self,
         request: Request<VmServiceListRequest>,
     ) -> std::result::Result<Response<VmServiceListResponse>, Status> {
+        self.authorize(&request)?;
         let req = request.into_inner();
         Ok(Response::new(self.list(req).await?))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::symlink;
+
+    #[test]
+    fn nested_vm_service_requires_matching_control_capability() {
+        let token = VmControlToken::from_secret("secret".into());
+        let service = VmService::new(
+            None,
+            Arc::new(Mutex::new(Cells::new_root(None))),
+            Context::Cell,
+            Some(token.clone()),
+            "/var/lib/aurae/vm".into(),
+        );
+
+        let missing = Request::new(());
+        assert!(service.authorize(&missing).is_err());
+
+        let mut wrong = Request::new(());
+        let _ = wrong.metadata_mut().insert(
+            VM_CONTROL_TOKEN_HEADER,
+            "wrong".parse().expect("metadata token"),
+        );
+        assert!(service.authorize(&wrong).is_err());
+
+        let mut matching = Request::new(());
+        let _ = matching.metadata_mut().insert(
+            VM_CONTROL_TOKEN_HEADER,
+            token.expose_secret().parse().expect("metadata token"),
+        );
+        assert!(service.authorize(&matching).is_ok());
+    }
+
+    #[test]
+    fn artifact_path_must_resolve_to_regular_file_below_vm_root() {
+        let temp = tempfile::tempdir().expect("temporary directory");
+        let root = temp.path().join("vm");
+        fs::create_dir(&root).expect("VM root");
+        let kernel = root.join("kernel");
+        fs::write(&kernel, b"kernel").expect("kernel image");
+        assert_eq!(
+            validate_artifact_path(&root, kernel.to_str().expect("UTF-8 path"))
+                .expect("allowed artifact"),
+            kernel
+        );
+
+        let outside = temp.path().join("outside");
+        fs::write(&outside, b"host file").expect("outside file");
+        let escape = root.join("escape");
+        symlink(&outside, &escape).expect("escape symlink");
+        assert!(
+            validate_artifact_path(&root, escape.to_str().expect("UTF-8 path"))
+                .is_err()
+        );
+        assert!(
+            validate_artifact_path(&root, root.to_str().expect("UTF-8 path"))
+                .is_err()
+        );
     }
 }
