@@ -21,13 +21,16 @@
 use crate::AuraeSocket;
 use crate::config::{AuraeConfig, CertMaterial, ClientCertDetails};
 use hyper_util::rt::TokioIo;
+use std::fmt;
 use thiserror::Error;
 use tokio::net::{TcpStream, UnixStream};
+use tonic::metadata::AsciiMetadataValue;
 use tonic::transport::{Certificate, Channel, ClientTlsConfig, Identity, Uri};
 use tower::service_fn;
 
 const KNOWN_IGNORED_SOCKET_ADDR: &str = "hxxp://null";
 const KNOWN_IGNORED_TLS_SOCKET_ADDR: &str = "https://null";
+pub(crate) const VM_CONTROL_TOKEN_HEADER: &str = "x-aurae-vm-control";
 
 type Result<T> = std::result::Result<T, ClientError>;
 
@@ -40,12 +43,24 @@ pub enum ClientError {
 }
 
 /// Instance of a single client for an Aurae consumer.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct Client {
     /// The channel used for gRPC connections before encryption is handled.
     pub(crate) channel: Channel,
     #[allow(unused)]
     client_cert_details: Option<ClientCertDetails>,
+    /// Present only on the private host-to-cell VmService path.
+    pub(crate) vm_control_token: Option<AsciiMetadataValue>,
+}
+
+impl fmt::Debug for Client {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Client")
+            .field("channel", &self.channel)
+            .field("client_cert_details", &self.client_cert_details)
+            .field("has_vm_control_token", &self.vm_control_token.is_some())
+            .finish()
+    }
 }
 
 impl Client {
@@ -74,7 +89,7 @@ impl Client {
 
         let channel =
             Self::connect_chan(system.socket.clone(), Some(tls_config)).await?;
-        Ok(Self { channel, client_cert_details })
+        Ok(Self { channel, client_cert_details, vm_control_token: None })
     }
 
     /// Create a new Client without TLS, remote server should also expect no TLS.
@@ -83,7 +98,20 @@ impl Client {
     pub async fn new_no_tls(socket: AuraeSocket) -> Result<Self> {
         let channel = Self::connect_chan(socket, None).await?;
         let client_cert_details = None;
-        Ok(Self { channel, client_cert_details })
+        Ok(Self { channel, client_cert_details, vm_control_token: None })
+    }
+
+    /// Create a no-TLS client carrying the capability required by the
+    /// VmService of a nested auraed. The token is never included in `Debug`.
+    pub async fn new_no_tls_with_vm_control_token(
+        socket: AuraeSocket,
+        token: &str,
+    ) -> Result<Self> {
+        let mut client = Self::new_no_tls(socket).await?;
+        client.vm_control_token = Some(token.parse().map_err(|e| {
+            anyhow::anyhow!("invalid VM control token metadata: {e}")
+        })?);
+        Ok(client)
     }
 
     async fn connect_chan(

@@ -98,7 +98,7 @@ use tokio::task::JoinHandle;
 use tonic::transport::server::Connected;
 use tonic::transport::{Certificate, Identity, Server, ServerTlsConfig};
 use tracing::{error, info, trace, warn};
-use vms::VmService;
+use vms::{VmControlToken, VmService};
 
 mod auraed_path;
 mod cells;
@@ -174,11 +174,29 @@ pub async fn run(
     nested: bool,
     net_config: Option<NetworkConfig>,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    run_with_vm_control(runtime, socket, verbose, nested, net_config, None)
+        .await
+}
+
+/// Starts the runtime loop with a capability inherited by a nested auraed.
+///
+/// This is public only for the `auraed` binary; ordinary embedders should use
+/// [`run`]. A host daemon passes the capability through an anonymous pipe.
+#[doc(hidden)]
+pub async fn run_with_vm_control(
+    runtime: AuraedRuntime,
+    socket: Option<String>,
+    verbose: bool,
+    nested: bool,
+    net_config: Option<NetworkConfig>,
+    vm_control_token: Option<String>,
+) -> Result<(), Box<dyn std::error::Error>> {
     async fn inner<T, IO, IE>(
         runtime: &AuraedRuntime,
         context: AuraeContext,
         socket_stream: T,
         net_config: Option<NetworkConfig>,
+        vm_control_token: Option<VmControlToken>,
     ) -> Result<(), Box<dyn std::error::Error>>
     where
         T: tokio_stream::Stream<Item = Result<IO, IE>> + Send + 'static,
@@ -300,8 +318,8 @@ pub async fn run(
             // handle binds to the netns of the cell, where it already runs.
             // Without the `--net-*` flags the cell has no isolated network,
             // the value stays `None`, and the daemon refuses each VM RPC.
-            // `build_nested_network` documents the guard limit for a nested
-            // cell.
+            // `build_nested_network` also installs the per-child source
+            // filter inside this cell's network namespace.
             AuraeContext::Cell => build_nested_network(net_config.as_ref()),
             _ => None,
         };
@@ -341,7 +359,13 @@ pub async fn run(
         // inside its cell. `cell_name`-scoped requests are proxied from the
         // host into the target cell's nested auraed, which then hosts the VM
         // locally out of its delegated prefix.
-        let vm_service = VmService::new(network, cells_handle);
+        let vm_service = VmService::new(
+            network,
+            cells_handle,
+            context,
+            vm_control_token,
+            runtime.library_dir.join("vm"),
+        );
         let vm_service_server = VmServiceServer::new(vm_service.clone());
         health_reporter.set_serving::<VmServiceServer<VmService>>().await;
 
@@ -403,6 +427,7 @@ pub async fn run(
     }
 
     let runtime = AURAED_RUNTIME.get_or_init(|| runtime);
+    let vm_control_token = vm_control_token.map(VmControlToken::from_secret);
 
     // `init` consumes `net_config` to configure this auraed's own endpoint
     // (eth0) from inside its netns; clone it so `inner` can also seed a
@@ -412,10 +437,24 @@ pub async fn run(
         init::init(verbose, nested, socket, net_config).await;
     match stream {
         SocketStream::Tcp(stream) => {
-            inner(runtime, context, stream, net_config_for_services).await
+            inner(
+                runtime,
+                context,
+                stream,
+                net_config_for_services,
+                vm_control_token,
+            )
+            .await
         }
         SocketStream::Unix(stream) => {
-            inner(runtime, context, stream, net_config_for_services).await
+            inner(
+                runtime,
+                context,
+                stream,
+                net_config_for_services,
+                vm_control_token,
+            )
+            .await
         }
     }
 }
@@ -429,14 +468,9 @@ pub async fn run(
 /// setup failure.
 ///
 /// This nested `Network` does not load the cell-net BPF guard (only the host
-/// daemon's [`Network::init_host_network`] does). Cross-tenant isolation is
-/// unaffected: the host guard on this cell's own netkit primary already pins
-/// every packet leaving the cell to the cell's delegated prefix, so neither a
-/// hosted VM nor a nested cell can spoof another *top-level* tenant. The gap
-/// is intra-tenant only — nested cells created inside this cell (which shares
-/// one tenant's delegated block) are not mutually guarded against each other.
-/// Per-cell guarding of nested cells is deferred; hosting VMs (the primary
-/// use) needs no nested guard.
+/// daemon's [`Network::init_host_network`] does). The host eBPF guard pins the
+/// outer cell to its delegated block, while an nftables source filter in the
+/// cell netns pins each VM TAP or nested-cell interface to its `/128`.
 fn build_nested_network(net_config: Option<&NetworkConfig>) -> Option<Network> {
     // No `--net-*` flags means a non-isolated cell with no networking — not
     // an error, so return quietly. A delegated prefix too narrow to
@@ -451,7 +485,12 @@ fn build_nested_network(net_config: Option<&NetworkConfig>) -> Option<Network> {
         );
         return None;
     };
-    match Network::builder().ipam(ipam_config).enable_forwarding().build() {
+    match Network::builder()
+        .ipam(ipam_config)
+        .enable_forwarding()
+        .enable_source_filter()
+        .build()
+    {
         Ok(net) => Some(net),
         Err(e) => {
             error!(

@@ -24,7 +24,6 @@ use std::time::Duration;
 use backoff::backoff::Backoff;
 use client::{Client, ClientError};
 use tokio::sync::Mutex;
-use tonic::Code;
 use tracing::trace;
 
 use crate::cells::cell_service::cells::{CellName, Cells};
@@ -38,11 +37,9 @@ use super::error::{Result, VmServiceError};
 ///    awaits.
 /// 2. Open a unix-socket [`Client`] with exponential-backoff retry on
 ///    connection errors. Gives the nested auraed up to ~20s to come up.
-/// 3. Call `call(client, request)` under the same backoff. Transient
-///    transport errors (`Code::Unknown` + `"transport error"`) retry;
-///    everything else propagates as [`VmServiceError::ProxiedStatus`] so
-///    the upstream caller sees the same `Status` they'd see from a direct
-///    call.
+/// 3. Call `call(client, request)` exactly once. A mutation may have reached
+///    the nested daemon even when its response is lost, so retrying after
+///    dispatch would make Allocate/Start/Stop/Free observably non-idempotent.
 ///
 /// `request` should already have any cell-routing field cleared by the
 /// caller — typically `request.cell_name = None` — so the receiving daemon
@@ -54,13 +51,12 @@ pub(crate) async fn proxy_to_cell<Req, Resp, Fut, F>(
     call: F,
 ) -> Result<Resp>
 where
-    Req: Clone,
     F: Fn(Client, Req) -> Fut,
     Fut: Future<Output = std::result::Result<Resp, tonic::Status>>,
 {
-    let client_socket = {
+    let (client_socket, control_token) = {
         let mut cells = cells.lock().await;
-        cells.get(cell_name, |cell| cell.client_socket()).map_err(|e| {
+        cells.get(cell_name, |cell| cell.vm_control()).map_err(|e| {
             VmServiceError::VmCellNotFound {
                 cell_name: cell_name.to_string(),
                 source: e,
@@ -77,7 +73,12 @@ where
         .build();
 
     let client = loop {
-        match Client::new_no_tls(client_socket.clone()).await {
+        match Client::new_no_tls_with_vm_control_token(
+            client_socket.clone(),
+            control_token.expose_secret(),
+        )
+        .await
+        {
             Ok(client) => break Ok(client),
             e @ Err(ClientError::ConnectionError(_)) => {
                 trace!("aurae client failed to connect: {e:?}");
@@ -96,21 +97,7 @@ where
         source: e,
     })?;
 
-    backoff::future::retry(retry_strategy, || async {
-        match call(client.clone(), request.clone()).await {
-            Ok(res) => Ok(res),
-            Err(e)
-                if e.code() == Code::Unknown
-                    && e.message() == "transport error" =>
-            {
-                Err(e)?;
-                unreachable!();
-            }
-            Err(e) => Err(backoff::Error::Permanent(e)),
-        }
-    })
-    .await
-    .map_err(VmServiceError::ProxiedStatus)
+    call(client, request).await.map_err(VmServiceError::ProxiedStatus)
 }
 
 #[cfg(test)]

@@ -20,6 +20,7 @@ use super::{
 use crate::init::network::Network;
 use crate::init::network::endpoint::NetworkConfig;
 use crate::init::network::ipam::Allocation;
+use crate::vms::VmControlToken;
 use client::AuraeSocket;
 use std::fs::File;
 use std::io;
@@ -539,6 +540,22 @@ impl Cell {
         };
 
         Ok(nested_auraed.client_socket.clone())
+    }
+
+    /// Return the private endpoint and capability used only for proxied VM
+    /// requests. Ordinary cell service clients receive the socket alone and
+    /// cannot invoke VmService in the nested daemon.
+    pub(crate) fn vm_control(&self) -> Result<(AuraeSocket, VmControlToken)> {
+        let CellState::Allocated { nested_auraed, .. } = &self.state else {
+            return Err(CellsError::CellNotAllocated {
+                cell_name: self.cell_name.clone(),
+            });
+        };
+
+        Ok((
+            nested_auraed.client_socket.clone(),
+            nested_auraed.vm_control_token.clone(),
+        ))
     }
 
     /// Returns the [CellName] of the [Cell]

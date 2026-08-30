@@ -114,7 +114,14 @@ pub(crate) fn service(input: TokenStream) -> TokenStream {
             quote! {
                 #signature {
                     let mut client = ::proto::#module::#client_namespace::#client_ident::new(self.channel.clone());
-                    client.#name(req).await
+                    let mut request = ::tonic::Request::new(req);
+                    if let Some(token) = self.vm_control_token.clone() {
+                        let _ = request.metadata_mut().insert(
+                            crate::client::VM_CONTROL_TOKEN_HEADER,
+                            token,
+                        );
+                    }
+                    client.#name(request).await
                 }
             }
         }).collect();

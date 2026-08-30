@@ -17,6 +17,7 @@ use std::sync::{
     mpsc::{Sender, channel},
 };
 
+use anyhow::{Context, anyhow};
 use hypervisor::Hypervisor;
 use nix::libc::EFD_NONBLOCK;
 use vmm::{VmmThreadHandle, api::ApiRequest};
@@ -31,46 +32,56 @@ pub struct Manager {
 }
 
 impl Manager {
-    pub fn new() -> Self {
-        let debug =
-            EventFd::new(EFD_NONBLOCK).expect("Failed to create event monitor");
-        let api_evt =
-            EventFd::new(EFD_NONBLOCK).expect("Failed to create API eventfd");
+    pub fn new() -> Result<Self, anyhow::Error> {
+        let debug = EventFd::new(EFD_NONBLOCK)
+            .context("Failed to create event monitor")?;
+        let api_evt = EventFd::new(EFD_NONBLOCK)
+            .context("Failed to create API eventfd")?;
 
-        let hypervisor =
-            hypervisor::new().expect("Failed to instantiate hypervisor");
+        let hypervisor = hypervisor::new()
+            .map_err(|e| anyhow!("Failed to instantiate hypervisor: {e}"))?;
 
-        Self {
+        Ok(Self {
             hypervisor,
             debug,
             sender: None,
             events: api_evt,
             vmm_thread: None,
-        }
+        })
     }
 
     pub fn start(&mut self) -> Result<(), anyhow::Error> {
         let (sender, receiver) = channel();
-        self.sender = Some(sender.clone());
 
         let version =
             vmm::VmmVersionInfo::new("auraed", env!("CARGO_PKG_VERSION"));
-        self.vmm_thread = Some(
-            vmm::start_vmm_thread(
-                version,
-                &None,
-                None,
-                self.events.try_clone()?,
-                sender,
-                receiver,
-                self.debug.try_clone()?,
-                &seccompiler::SeccompAction::Allow,
-                self.hypervisor.clone(),
-                false, // no_shutdown
-                false, // landlock_enable
-            )
-            .expect("Failed to start VMM thread"),
-        );
+        let vmm_thread = vmm::start_vmm_thread(
+            version,
+            &None,
+            None,
+            self.events.try_clone()?,
+            sender.clone(),
+            receiver,
+            self.debug.try_clone()?,
+            &seccompiler::SeccompAction::Allow,
+            self.hypervisor.clone(),
+            false, // no_shutdown
+            true,  // landlock_enable
+        )
+        .map_err(|e| anyhow!("Failed to start VMM thread: {e}"))?;
+        self.sender = Some(sender);
+        self.vmm_thread = Some(vmm_thread);
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Manager;
+
+    #[test]
+    fn manager_construction_never_panics() {
+        let result = std::panic::catch_unwind(Manager::new);
+        assert!(result.is_ok(), "Manager::new panicked");
     }
 }

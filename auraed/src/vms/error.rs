@@ -39,6 +39,8 @@ pub(crate) enum VmServiceError {
     MissingMachineConfig,
     #[error("vm '{id}' config has no root drive specified")]
     MissingRootDrive { id: VmID },
+    #[error("VM artifact path '{path}' is not allowed: {source}")]
+    InvalidArtifactPath { path: String, source: anyhow::Error },
     #[error(
         "vm networking is unavailable on this host (forwarding could not be \
          enabled or netlink failed); see daemon logs for details"
@@ -90,7 +92,8 @@ impl From<VmServiceError> for Status {
             | VmServiceError::NetworkingUnavailable => {
                 Status::failed_precondition(msg)
             }
-            VmServiceError::InvalidCellName { .. } => {
+            VmServiceError::InvalidCellName { .. }
+            | VmServiceError::InvalidArtifactPath { .. } => {
                 Status::invalid_argument(msg)
             }
             VmServiceError::VmCellNotFound { .. } => Status::not_found(msg),

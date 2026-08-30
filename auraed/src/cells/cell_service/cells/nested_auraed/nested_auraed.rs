@@ -16,6 +16,7 @@
 use super::isolation_controls::{Isolation, IsolationControls};
 use crate::AURAED_RUNTIME;
 use crate::init::network::endpoint::NetworkConfig;
+use crate::vms::VmControlToken;
 use client::AuraeSocket;
 use clone3::Flags;
 use nix::{
@@ -25,13 +26,14 @@ use nix::{
         signal::{Signal, Signal::SIGKILL, Signal::SIGTERM},
         wait::{WaitPidFlag, WaitStatus, waitpid},
     },
-    unistd::Pid,
+    unistd::{Pid, pipe},
 };
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 use std::{
-    io,
+    fs::File,
+    io::{self, Write},
     os::unix::process::{CommandExt, ExitStatusExt},
     process::{Command, ExitStatus},
 };
@@ -56,6 +58,8 @@ pub struct NestedAuraed {
     #[allow(unused)]
     iso_ctl: IsolationControls,
     pub client_socket: AuraeSocket,
+    /// Capability required by VmService on the nested daemon.
+    pub(crate) vm_control_token: VmControlToken,
     /// Cached after reaping so cgroup-cleanup retries do not signal again.
     exit_status: Option<ExitStatus>,
 }
@@ -79,6 +83,14 @@ impl NestedAuraed {
         );
 
         let client_socket = AuraeSocket::Path(socket_path.clone().into());
+        let vm_control_token = VmControlToken::generate();
+        let (control_reader, control_writer) =
+            pipe().map_err(io::Error::from)?;
+        let mut control_writer = File::from(control_writer);
+        control_writer
+            .write_all(vm_control_token.expose_secret().as_bytes())?;
+        drop(control_writer);
+        let control_fd = control_reader.as_raw_fd().to_string();
 
         let auraed_path: PathBuf =
             auraed_runtime.auraed.clone().try_into().expect("path to auraed");
@@ -98,13 +110,15 @@ impl NestedAuraed {
             &auraed_runtime.runtime_dir.to_string_lossy(),
             "--library-dir",
             &auraed_runtime.library_dir.to_string_lossy(),
+            "--vm-control-fd",
+            &control_fd,
         ]);
 
         // We have a concern that the "command" API make change/break in the future and this
         // test is intended to help safeguard against that!
         // We check that the command we kept has the expected number of args following the call
         // to command.args, whose return value we ignored above.
-        assert_eq!(command.get_args().len(), 13);
+        assert_eq!(command.get_args().len(), 15);
 
         // Send the network configuration of the cell to the child auraed
         // in CLI flags. `CellSystemRuntime` in the child parses them at
@@ -204,6 +218,7 @@ impl NestedAuraed {
                     pidfd,
                     iso_ctl,
                     client_socket,
+                    vm_control_token,
                     exit_status: None,
                 })
             }
@@ -471,6 +486,7 @@ mod tests {
                 isolate_network: false,
             },
             client_socket: AuraeSocket::Path("/dev/null".into()),
+            vm_control_token: VmControlToken::from_secret("test-token".into()),
             exit_status: None,
         }
     }

@@ -51,6 +51,16 @@ fn aurae_kernel_args(allocation: &Allocation) -> [String; 2] {
     ]
 }
 
+fn tap_endpoint(
+    vm: &VirtualMachine,
+) -> Result<Option<TapEndpoint>, anyhow::Error> {
+    let Some(net) = vm.vm.net.first() else { return Ok(None) };
+    let Some(tap) = net.tap.clone() else { return Ok(None) };
+    let delegated = Ipv6Net::new(net.guest_ip_v6, net.prefix_len_v6)
+        .map_err(|e| anyhow!("Invalid delegated prefix on NetSpec: {e}"))?;
+    Ok(Some(TapEndpoint { tap, host_ip: net.host_ip_v6, delegated }))
+}
+
 /// The in-memory cache of virtual machines ([VirtualMachine]) created with Aurae.
 #[derive(Debug)]
 pub struct VirtualMachines {
@@ -164,14 +174,10 @@ impl VirtualMachines {
         }
     }
 
-    /// Boot a virtual machine by its ID and return the host-side TAP
-    /// endpoint that still needs configuring, if any.
-    ///
-    /// This performs only the synchronous Cloud Hypervisor boot call, so
-    /// callers can hold the [`VirtualMachines`] lock for the (brief)
-    /// duration of this method and then drop it before configuring the TAP
-    /// endpoint — which involves a multi-second link-up wait we don't want
-    /// to serialize all VM operations behind.
+    /// Boot a virtual machine by its ID and return the host-side TAP endpoint
+    /// that still needs configuring, if any. The caller must retain the
+    /// [`VirtualMachines`] lock until endpoint configuration completes, so
+    /// Free cannot delete the VM and recycle its IPAM slot during Start.
     ///
     /// Returns `Ok(None)` when the VM has no TAP to configure (e.g. it was
     /// created with an explicit `net` spec without one). On configuration
@@ -193,39 +199,21 @@ impl VirtualMachines {
             ));
         };
 
+        let endpoint = tap_endpoint(vm)?;
         vm.start()?;
-
-        let Some(net) = vm.vm.net.first() else {
-            return Ok(None);
-        };
-        let Some(tap) = net.tap.clone() else {
-            return Ok(None);
-        };
-        let delegated = Ipv6Net::new(net.guest_ip_v6, net.prefix_len_v6)
-            .map_err(|e| anyhow!("Invalid delegated prefix on NetSpec: {e}"))?;
-
-        Ok(Some(TapEndpoint { tap, host_ip: net.host_ip_v6, delegated }))
+        Ok(endpoint)
     }
 
     /// Roll back a VM whose host-side TAP configuration failed after boot:
     /// stop + delete it, drop it from the cache, and release its IPAM slot.
-    /// Best-effort — every step is logged rather than propagated, since the
-    /// caller is already returning the original start failure.
-    pub fn rollback_failed_start(&mut self, id: &VmID) {
-        if let Some(vm) = self.cache.get_mut(id) {
-            let _ = vm.stop();
-            let _ = vm.delete();
-        }
-        let _ = self.cache.remove(id);
-        if let Some(network) = self.network.as_ref()
-            && let Err(release_err) = network.ipam().release(&vm_key(id))
-            && !matches!(release_err, IpamError::NotAllocated(_))
-        {
-            warn!(
-                "Failed to release IPAM allocation for {id} after start \
-                 failure: {release_err}"
-            );
-        }
+    /// Cleanup errors are propagated and state remains cached so Free or
+    /// daemon shutdown can retry without recycling an address that may still
+    /// be in use.
+    pub fn rollback_failed_start(
+        &mut self,
+        id: &VmID,
+    ) -> Result<(), anyhow::Error> {
+        self.delete(id)
     }
 
     /// Address of a VM's guest auraed socket, if the VM is in the cache.
@@ -235,32 +223,44 @@ impl VirtualMachines {
 
     /// Delete a virtual machine by its ID
     pub fn delete(&mut self, id: &VmID) -> Result<(), anyhow::Error> {
-        if let Some(vm) = self.cache.get_mut(id) {
+        let (endpoint, leaked_ip) = {
+            let Some(vm) = self.cache.get_mut(id) else {
+                return Err(anyhow!(
+                    "Virtual machine with ID '{:?}' not found",
+                    id
+                ));
+            };
+            let endpoint = tap_endpoint(vm)?;
+            let leaked_ip = vm.vm.net.first().map(|n| n.guest_ip_v6);
             vm.delete()?;
-            let leaked_ip =
-                vm.vm.net.first().map(|n| n.guest_ip_v6.to_string());
-            let _ = self.cache.remove(id);
-            // Release the IP address back to IPAM for reuse. Ignore
-            // NotAllocated, which is expected when the VM was created
-            // with an explicit `net` spec (no IPAM reservation).
-            if let Some(network) = self.network.as_ref() {
-                match network.ipam().release(&vm_key(id)) {
-                    Ok(_) => {}
-                    Err(IpamError::NotAllocated(_)) => {}
-                    Err(e) => {
-                        let leaked =
-                            leaked_ip.as_deref().unwrap_or("<unknown>");
-                        error!(
-                            "Failed to release IPAM allocation for VM {id} \
-                             (IP {leaked} leaked until daemon restart): {e}"
-                        );
-                    }
+            (endpoint, leaked_ip)
+        };
+
+        // Cloud Hypervisor has confirmed deletion, so the TAP no longer
+        // exists and its nftables source binding can be removed safely.
+        if let Some(network) = self.network.as_ref() {
+            if let Some(endpoint) = endpoint {
+                network.destroy_tap_endpoint(&endpoint.tap)?;
+            }
+
+            // Release only after VM deletion and source-filter cleanup.
+            // NotAllocated is expected for an explicit caller-supplied net.
+            match network.ipam().release(&vm_key(id)) {
+                Ok(_) | Err(IpamError::NotAllocated(_)) => {}
+                Err(e) => {
+                    let leaked = leaked_ip
+                        .map(|ip| ip.to_string())
+                        .unwrap_or_else(|| "<unknown>".into());
+                    return Err(anyhow!(
+                        "Failed to release IPAM allocation for VM {id} \
+                         (IP {leaked} retained): {e}"
+                    ));
                 }
             }
-            Ok(())
-        } else {
-            Err(anyhow!("Virtual machine with ID '{:?}' not found", id))
         }
+
+        let _ = self.cache.remove(id);
+        Ok(())
     }
 
     /// List all virtual machines

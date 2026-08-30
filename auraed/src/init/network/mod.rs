@@ -102,6 +102,12 @@ pub enum NetworkError {
         "cell_interfaces mutex poisoned — daemon network state is unrecoverable"
     )]
     CellInterfacesPoisoned,
+    #[error(
+        "tap_interfaces mutex poisoned — daemon network state is unrecoverable"
+    )]
+    TapInterfacesPoisoned,
+    #[error("VM TAP `{tap}` is already tracked")]
+    TapAlreadyTracked { tap: String },
     #[error("Failed to rename link `{old}` to `{new}`: {source}")]
     ErrorRenamingLink { old: String, new: String, source: rtnetlink::Error },
     #[error(transparent)]
@@ -123,8 +129,16 @@ struct NetworkInner {
     nat: NatManager,
     /// The host interface state for each cell.
     cell_interfaces: Mutex<HashMap<CellName, CellInterfaceState>>,
+    /// Source-enforcement state for each routed VM TAP in this netns.
+    tap_interfaces: Mutex<HashMap<String, TapInterfaceState>>,
     /// The IPAM allocator.
     ipam: Ipam,
+}
+
+#[derive(Debug, Clone)]
+struct TapInterfaceState {
+    delegated: Ipv6Net,
+    source_bound: bool,
 }
 
 impl fmt::Debug for Network {
@@ -132,9 +146,12 @@ impl fmt::Debug for Network {
         // `Handle` does not implement `Debug`. Report the nat state.
         let cell_count =
             self.inner.cell_interfaces.lock().map(|g| g.len()).unwrap_or(0);
+        let tap_count =
+            self.inner.tap_interfaces.lock().map(|g| g.len()).unwrap_or(0);
         f.debug_struct("Network")
             .field("nat_installed", &self.inner.nat.is_installed())
             .field("cell_interface_count", &cell_count)
+            .field("tap_interface_count", &tap_count)
             .finish()
     }
 }
@@ -150,6 +167,7 @@ impl fmt::Debug for Network {
 pub(crate) struct NetworkBuilder {
     ipam: IpamConfig,
     enable_forwarding: bool,
+    enable_source_filter: bool,
 }
 
 impl NetworkBuilder {
@@ -172,6 +190,13 @@ impl NetworkBuilder {
         self
     }
 
+    /// Install the source-only nft ruleset in this network namespace.
+    /// Nested auraed uses it to bind each VM TAP to its `/128`.
+    pub(crate) fn enable_source_filter(mut self) -> Self {
+        self.enable_source_filter = true;
+        self
+    }
+
     /// Open the netlink connection, apply the forwarding sysctl if the
     /// caller requested it, and build the `Network` with the given IPAM.
     pub(crate) fn build(self) -> Result<Network, NetworkError> {
@@ -180,14 +205,22 @@ impl NetworkBuilder {
         if self.enable_forwarding {
             enable_forwarding_v6()?;
         }
-        Ok(Network {
+        let network = Network {
             inner: Arc::new(NetworkInner {
                 handle,
                 nat: NatManager::new(),
                 cell_interfaces: Mutex::new(HashMap::new()),
+                tap_interfaces: Mutex::new(HashMap::new()),
                 ipam: Ipam::new(self.ipam),
             }),
-        })
+        };
+        if self.enable_source_filter {
+            network
+                .inner
+                .nat
+                .install_source_filter(network.inner.ipam.pool())?;
+        }
+        Ok(network)
     }
 }
 
@@ -221,11 +254,10 @@ impl Network {
     }
 
     /// Configure the host side of the routed TAP of a VM after Cloud
-    /// Hypervisor creates it. The function adds `host/128`, sets the link
-    /// up, and installs a `dev` route for the delegated prefix of the VM,
-    /// so that return traffic reaches the host stack. This is the same
-    /// host-side step as in [`Self::create_cell_interface`], but Cloud
-    /// Hypervisor owns the TAP and this function only adds the addressing.
+    /// Hypervisor creates it. Before the TAP is brought up, the function
+    /// binds it to its delegated source prefix in nftables. It then adds
+    /// `host/128`, sets the link up, and installs a `dev` route for the
+    /// delegated prefix. Cloud Hypervisor owns the TAP itself.
     /// It waits a maximum of 5 s for the TAP, because Cloud Hypervisor
     /// creates the device during the boot of the VM.
     pub(crate) async fn configure_tap_endpoint(
@@ -237,11 +269,82 @@ impl Network {
         const TIMEOUT: Duration = Duration::from_secs(5);
         const POLL: Duration = Duration::from_millis(50);
         let _ = wait_for_link(&self.inner.handle, tap, TIMEOUT, POLL).await?;
+
+        {
+            let mut guard = self
+                .inner
+                .tap_interfaces
+                .lock()
+                .map_err(|_| NetworkError::TapInterfacesPoisoned)?;
+            if guard.contains_key(tap) {
+                return Err(NetworkError::TapAlreadyTracked {
+                    tap: tap.to_string(),
+                });
+            }
+            let _ = guard.insert(
+                tap.to_string(),
+                TapInterfaceState { delegated, source_bound: false },
+            );
+        }
+
+        if let Err(source) = self.inner.nat.bind_cell_source(tap, delegated) {
+            if let Ok(mut guard) = self.inner.tap_interfaces.lock() {
+                let _ = guard.remove(tap);
+            }
+            return Err(NetworkError::FailedToConnect(source));
+        }
+        {
+            let mut guard = self
+                .inner
+                .tap_interfaces
+                .lock()
+                .map_err(|_| NetworkError::TapInterfacesPoisoned)?;
+            let state = guard
+                .get_mut(tap)
+                .ok_or(NetworkError::TapInterfacesPoisoned)?;
+            state.source_bound = true;
+        }
+
+        // Keep the source binding if link configuration fails. The VM
+        // rollback deletes the TAP first, then removes the binding. This
+        // avoids an unguarded interval when Cloud Hypervisor teardown fails.
         configure_routed_endpoint(&self.inner.handle, tap, host, delegated)
             .await?;
         info!(
             "Configured VM TAP endpoint {tap}: host={host}, guest={delegated}"
         );
+        Ok(())
+    }
+
+    /// Remove a VM TAP's source binding after Cloud Hypervisor confirms that
+    /// the VM (and therefore the TAP) has been deleted. State is retained on
+    /// failure so a later Free or shutdown can retry cleanup.
+    pub(crate) fn destroy_tap_endpoint(
+        &self,
+        tap: &str,
+    ) -> Result<(), NetworkError> {
+        let state = {
+            let guard = self
+                .inner
+                .tap_interfaces
+                .lock()
+                .map_err(|_| NetworkError::TapInterfacesPoisoned)?;
+            guard.get(tap).cloned()
+        };
+        let Some(state) = state else { return Ok(()) };
+
+        if state.source_bound {
+            self.inner
+                .nat
+                .unbind_cell_source(tap, state.delegated)
+                .map_err(NetworkError::FailedToConnect)?;
+        }
+        let mut guard = self
+            .inner
+            .tap_interfaces
+            .lock()
+            .map_err(|_| NetworkError::TapInterfacesPoisoned)?;
+        let _ = guard.remove(tap);
         Ok(())
     }
 

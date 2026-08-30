@@ -75,7 +75,7 @@ impl From<VmSpec> for vmm::vm_config::VmConfig {
                 core_scheduling: CoreScheduling::default(),
             },
             memory: MemoryConfig {
-                size: (spec.memory_size << 20) as u64,
+                size: u64::from(spec.memory_size) << 20,
                 mergeable: false,
                 hotplug_method: HotplugMethod::default(),
                 hotplug_size: None,
@@ -117,7 +117,7 @@ impl From<VmSpec> for vmm::vm_config::VmConfig {
             platform: None,
             tpm: None,
             preserved_fds: None,
-            landlock_enable: false,
+            landlock_enable: true,
             landlock_rules: None,
         }
     }
@@ -221,6 +221,7 @@ pub struct VirtualMachine {
     pub vm: VmSpec,
     pub status: VmStatus,
     manager: Arc<Mutex<Manager>>,
+    deleted: bool,
 }
 
 impl fmt::Debug for VirtualMachine {
@@ -240,7 +241,7 @@ impl Display for VmStatus {
 
 impl VirtualMachine {
     pub fn new(id: VmID, spec: VmSpec) -> Result<Self, anyhow::Error> {
-        let mut manager = Manager::new();
+        let mut manager = Manager::new()?;
         manager.start()?;
 
         if let Some(sender) = &manager.sender {
@@ -250,7 +251,7 @@ impl VirtualMachine {
                     sender.clone(),
                     Box::new(spec.clone().into()),
                 )
-                .expect("Failed to send create request");
+                .map_err(|e| anyhow!("Failed to send create request: {e}"))?;
         } else {
             return Err(anyhow!("Virtual machine manager not initialized"));
         }
@@ -260,10 +261,14 @@ impl VirtualMachine {
             vm: spec,
             status: VmStatus(VmState::Created),
             manager: Arc::new(Mutex::new(manager)),
+            deleted: false,
         })
     }
 
     pub fn start(&mut self) -> Result<(), anyhow::Error> {
+        if self.deleted {
+            return Err(anyhow!("Virtual machine has been deleted"));
+        }
         if let VmState::Running = self.status.0 {
             return Err(anyhow!("Virtual machine already running"));
         }
@@ -285,6 +290,9 @@ impl VirtualMachine {
     }
 
     pub fn stop(&mut self) -> Result<(), anyhow::Error> {
+        if self.deleted {
+            return Err(anyhow!("Virtual machine has been deleted"));
+        }
         if let VmState::Shutdown = self.status.0 {
             return Err(anyhow!("Virtual machine already stopped"));
         }
@@ -306,6 +314,9 @@ impl VirtualMachine {
     }
 
     pub fn delete(&mut self) -> Result<(), anyhow::Error> {
+        if self.deleted {
+            return Ok(());
+        }
         if self.status.0 != VmState::Shutdown {
             self.stop()?;
         };
@@ -318,6 +329,7 @@ impl VirtualMachine {
             let _ = vmm::api::VmDelete
                 .send(manager.events.try_clone()?, sender.clone(), ())
                 .map_err(|e| anyhow!("Failed to send destroy request: {e}"))?;
+            self.deleted = true;
             return Ok(());
         }
         Err(anyhow!("Virtual machine manager not initialized"))
@@ -469,5 +481,14 @@ mod tests {
 
         let nets = cfg.net.as_ref().expect("net");
         assert_eq!(nets.len(), 1);
+        assert!(cfg.landlock_enable);
+    }
+
+    #[test]
+    fn memory_size_conversion_widens_before_shifting() {
+        let mut spec = sample_vm_spec();
+        spec.memory_size = u32::MAX;
+        let cfg: vmm::vm_config::VmConfig = spec.into();
+        assert_eq!(cfg.memory.size, u64::from(u32::MAX) << 20);
     }
 }
