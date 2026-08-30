@@ -402,7 +402,7 @@ prepare-image:
 
 .PHONY: e2e-vm-in-cell
 e2e-vm-in-cell: aer-debug auraed-debug ## E2E test of VM-in-cell networking through the `aer` CLI (needs root + KVM + a prepared guest image; SKIPs when unavailable)
-	sudo -E bash hack/e2e-vm-in-cell.sh
+	$(root_cargo) test -p auraed --locked --test vms_start_must_start_vm_in_cell -- --ignored --nocapture
 
 #------------------------------------------------------------------------------#
 

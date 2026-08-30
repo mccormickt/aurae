@@ -74,6 +74,9 @@ const FAMILY: NfFamily = NfFamily::INet;
 /// delete batch.
 struct NatState {
     pool_v6: Ipv6Net,
+    /// A nested auraed needs only ingress source enforcement for VM TAPs.
+    /// The host installs the forwarding and optional NAT rules as well.
+    source_filter_only: bool,
     /// `None` if the host has no IPv6 default route. The base chain is
     /// still installed with fail-closed isolation, but there is no egress
     /// and no masquerade.
@@ -94,7 +97,11 @@ impl NatState {
             }
             None => None,
         };
-        Ok(Self { pool_v6, wan_iface })
+        Ok(Self { pool_v6, source_filter_only: false, wan_iface })
+    }
+
+    fn source_filter(pool_v6: Ipv6Net) -> Self {
+        Self { pool_v6, source_filter_only: true, wan_iface: None }
     }
 
     fn build_install(&self) -> Batch<'_> {
@@ -104,11 +111,16 @@ impl NatState {
         batch.add(NfListObject::Set(Box::new(self.set_cell_ifaces())));
         batch.add(NfListObject::Set(Box::new(self.set_cell_src())));
         batch.add(NfListObject::Chain(self.prerouting_chain()));
-        batch.add(NfListObject::Chain(self.input_chain()));
-        batch.add(NfListObject::Chain(self.forward_chain()));
         // Drop other network protocols before the IPv6 source check.
         batch.add(NfListObject::Rule(self.rule_drop_non_ipv6()));
         batch.add(NfListObject::Rule(self.rule_antispoof()));
+
+        if self.source_filter_only {
+            return batch;
+        }
+
+        batch.add(NfListObject::Chain(self.input_chain()));
+        batch.add(NfListObject::Chain(self.forward_chain()));
         batch.add(NfListObject::Rule(self.rule_drop_cell_input()));
         batch.add(NfListObject::Rule(self.rule_drop_cell_to_cell()));
 
@@ -629,6 +641,20 @@ impl NatManager {
         wan_iface: Option<&str>,
     ) -> io::Result<()> {
         let new_state = NatState::new(pool_v6, wan_iface)?;
+        self.install_state(new_state)
+    }
+
+    /// Install only the fail-closed source filter in the current network
+    /// namespace. A nested auraed uses it for VM TAPs; forwarding remains
+    /// under that namespace's existing policy.
+    pub(crate) fn install_source_filter(
+        &self,
+        pool_v6: Ipv6Net,
+    ) -> io::Result<()> {
+        self.install_state(NatState::source_filter(pool_v6))
+    }
+
+    fn install_state(&self, new_state: NatState) -> io::Result<()> {
         let mut guard = self.state.lock().expect("nat mutex poisoned");
 
         ensure_table_owned_or_absent()?;
@@ -676,21 +702,24 @@ impl NatManager {
         self.state.lock().map(|g| g.is_some()).unwrap_or(false)
     }
 
-    /// Bind the host-side primary of a cell to its delegated prefix. The
-    /// forward chain then accepts the traffic of that cell and drops all
-    /// other traffic with the same source.
+    /// Bind a routed endpoint to its delegated prefix.
     ///
     /// `create_cell_interface` calls this function before the peer enters
     /// the network namespace of the cell. Thus an unbound cell cannot send a packet.
-    /// The function does nothing if no ruleset is installed, because the
-    /// caller does not create a cell in that condition.
+    /// The function fails if no ruleset is installed. Callers must never
+    /// bring an unbound routed endpoint up.
     pub(crate) fn bind_cell_source(
         &self,
         primary: &str,
         delegated: Ipv6Net,
     ) -> io::Result<()> {
         let guard = self.state.lock().expect("nat mutex poisoned");
-        let Some(state) = guard.as_ref() else { return Ok(()) };
+        let Some(state) = guard.as_ref() else {
+            return Err(io::Error::new(
+                io::ErrorKind::NotConnected,
+                "source filter is not installed",
+            ));
+        };
         apply_batch(state.build_bind_cell(primary, delegated))
             .map_err(|e| io_err("bind cell source", e))
     }
@@ -763,10 +792,10 @@ mod tests {
     }
 
     #[test]
-    fn cell_binding_is_a_noop_when_nothing_is_installed() {
+    fn source_binding_fails_closed_when_filter_is_not_installed() {
         let m = NatManager::new();
         let net: Ipv6Net = "fd00:ae::2/128".parse().expect("net");
-        m.bind_cell_source(CELL_PRIMARY, net).expect("bind is a no-op");
+        assert!(m.bind_cell_source(CELL_PRIMARY, net).is_err());
         m.unbind_cell_source(CELL_PRIMARY, net).expect("unbind is a no-op");
     }
 
@@ -834,6 +863,17 @@ mod tests {
         });
         let chain = chain.expect("source filter chain");
         assert_eq!(chain.hook, Some(NfHook::Prerouting));
+    }
+
+    #[test]
+    fn nested_source_filter_does_not_replace_forwarding_policy() {
+        let rendered =
+            render(NatState::source_filter(test_pool_v6()).build_install());
+        assert!(rendered.contains(PREROUTING_CHAIN), "{rendered}");
+        assert!(rendered.contains(r#""@cell_src""#), "{rendered}");
+        assert!(!rendered.contains(FORWARD_CHAIN), "{rendered}");
+        assert!(!rendered.contains(POSTROUTING_CHAIN), "{rendered}");
+        assert!(!rendered.contains(r#""accept""#), "{rendered}");
     }
 
     #[test]

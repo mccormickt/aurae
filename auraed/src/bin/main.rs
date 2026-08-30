@@ -39,11 +39,14 @@
 
 use auraed::{
     AuraedRuntime, IpamConfig, NetworkConfig, prep_oci_spec_for_spawn,
-    run_with_network,
+    run_with_vm_control,
 };
 use clap::{Parser, Subcommand};
 use ipnet::Ipv6Net;
+use std::fs::File;
+use std::io::Read;
 use std::net::Ipv6Addr;
+use std::os::fd::FromRawFd;
 use std::path::PathBuf;
 use std::process::ExitCode;
 use tracing::{error, info};
@@ -143,6 +146,9 @@ struct AuraedOptions {
     /// no rename.
     #[clap(long, value_parser)]
     net_interface_name: Option<String>,
+    /// Inherited pipe containing the capability for proxied `VmService` calls.
+    #[clap(long, hide = true)]
+    vm_control_fd: Option<i32>,
     // Subcommands for the project
     #[clap(subcommand)]
     subcmd: Option<SubCommands>,
@@ -199,8 +205,17 @@ async fn handle_default(
         net_guest_ip_v6,
         net_delegated_prefix_v6,
         net_interface_name,
+        vm_control_fd,
         subcmd: _,
     } = options;
+
+    let vm_control_token = match vm_control_fd {
+        Some(fd) if nested => Some(read_vm_control_token(fd)?),
+        Some(_) => {
+            return Err("--vm-control-fd is valid only with --nested".into());
+        }
+        None => None,
+    };
 
     // A networked endpoint needs both `host_v6` and `guest_v6`. The
     // `prefix_v6` and `interface_name` values are optional and have
@@ -254,16 +269,34 @@ async fn handle_default(
     };
 
     // Run the auraed daemon with the configured runtime
-    run_with_network(
+    run_with_vm_control(
         runtime,
         socket,
         verbose,
         nested,
         net_config,
         host_ipam_config,
+        vm_control_token,
     )
     .await?;
     Ok(())
+}
+
+fn read_vm_control_token(
+    fd: i32,
+) -> Result<String, Box<dyn std::error::Error>> {
+    if fd < 0 {
+        return Err("--vm-control-fd must be a non-negative descriptor".into());
+    }
+    let reader = unsafe { File::from_raw_fd(fd) };
+    let mut token = String::new();
+    let _ = reader.take(256).read_to_string(&mut token)?;
+    if token.len() != 72
+        || !token.bytes().all(|b| b.is_ascii_hexdigit() || b == b'-')
+    {
+        return Err("invalid VM control capability".into());
+    }
+    Ok(token)
 }
 
 fn handle_spawn_subcommand(
@@ -272,4 +305,20 @@ fn handle_spawn_subcommand(
     info!("Spawning Auraed OCI bundle: {}", output);
     prep_oci_spec_for_spawn(output)?; // Prepare the OCI spec for spawning
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn legacy_guest_prefix_flag_remains_accepted() {
+        let options = AuraedOptions::try_parse_from([
+            "auraed",
+            "--net-guest-prefix-v6",
+            "112",
+        ])
+        .expect("legacy flag must remain an alias");
+        assert_eq!(options.net_delegated_prefix_v6, Some(112));
+    }
 }
