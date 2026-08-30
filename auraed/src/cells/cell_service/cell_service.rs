@@ -149,14 +149,27 @@ impl CellService {
         let cell_name = cell.name.clone();
         let cell_spec = cell.into();
 
-        let mut cells = self.cells.lock().await;
+        // Allocation owns host resources and must outlive the request future.
+        // Dropping a tonic request detaches this task rather than cancelling
+        // it between acquiring IPAM/process/cgroup/interface resources and
+        // committing the final cell state.
+        let cells = Arc::clone(&self.cells);
+        let allocation = tokio::spawn(async move {
+            let mut cells = cells.lock().await;
+            let cell = cells.allocate(cell_name, cell_spec).await?;
+            Ok::<_, CellsError>((
+                cell.name().to_string(),
+                cell.v2().expect("allocated cell returns `Some`"),
+            ))
+        });
 
-        let cell = cells.allocate(cell_name, cell_spec).await?;
+        let (cell_name, cgroup_v2) = allocation.await.map_err(|error| {
+            CellsServiceError::Io(std::io::Error::other(format!(
+                "cell allocation task failed: {error}"
+            )))
+        })??;
 
-        Ok(CellServiceAllocateResponse {
-            cell_name: cell.name().to_string(),
-            cgroup_v2: cell.v2().expect("allocated cell returns `Some`"),
-        })
+        Ok(CellServiceAllocateResponse { cell_name, cgroup_v2 })
     }
 
     /// Frees a cell.

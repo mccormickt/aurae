@@ -24,15 +24,15 @@
 use super::netlink::{
     configure_routed_endpoint, get_link_index, netlink_errno,
 };
-use super::{Network, NetworkError};
+use super::{CELL_INTERFACE_ALIAS, Network, NetworkError};
 use crate::cells::cell_service::cells::CellName;
 use crate::init::network::ipam::Allocation;
 use ipnet::Ipv6Net;
-use netlink_packet_route::link::{NetkitMode, NetkitPolicy};
+use netlink_packet_route::link::{LinkAttribute, NetkitMode, NetkitPolicy};
 use nix::libc;
 use rtnetlink::{LinkNetkit, LinkUnspec};
 use std::os::fd::{AsRawFd, BorrowedFd};
-use tracing::{info, trace, warn};
+use tracing::{info, trace};
 
 /// Host-side state for the interface of one cell. The destroy, hard-kill,
 /// and rollback paths use it to undo `create_cell_interface`.
@@ -107,6 +107,9 @@ impl Network {
                 LinkNetkit::new(primary, peer, NetkitMode::L3)
                     .policy(NetkitPolicy::Pass)
                     .peer_policy(NetkitPolicy::Pass)
+                    .append_extra_attribute(LinkAttribute::IfAlias(
+                        CELL_INTERFACE_ALIAS.to_string(),
+                    ))
                     .build(),
             )
             .execute()
@@ -123,40 +126,25 @@ impl Network {
             delegated: allocation.delegated,
             source_bound: false,
         };
-        let tracked = match self.inner.cell_interfaces.lock() {
-            Ok(mut guard) => {
-                let _ = guard.insert(cell_name.clone(), state);
-                true
-            }
-            Err(_poisoned) => false,
-        };
-        if !tracked {
-            self.delete_primary_best_effort(primary).await;
-            return Err(NetworkError::CellInterfacesPoisoned);
-        }
+        let _ = self.cell_interfaces().insert(cell_name.clone(), state);
 
         // Bind the cell source in nftables while the peer is still in the
         // host network namespace and admin-down. Thus the cell cannot send an
         // unfiltered packet. A failure here is fatal for the cell, because
         // an unbound interface can forge the address of a sibling.
-        if let Err(e) =
-            self.inner.nat.bind_cell_source(primary, allocation.delegated)
-        {
-            let setup_error = NetworkError::FailedToConnect(e);
+        let bind = {
+            let primary = primary.to_string();
+            let delegated = allocation.delegated;
+            self.nft(move |nat| nat.bind_cell_source(&primary, delegated)).await
+        };
+        if let Err(setup_error) = bind {
             return match self.destroy_cell_interface(cell_name).await {
                 Ok(()) => Err(setup_error),
                 Err(cleanup_error) => Err(cleanup_error),
             };
         }
-        {
-            let mut guard = self
-                .inner
-                .cell_interfaces
-                .lock()
-                .map_err(|_| NetworkError::CellInterfacesPoisoned)?;
-            if let Some(state) = guard.get_mut(cell_name) {
-                state.source_bound = true;
-            }
+        if let Some(state) = self.cell_interfaces().get_mut(cell_name) {
+            state.source_bound = true;
         }
 
         // Move the peer into the network namespace of the cell. Each cell has a unique
@@ -200,61 +188,6 @@ impl Network {
         Ok(())
     }
 
-    /// Remove the nftables source binding of a cell. All rollback and
-    /// teardown paths use this function, so that a leftover element cannot
-    /// accept a recycled interface name.
-    ///
-    /// The function is synchronous and best-effort. The callers are already
-    /// on a failure or teardown path, and `Cell::kill` and `Drop` have no
-    /// runtime to await on.
-    fn unbind_cell_enforcement(
-        &self,
-        primary: &str,
-        delegated: Ipv6Net,
-    ) -> Result<(), NetworkError> {
-        self.inner
-            .nat
-            .unbind_cell_source(primary, delegated)
-            .map_err(NetworkError::FailedToConnect)
-    }
-
-    /// Delete a host-side primary by name. The function is best-effort.
-    /// The rollback path of `create_cell_interface` and the hard-kill path
-    /// use it. The function logs errors and does not return them, because
-    /// the callers are on a failure path and must keep the initial cause.
-    pub(crate) async fn delete_primary_best_effort(&self, primary: &str) {
-        match get_link_index(&self.inner.handle, primary.to_string()).await {
-            Ok(idx) => {
-                match self.inner.handle.link().del(idx).execute().await {
-                    Ok(()) => {}
-                    // The kernel deletes the pair when the network namespace of the
-                    // cell ends. That can occur before this delete.
-                    Err(e) if netlink_errno(&e) == Some(-libc::ENODEV) => {
-                        trace!(
-                            "Primary `{primary}` disappeared before delete \
-                             (netns teardown won the race)"
-                        );
-                    }
-                    Err(e) => {
-                        warn!(
-                            "Rollback: failed to delete primary `{primary}` \
-                             (index {idx}): {e}. Host interface may leak."
-                        );
-                    }
-                }
-            }
-            Err(NetworkError::DeviceNotFound { .. }) => {
-                // The primary is already gone.
-            }
-            Err(e) => {
-                warn!(
-                    "Rollback: could not look up primary `{primary}` for \
-                     deletion: {e}. Host interface may leak."
-                );
-            }
-        }
-    }
-
     /// Remove the host link and the source binding for a cell.
     ///
     /// The function keeps the state until each cleanup step succeeds.
@@ -262,15 +195,9 @@ impl Network {
         &self,
         cell_name: &CellName,
     ) -> Result<(), NetworkError> {
-        let state = {
-            let guard = self
-                .inner
-                .cell_interfaces
-                .lock()
-                .map_err(|_| NetworkError::CellInterfacesPoisoned)?;
-            guard.get(cell_name).cloned()
+        let Some(state) = self.cell_interfaces().get(cell_name).cloned() else {
+            return Ok(());
         };
-        let Some(state) = state else { return Ok(()) };
         let primary = &state.primary;
 
         let index = match get_link_index(&self.inner.handle, primary.clone())
@@ -301,15 +228,15 @@ impl Network {
             }
         }
 
+        // Remove the source binding, so that a leftover element cannot
+        // accept a recycled interface name.
         if state.source_bound {
-            self.unbind_cell_enforcement(primary, state.delegated)?;
+            let primary = primary.clone();
+            let delegated = state.delegated;
+            self.nft(move |nat| nat.unbind_cell_source(&primary, delegated))
+                .await?;
         }
-        let mut guard = self
-            .inner
-            .cell_interfaces
-            .lock()
-            .map_err(|_| NetworkError::CellInterfacesPoisoned)?;
-        let _ = guard.remove(cell_name);
+        let _ = self.cell_interfaces().remove(cell_name);
         info!(
             "Destroyed cell interface for {cell_name}: primary={primary} \
              index={index}"
@@ -356,8 +283,5 @@ mod tests {
             .await
             .expect_err("device is already gone");
         assert_eq!(netlink_errno(&err), Some(-libc::ENODEV));
-
-        // The best-effort path stays silent on an already-gone primary.
-        network.delete_primary_best_effort(&primary).await;
     }
 }

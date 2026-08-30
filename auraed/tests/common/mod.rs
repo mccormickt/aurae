@@ -116,7 +116,16 @@ async fn run_auraed() -> Client {
             auraed: AuraedPath::from_path("auraed"),
             ..Default::default()
         };
-        auraed::run(runtime, Some(socket), false, false, None).await.unwrap()
+        auraed::run(
+            runtime,
+            Some(socket),
+            false,
+            false,
+            None,
+            Some(auraed::IpamConfig::default()),
+        )
+        .await
+        .unwrap()
     });
 
     let mut retry_strategy = default_retry_strategy();

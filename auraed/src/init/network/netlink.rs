@@ -22,7 +22,7 @@
 use super::NetworkError;
 use futures::stream::TryStreamExt;
 use ipnet::Ipv6Net;
-use netlink_packet_route::link::{LinkAttribute, LinkFlags};
+use netlink_packet_route::link::LinkAttribute;
 use nix::libc;
 use rtnetlink::{Handle, LinkUnspec, RouteMessageBuilder};
 use std::net::{IpAddr, Ipv6Addr};
@@ -131,52 +131,22 @@ pub(super) async fn add_address(
     Ok(())
 }
 
-/// Set a link with a known index admin-up and wait for `IFF_UP`.
+/// Set a link with a known index admin-up. The kernel sets `IFF_UP` before
+/// it acknowledges the request. The subsequent address and route
+/// operations need admin-up only, not carrier. A netkit pair raises the
+/// carrier only when both halves are up, and the host-side primary comes
+/// up before the peer in the cell.
 pub(super) async fn set_link_up(
     handle: &Handle,
     link_index: u32,
     iface: &str,
 ) -> Result<(), NetworkError> {
-    const TIMEOUT: Duration = Duration::from_secs(3);
-    const POLL: Duration = Duration::from_millis(25);
-
     let msg = LinkUnspec::new_with_index(link_index).up().build();
     handle.link().set(msg).execute().await.map_err(|e| {
         NetworkError::ErrorSettingLinkUp { iface: iface.to_string(), source: e }
     })?;
-
-    // Poll for admin-up (IFF_UP) and not for carrier. A pair device such
-    // as netkit raises the carrier only when both halves are up, and the
-    // host-side primary comes up before the peer in the cell. The
-    // subsequent address and route operations need admin-up only. A DAD
-    // wait is also unnecessary, because netkit sets IFF_NOARP and an
-    // address does not become tentative. On a timeout the function logs a
-    // warning and continues, because the request above was successful.
-    let start = Instant::now();
-    loop {
-        let link = handle
-            .link()
-            .get()
-            .match_index(link_index)
-            .execute()
-            .try_next()
-            .await;
-        if let Ok(Some(link)) = link
-            && link.header.flags.contains(LinkFlags::Up)
-        {
-            trace!("Link '{iface}' is up");
-            return Ok(());
-        }
-        if start.elapsed() >= TIMEOUT {
-            warn!(
-                "Timed out after {}ms waiting for link '{iface}' to report \
-                 IFF_UP; continuing anyway",
-                TIMEOUT.as_millis()
-            );
-            return Ok(());
-        }
-        tokio::time::sleep(POLL).await;
-    }
+    trace!("Link '{iface}' is up");
+    Ok(())
 }
 
 /// Rename a link with a known index. The function sends `RTM_SETLINK` with

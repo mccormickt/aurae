@@ -52,16 +52,22 @@ mod netlink;
 mod sriov;
 
 use cell::CellInterfaceState;
+use host::HostSysctlState;
 use nat::NatManager;
 use netlink::{
     add_address, add_onlink_default, configure_loopback, rename_link,
     set_link_up, wait_for_link,
 };
 
+/// Durable kernel ownership marker for Aurae cell primaries.
+pub(super) const CELL_INTERFACE_ALIAS: &str = "aurae-cell-network-v1";
+
 #[derive(thiserror::Error, Debug)]
 pub enum NetworkError {
     #[error("Failed to initialize network: {0}")]
     FailedToConnect(#[from] std::io::Error),
+    #[error("nftables operation failed: {0}")]
+    Nft(#[source] std::io::Error),
     #[error("Could not find link `{iface}`")]
     DeviceNotFound { iface: String },
     #[error("Error adding address `{ip}` to link `{iface}`: {source}")]
@@ -96,10 +102,8 @@ pub enum NetworkError {
         "Timed out waiting for link `{iface}` to appear after {timeout_ms} ms"
     )]
     TimedOutWaitingForLink { iface: String, timeout_ms: u64 },
-    #[error(
-        "cell_interfaces mutex poisoned — daemon network state is unrecoverable"
-    )]
-    CellInterfacesPoisoned,
+    #[error("cell network pool `{pool}` overlaps existing route `{route}`")]
+    PoolRouteConflict { pool: Ipv6Net, route: Ipv6Net },
     #[error("Failed to rename link `{old}` to `{new}`: {source}")]
     ErrorRenamingLink { old: String, new: String, source: rtnetlink::Error },
     #[error(transparent)]
@@ -121,6 +125,9 @@ struct NetworkInner {
     nat: NatManager,
     /// The host interface state for each cell.
     cell_interfaces: Mutex<HashMap<CellName, CellInterfaceState>>,
+    /// Original host-global sysctl values, captured only after host network
+    /// initialization succeeds.
+    host_sysctls: Mutex<Option<HostSysctlState>>,
     /// The IPAM allocator.
     ipam: Ipam,
 }
@@ -128,8 +135,7 @@ struct NetworkInner {
 impl fmt::Debug for Network {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         // `Handle` does not implement `Debug`. Report the nat state.
-        let cell_count =
-            self.inner.cell_interfaces.lock().map(|g| g.len()).unwrap_or(0);
+        let cell_count = self.cell_interfaces().len();
         f.debug_struct("Network")
             .field("nat_installed", &self.inner.nat.is_installed())
             .field("cell_interface_count", &cell_count)
@@ -157,6 +163,7 @@ impl Network {
                 handle,
                 nat: NatManager::new(),
                 cell_interfaces: Mutex::new(HashMap::new()),
+                host_sysctls: Mutex::new(None),
                 ipam: Ipam::new(ipam_config),
             }),
         })
@@ -164,6 +171,30 @@ impl Network {
 
     pub(crate) fn ipam(&self) -> &Ipam {
         &self.inner.ipam
+    }
+
+    fn cell_interfaces(
+        &self,
+    ) -> std::sync::MutexGuard<'_, HashMap<CellName, CellInterfaceState>> {
+        self.inner
+            .cell_interfaces
+            .lock()
+            .expect("cell interfaces mutex poisoned")
+    }
+
+    /// Run one nftables operation on the blocking pool. The `nftables`
+    /// crate runs the `nft` binary as a subprocess and waits for it. A
+    /// runtime worker must not wait on that subprocess.
+    async fn nft<F>(&self, op: F) -> Result<(), NetworkError>
+    where
+        F: FnOnce(&NatManager) -> std::io::Result<()> + Send + 'static,
+    {
+        let inner = Arc::clone(&self.inner);
+        tokio::task::spawn_blocking(move || op(&inner.nat))
+            .await
+            .map_err(|e| std::io::Error::other(format!("nft task: {e}")))
+            .and_then(|result| result)
+            .map_err(NetworkError::Nft)
     }
 
     /// Set up the local NIC of an auraed that runs in its own network namespace. The
@@ -226,12 +257,11 @@ impl Network {
 
         set_link_up(&self.inner.handle, link_index, ETH0).await?;
 
-        let addr = Ipv6Net::new(config.guest_v6, config.guest_prefix_len_v6)
-            .map_err(|e| {
-                NetworkError::Other(rtnetlink::Error::NamespaceError(
-                    e.to_string(),
-                ))
-            })?;
+        // Endpoint identity and prefix delegation are separate contracts.
+        // The endpoint owns one /128; the host routes the delegated block
+        // to it so a nested auraed can sub-delegate addresses to VMs.
+        let addr =
+            Ipv6Net::new(config.guest_v6, 128).expect("/128 is a valid prefix");
         add_address(&self.inner.handle, link_index, ETH0, addr).await?;
 
         add_onlink_default(
@@ -244,11 +274,11 @@ impl Network {
         .await?;
 
         info!(
-            "Configured endpoint (source={}→{ETH0}): \
-             guest={}/{}, default via {}",
+            "Configured endpoint (source={}→{ETH0}): guest={}/128, \
+             delegated=/{}, default via {}",
             config.interface_name,
             config.guest_v6,
-            config.guest_prefix_len_v6,
+            config.delegated_prefix_len_v6,
             config.host_v6,
         );
         Ok(())
@@ -256,10 +286,36 @@ impl Network {
 }
 
 impl Drop for NetworkInner {
-    /// Remove the nftables state when the last handle is dropped.
+    /// Remove enforcement and restore host state only after every tracked
+    /// cell interface has been reclaimed. A surviving cell must retain the
+    /// nft fallback after a bounded shutdown fails.
     fn drop(&mut self) {
+        let interfaces_empty = match self.cell_interfaces.lock() {
+            Ok(interfaces) => interfaces.is_empty(),
+            Err(_) => {
+                warn!(
+                    "Retaining nft cell enforcement because interface state \
+                     is poisoned"
+                );
+                return;
+            }
+        };
+        if !interfaces_empty {
+            warn!(
+                "Retaining nft cell enforcement and forwarding state because \
+                 cell interfaces survived shutdown"
+            );
+            return;
+        }
+
         if let Err(e) = self.nat.uninstall() {
             warn!("Failed to uninstall NAT ruleset: {e}");
+        }
+        if let Ok(sysctls) = self.host_sysctls.get_mut()
+            && let Some(sysctls) = sysctls.take()
+            && let Err(error) = sysctls.restore()
+        {
+            warn!("Failed to restore host network sysctls: {error}");
         }
     }
 }
@@ -273,7 +329,7 @@ pub(crate) mod testutil {
     use super::netlink::get_link_index;
     use super::{Handle, Ipv6Net};
     use futures::stream::TryStreamExt;
-    use netlink_packet_route::link::{NetkitMode, NetkitPolicy};
+    use netlink_packet_route::link::{LinkAttribute, NetkitMode, NetkitPolicy};
     use netlink_packet_route::route::{RouteAddress, RouteAttribute};
     use rtnetlink::{LinkNetkit, RouteMessageBuilder};
     use std::net::Ipv6Addr;
@@ -283,14 +339,26 @@ pub(crate) mod testutil {
         primary: &str,
         peer: &str,
     ) {
+        create_test_pair_with_alias(handle, primary, peer, None).await;
+    }
+
+    pub(crate) async fn create_test_pair_with_alias(
+        handle: &Handle,
+        primary: &str,
+        peer: &str,
+        alias: Option<&str>,
+    ) {
+        let mut pair = LinkNetkit::new(primary, peer, NetkitMode::L3)
+            .policy(NetkitPolicy::Pass)
+            .peer_policy(NetkitPolicy::Pass);
+        if let Some(alias) = alias {
+            pair = pair.append_extra_attribute(LinkAttribute::IfAlias(
+                alias.to_string(),
+            ));
+        }
         handle
             .link()
-            .add(
-                LinkNetkit::new(primary, peer, NetkitMode::L3)
-                    .policy(NetkitPolicy::Pass)
-                    .peer_policy(NetkitPolicy::Pass)
-                    .build(),
-            )
+            .add(pair.build())
             .execute()
             .await
             .expect("create test netkit pair");

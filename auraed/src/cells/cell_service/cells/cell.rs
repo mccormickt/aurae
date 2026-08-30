@@ -191,11 +191,89 @@ impl Cell {
         Ok(())
     }
 
-    async fn rollback_allocation(&mut self, cleanup: PendingCleanup) {
-        self.state = CellState::CleanupPending(cleanup);
+    async fn rollback_allocation(&mut self) {
         if let Err(error) = self.retry_pending_cleanup().await {
             warn!("Cell {}: rollback failed: {error}", self.cell_name);
         }
+    }
+
+    /// Start the nested auraed, create the cgroup, and create the host-side
+    /// interface. Each resource goes into `cleanup` as soon as it exists.
+    /// On an error the caller rolls back what `cleanup` holds.
+    async fn acquire_resources(
+        cell_name: &CellName,
+        spec: &CellSpec,
+        cleanup: &mut PendingCleanup,
+        net_config: Option<NetworkConfig>,
+        interface_names: Option<(String, String)>,
+    ) -> Result<()> {
+        let auraed = NestedAuraed::new(
+            cell_name.leaf().to_string(),
+            spec.iso_ctl.clone(),
+            net_config,
+        )
+        .map_err(|source| CellsError::FailedToAllocateCell {
+            cell_name: cell_name.clone(),
+            source,
+        })?;
+        let pid = auraed.pid();
+        let client_socket = auraed.client_socket.clone();
+        cleanup.nested_auraed = Some(auraed);
+
+        let cgroup =
+            Cgroup::new(cell_name.clone(), spec.cgroup_spec.clone(), pid)
+                .map_err(|source| CellsError::AbortedAllocateCell {
+                    cell_name: cell_name.clone(),
+                    source,
+                })?;
+        cleanup.cgroup.insert(cgroup).add_task(pid).map_err(|source| {
+            CellsError::AbortedAllocateCell {
+                cell_name: cell_name.clone(),
+                source,
+            }
+        })?;
+        info!("Attach nested Auraed pid {pid} to cgroup {cell_name}");
+
+        // Create the host-side primary and move the peer into the network
+        // namespace of the cell.
+        if let (Some(cell_network), Some((primary, peer))) =
+            (cleanup.cell_network.as_ref(), interface_names.as_ref())
+        {
+            let netns_file =
+                File::open(format!("/proc/{}/ns/net", pid.as_raw())).map_err(
+                    |source| CellsError::FailedToAllocateCell {
+                        cell_name: cell_name.clone(),
+                        source,
+                    },
+                )?;
+            cell_network
+                .network
+                .create_cell_interface(
+                    cell_name,
+                    &cell_network.allocation,
+                    netns_file.as_fd(),
+                    primary,
+                    peer,
+                )
+                .await
+                .map_err(|source| CellsError::NetworkSetupFailed {
+                    cell_name: cell_name.clone(),
+                    source: Box::new(source),
+                })?;
+        }
+
+        // The Unix socket of the nested auraed appears only after
+        // `CellSystemRuntime::init` completes, which includes
+        // `init_endpoint` if the CLI flags are set. If the socket does not
+        // appear before the timeout, the child probably failed in
+        // `init_endpoint`. The caller then sees the failure here and not at
+        // the next gRPC call.
+        wait_for_client_socket(&client_socket, CHILD_READY_TIMEOUT)
+            .await
+            .map_err(|source| CellsError::FailedToAllocateCell {
+                cell_name: cell_name.clone(),
+                source,
+            })
     }
 
     /// Allocate the cell. The function reserves an IPAM slot if
@@ -217,9 +295,7 @@ impl Cell {
 
         let key = Self::ipam_key(&self.cell_name);
 
-        // Step 1: reserve an IPAM slot if the cell needs an isolated
-        // network. The allocator is part of `Network`. A `Network`
-        // handle gives an allocator.
+        // Reserve an IPAM slot if the cell needs an isolated network.
         let cell_network = if self.spec.iso_ctl.isolate_network {
             let Some(network) = host_network.as_ref() else {
                 return Err(CellsError::NetworkUnavailable {
@@ -237,17 +313,12 @@ impl Cell {
             None
         };
 
-        // Step 2: reserve the unique primary and peer names before the
-        // start of the child. The peer name must be in the environment of
-        // the child, and the environment is fixed at the exec. Step 5
-        // creates the links.
+        // Reserve the primary and peer names before the start of the child.
+        // The child receives the peer name in its CLI arguments, renames
+        // the peer to `eth0`, and adds the addresses and routes.
         let interface_names = cell_network
             .as_ref()
             .map(|cell_network| cell_network.network.reserve_interface_names());
-
-        // Step 3: build the CLI arguments. The child auraed parses them at
-        // its start and configures its endpoint. It renames the peer to
-        // `eth0` and adds the addresses and routes.
         let net_config = cell_network
             .as_ref()
             .zip(interface_names.as_ref())
@@ -258,138 +329,42 @@ impl Cell {
                 )
             });
 
-        // Step 4: spawn the nested auraed.
-        let name = self.cell_name.leaf().to_string();
-        let auraed = match NestedAuraed::new(
-            name,
-            self.spec.iso_ctl.clone(),
+        // Every acquired resource lives in the cell state. If a step fails
+        // and the rollback also fails, the state keeps the resources. Then
+        // `free`, `kill`, and `Drop` can reclaim them later, and
+        // `can_allocate` refuses a new cell with the same name.
+        self.state = CellState::CleanupPending(PendingCleanup {
+            nested_auraed: None,
+            cgroup: None,
+            cell_network,
+        });
+        let CellState::CleanupPending(cleanup) = &mut self.state else {
+            unreachable!("allocation resources are in cleanup-pending state")
+        };
+        if let Err(error) = Self::acquire_resources(
+            &self.cell_name,
+            &self.spec,
+            cleanup,
             net_config,
-        ) {
-            Ok(a) => a,
-            Err(e) => {
-                self.rollback_allocation(PendingCleanup {
-                    nested_auraed: None,
-                    cgroup: None,
-                    cell_network,
-                })
-                .await;
-                return Err(CellsError::FailedToAllocateCell {
-                    cell_name: self.cell_name.clone(),
-                    source: e,
-                });
-            }
-        };
-
-        let pid = auraed.pid();
-
-        // Step 5: cgroup setup.
-        let cgroup = match Cgroup::new(
-            self.cell_name.clone(),
-            self.spec.cgroup_spec.clone(),
-            pid,
-        ) {
-            Ok(cgroup) => cgroup,
-            Err(e) => {
-                self.rollback_allocation(PendingCleanup {
-                    nested_auraed: Some(auraed),
-                    cgroup: None,
-                    cell_network,
-                })
-                .await;
-                return Err(CellsError::AbortedAllocateCell {
-                    cell_name: self.cell_name.clone(),
-                    source: e,
-                });
-            }
-        };
-
-        if let Err(e) = cgroup.add_task(pid) {
-            self.rollback_allocation(PendingCleanup {
-                nested_auraed: Some(auraed),
-                cgroup: Some(cgroup),
-                cell_network,
-            })
-            .await;
-            return Err(CellsError::AbortedAllocateCell {
-                cell_name: self.cell_name.clone(),
-                source: e,
-            });
-        }
-
-        info!("Attach nested Auraed pid {} to cgroup {}", pid, self.cell_name);
-
-        // Step 6: create the host-side primary and move the peer into the
-        // network namespace of the cell. An error here rolls back all steps.
-        if let (Some(cell_network_ref), Some((primary, peer))) =
-            (cell_network.as_ref(), interface_names.as_ref())
+            interface_names,
+        )
+        .await
         {
-            let netns_path = format!("/proc/{}/ns/net", pid.as_raw());
-            let netns_file = match File::open(&netns_path) {
-                Ok(f) => f,
-                Err(e) => {
-                    self.rollback_allocation(PendingCleanup {
-                        nested_auraed: Some(auraed),
-                        cgroup: Some(cgroup),
-                        cell_network,
-                    })
-                    .await;
-                    return Err(CellsError::FailedToAllocateCell {
-                        cell_name: self.cell_name.clone(),
-                        source: e,
-                    });
-                }
-            };
-            if let Err(e) = cell_network_ref
-                .network
-                .create_cell_interface(
-                    &self.cell_name,
-                    &cell_network_ref.allocation,
-                    netns_file.as_fd(),
-                    primary,
-                    peer,
-                )
-                .await
-            {
-                self.rollback_allocation(PendingCleanup {
-                    nested_auraed: Some(auraed),
-                    cgroup: Some(cgroup),
-                    cell_network,
-                })
-                .await;
-                return Err(CellsError::NetworkSetupFailed {
-                    cell_name: self.cell_name.clone(),
-                    source: Box::new(e),
-                });
-            }
+            self.rollback_allocation().await;
+            return Err(error);
         }
 
-        // Step 7: wait for the end of the startup of the nested auraed.
-        // Its Unix socket appears only after `CellSystemRuntime::init`
-        // completes, which includes `init_endpoint` if the CLI flags are
-        // set. Thus the socket shows that the cell is reachable. If the
-        // socket does not appear before the timeout, the child probably
-        // failed in `init_endpoint`. Stop the child and roll back, so that
-        // the caller sees the failure here and not at the next gRPC
-        // call.
-        if let Err(e) =
-            wait_for_client_socket(&auraed.client_socket, CHILD_READY_TIMEOUT)
-                .await
-        {
-            self.rollback_allocation(PendingCleanup {
-                nested_auraed: Some(auraed),
-                cgroup: Some(cgroup),
-                cell_network,
-            })
-            .await;
-            return Err(CellsError::FailedToAllocateCell {
-                cell_name: self.cell_name.clone(),
-                source: e,
-            });
-        }
-
+        let CellState::CleanupPending(PendingCleanup {
+            nested_auraed: Some(nested_auraed),
+            cgroup: Some(cgroup),
+            cell_network,
+        }) = std::mem::replace(&mut self.state, CellState::Unallocated)
+        else {
+            unreachable!("successful allocation owns all required resources")
+        };
         self.state = CellState::Allocated {
             cgroup,
-            nested_auraed: auraed,
+            nested_auraed,
             children: Cells::new(self.cell_name.clone(), host_network),
             cell_network,
         };
