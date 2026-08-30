@@ -46,7 +46,7 @@ const DEFAULT_NET_DEV: &str = "eth0";
 /// `aurae.prefix_v6` or `aurae.gw_v6` parameter replaces it.
 const DEFAULT_GUEST_V6: Ipv6Addr = Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 2);
 const DEFAULT_GATEWAY_V6: Ipv6Addr = Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 1);
-const DEFAULT_GUEST_PREFIX_LEN_V6: u8 = 64;
+const DEFAULT_DELEGATED_PREFIX_LEN_V6: u8 = 64;
 
 /// Parse kernel command line parameters from /proc/cmdline.
 ///
@@ -87,7 +87,7 @@ fn build_network_config(
         return Ok(NetworkConfig {
             host_v6: DEFAULT_GATEWAY_V6,
             guest_v6: DEFAULT_GUEST_V6,
-            guest_prefix_len_v6: DEFAULT_GUEST_PREFIX_LEN_V6,
+            delegated_prefix_len_v6: DEFAULT_DELEGATED_PREFIX_LEN_V6,
             interface_name: DEFAULT_NET_DEV.to_owned(),
         });
     }
@@ -109,7 +109,7 @@ fn build_network_config(
         // address of the guest. With a /128 prefix the network address is
         // that address.
         guest_v6: prefix_v6.addr(),
-        guest_prefix_len_v6: prefix_v6.prefix_len(),
+        delegated_prefix_len_v6: prefix_v6.prefix_len(),
         interface_name: DEFAULT_NET_DEV.to_owned(),
     })
 }
@@ -259,9 +259,9 @@ impl SystemRuntime for Pid1SystemRuntime {
         };
 
         info!(
-            "IPv6 guest config: v6={}/{} gw={} iface={}",
+            "IPv6 guest config: v6={}/128 delegated=/{} gw={} iface={}",
             net_config.guest_v6,
-            net_config.guest_prefix_len_v6,
+            net_config.delegated_prefix_len_v6,
             net_config.host_v6,
             net_config.interface_name,
         );

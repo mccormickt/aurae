@@ -1,0 +1,65 @@
+# ---------------------------------------------------------------------------- #
+#                |   █████╗ ██╗   ██╗██████╗  █████╗ ███████╗ |                #
+#                |  ██╔══██╗██║   ██║██╔══██╗██╔══██╗██╔════╝ |                #
+#                |  ███████║██║   ██║██████╔╝███████║█████╗   |                #
+#                |  ██╔══██║██║   ██║██╔══██╗██╔══██║██╔══╝   |                #
+#                |  ██║  ██║╚██████╔╝██║  ██║██║  ██║███████╗ |                #
+#                |  ╚═╝  ╚═╝ ╚═════╝ ╚═╝  ╚═╝╚═╝  ╚═╝╚══════╝ |                #
+#                +--------------------------------------------+                #
+#                                                                              #
+#                         Distributed Systems Runtime                          #
+# ---------------------------------------------------------------------------- #
+# Copyright 2022 - 2024, the aurae contributors                                #
+# SPDX-License-Identifier: Apache-2.0                                          #
+# ---------------------------------------------------------------------------- #
+
+name: "(005) [ubuntu:latest] cell network isolation"
+
+on:
+  push:
+    branches: main
+  pull_request:
+    branches: main
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  cell-network-isolation:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: bufbuild/buf-action@v1
+        with:
+          setup_only: true
+          github_token: ${{ github.token }}
+          version: 1.63.0
+      - uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: 005-${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            005-${{ runner.os }}-cargo-
+      - name: Install network runtime tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y iproute2 iputils-ping nftables
+      - name: Verify netkit kernel support
+        run: |
+          sudo ip link add ci-netkit type netkit peer name ci-netkit-p
+          sudo ip link delete ci-netkit
+      - name: Build auraed and install test certificates
+        run: make os-deps pki auraed-debug
+      - name: Install nested auraed for the root test process
+        run: sudo install -m 0755 "$HOME/.cargo/bin/auraed" /usr/local/bin/auraed
+      - name: Test cell network isolation
+        run: |
+          sudo -E "$(which cargo)" test -p auraed --locked \
+            --test cell_isolated_network_must_have_egress \
+            cell_isolated_network_enforces_boundaries_and_has_egress \
+            -- --ignored --nocapture

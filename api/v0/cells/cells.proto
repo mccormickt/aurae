@@ -180,8 +180,10 @@ message Cell {
   // Default: false
   bool isolate_process = 10;
 
-  // Will isolate the network from the host.
-  // Will unshare the net namespaces.
+  // Will unshare the network namespace. When host cell networking is
+  // enabled, Aurae source-validates the cell and blocks traffic from the
+  // cell to host services and sibling cells by default. Forwarded IPv6
+  // internet egress remains subject to the host firewall policy.
   // The cgroup namespace is always unshared with the host.
   //
   // Default: false
