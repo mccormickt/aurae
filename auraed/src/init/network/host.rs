@@ -131,32 +131,22 @@ impl Network {
             return Err(NetworkError::FailedToConnect(e));
         }
 
-        // Load the guard before enabling forwarding. This keeps startup
-        // fail-closed if the eBPF program is unavailable.
-        let guard = match CellNetGuard::load() {
-            Ok(guard) => guard,
-            Err(source) => {
-                let error = NetworkError::BpfGuardFailed {
-                    iface: "<host>".to_string(),
-                    source: Box::new(source),
-                };
-                error!("{error}; refusing to start cells");
-                if let Err(cleanup_error) = self.inner.nat.uninstall() {
-                    warn!(
-                        "Failed to remove nft rules after guard load failed: \
-                         {cleanup_error}"
-                    );
-                }
-                if let Err(restore_error) = sysctls.restore() {
-                    warn!(
-                        "Failed to restore sysctls after guard load failed: \
-                         {restore_error}"
-                    );
-                }
-                return Err(error);
+        // nftables is the mandatory source-enforcement layer. Load eBPF as
+        // an optional cell-to-cell accelerator; missing artifacts, kernel
+        // support, or BPF privileges must not regress nft-isolated cells.
+        let guard_mode = match CellNetGuard::load() {
+            Ok(guard) => {
+                let _ = self.inner.cell_guard.set(guard);
+                "bpf"
+            }
+            Err(error) => {
+                warn!(
+                    "Cell-net BPF guard unavailable: {error}. Isolated cells \
+                     will use nft/host-stack mode."
+                );
+                "nft"
             }
         };
-        let _ = self.inner.cell_guard.set(guard);
 
         if let Err(source) = sysctls.enable_forwarding() {
             if let Err(cleanup_error) = self.inner.nat.uninstall() {
@@ -184,11 +174,13 @@ impl Network {
             Some(wan) => info!(
                 "Host network ready for v6={pool_v6}: per-cell anti-spoof, \
                  host/sibling isolation, and NAT egress via '{wan}'. Host \
-                 firewall chains can still deny this traffic."
+                 firewall chains can still deny this traffic \
+                 (guard={guard_mode})."
             ),
             None => warn!(
                 "Host network ready for v6={pool_v6}, but there is no IPv6 \
-                 default route — cells remain isolated with no egress."
+                 default route — cells remain isolated with no egress \
+                 (guard={guard_mode})."
             ),
         }
         Ok(())
