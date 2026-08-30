@@ -19,8 +19,9 @@
 //! traffic. It also drops an IPv6 source that is not assigned to the cell.
 //! Prerouting covers local and forwarded traffic.
 //!
-//! The `forward_accept` chain permits cell forwarding. The
-//! `nat_postrouting` chain provides egress when the host has a WAN route.
+//! The `input_filter` and `forward_filter` chains isolate cells from host
+//! services and sibling cells. The `nat_postrouting` chain provides egress
+//! when the host has a WAN route.
 //!
 //! The `cell_ifaces` set contains each cell interface. The `cell_src` set
 //! contains each permitted interface and IPv6 prefix pair.
@@ -34,10 +35,10 @@ use nftables::{
         CT, Expression, Meta, MetaKey, NamedExpression, Payload, PayloadField,
         Prefix, SetItem,
     },
-    helper::{NftablesError, apply_ruleset},
+    helper::{NftablesError, apply_ruleset, get_current_ruleset},
     schema::{
-        Chain, Element, NfListObject, Rule, Set, SetFlag, SetType,
-        SetTypeValue, Table,
+        Chain, Element, NfCmd, NfListObject, NfObject, Nftables, Rule, Set,
+        SetFlag, SetType, SetTypeValue, Table,
     },
     stmt::{Match, Operator, Statement},
     types::{NfChainType, NfFamily, NfHook},
@@ -49,14 +50,18 @@ use std::sync::Mutex;
 use tracing::warn;
 
 const TABLE_NAME: &str = "aurae";
+const OWNER_SET: &str = "aurae_managed_v1";
+const OWNER_COMMENT: &str = "managed by aurae cell networking v1";
 const PREROUTING_CHAIN: &str = "source_filter";
-const FORWARD_CHAIN: &str = "forward_accept";
+const INPUT_CHAIN: &str = "input_filter";
+const FORWARD_CHAIN: &str = "forward_filter";
 const POSTROUTING_CHAIN: &str = "nat_postrouting";
 const SET_CELL_IFACES: &str = "cell_ifaces";
 const SET_CELL_SRC: &str = "cell_src";
 
 /// Run before filter chains that use priority 0.
 const FORWARD_PRIORITY: i32 = -5;
+const INPUT_PRIORITY: i32 = -5;
 const PREROUTING_PRIORITY: i32 = -5;
 
 /// `NF_IP_PRI_NAT_SRC` from `<linux/netfilter_ipv4.h>`.
@@ -70,8 +75,8 @@ const FAMILY: NfFamily = NfFamily::INet;
 struct NatState {
     pool_v6: Ipv6Net,
     /// `None` if the host has no IPv6 default route. The base chain is
-    /// still installed with the anti-spoof and cell-to-cell rules, but
-    /// there is no egress and no masquerade.
+    /// still installed with fail-closed isolation, but there is no egress
+    /// and no masquerade.
     wan_iface: Option<String>,
 }
 
@@ -95,14 +100,17 @@ impl NatState {
     fn build_install(&self) -> Batch<'_> {
         let mut batch = Batch::new();
         batch.add(NfListObject::Table(self.table()));
+        batch.add(NfListObject::Set(Box::new(self.owner_set())));
         batch.add(NfListObject::Set(Box::new(self.set_cell_ifaces())));
         batch.add(NfListObject::Set(Box::new(self.set_cell_src())));
         batch.add(NfListObject::Chain(self.prerouting_chain()));
+        batch.add(NfListObject::Chain(self.input_chain()));
         batch.add(NfListObject::Chain(self.forward_chain()));
         // Drop other network protocols before the IPv6 source check.
         batch.add(NfListObject::Rule(self.rule_drop_non_ipv6()));
         batch.add(NfListObject::Rule(self.rule_antispoof()));
-        batch.add(NfListObject::Rule(self.rule_allow_cell_to_cell()));
+        batch.add(NfListObject::Rule(self.rule_drop_cell_input()));
+        batch.add(NfListObject::Rule(self.rule_drop_cell_to_cell()));
 
         if let Some(wan) = self.wan_iface.as_deref() {
             batch.add(NfListObject::Chain(self.postrouting_chain()));
@@ -110,7 +118,24 @@ impl NatState {
             batch.add(NfListObject::Rule(self.rule_allow_return(wan)));
             batch.add(NfListObject::Rule(self.rule_masquerade(wan)));
         }
+        // Packets involving a cell which did not match the narrowly allowed
+        // WAN flow above fail closed regardless of the host's other base
+        // chains and their default policies.
+        batch.add(NfListObject::Rule(self.rule_drop_cell_egress()));
+        batch.add(NfListObject::Rule(self.rule_drop_cell_ingress()));
         batch
+    }
+
+    /// Empty marker set used to distinguish Aurae's table from an
+    /// operator-owned table with the same name.
+    fn owner_set(&self) -> Set<'_> {
+        Set {
+            family: FAMILY,
+            table: TABLE_NAME.into(),
+            name: OWNER_SET.into(),
+            comment: Some(OWNER_COMMENT.into()),
+            ..default_set()
+        }
     }
 
     /// The set of the host-side primaries of all live cells. It limits the
@@ -169,6 +194,18 @@ impl NatState {
             _type: Some(NfChainType::Filter),
             hook: Some(NfHook::Forward),
             prio: Some(FORWARD_PRIORITY),
+            ..Chain::default()
+        }
+    }
+
+    fn input_chain(&self) -> Chain<'_> {
+        Chain {
+            family: FAMILY,
+            table: TABLE_NAME.into(),
+            name: INPUT_CHAIN.into(),
+            _type: Some(NfChainType::Filter),
+            hook: Some(NfHook::Input),
+            prio: Some(INPUT_PRIORITY),
             ..Chain::default()
         }
     }
@@ -257,19 +294,26 @@ impl NatState {
         )
     }
 
-    /// Forward rule. It accepts cell-to-cell traffic in the pool.
-    ///
-    /// Without this rule, cell-to-cell traffic matches no other rule and
-    /// leaves the chain at its end. The other base chains on the forward
-    /// hook then decide. On a host with a forward chain that has a deny
-    /// policy, the cells cannot reach each other.
-    fn rule_allow_cell_to_cell(&self) -> Rule<'_> {
+    /// Do not expose host-local services to cells. This chain sees packets
+    /// after source anti-spoofing in prerouting.
+    fn rule_drop_cell_input(&self) -> Rule<'_> {
+        self.rule(
+            INPUT_CHAIN,
+            vec![
+                match_interface_set(MetaKey::Iifname, SET_CELL_IFACES),
+                Statement::Drop(None),
+            ],
+        )
+    }
+
+    /// Cells and their nested VMs are separate tenants by default.
+    fn rule_drop_cell_to_cell(&self) -> Rule<'_> {
         self.rule(
             FORWARD_CHAIN,
             vec![
-                match_addr("saddr", self.pool_v6, Operator::EQ),
-                match_addr("daddr", self.pool_v6, Operator::EQ),
-                Statement::Accept(None),
+                match_interface_set(MetaKey::Iifname, SET_CELL_IFACES),
+                match_interface_set(MetaKey::Oifname, SET_CELL_IFACES),
+                Statement::Drop(None),
             ],
         )
     }
@@ -280,6 +324,7 @@ impl NatState {
         self.rule(
             FORWARD_CHAIN,
             vec![
+                match_interface_set(MetaKey::Iifname, SET_CELL_IFACES),
                 match_addr("saddr", self.pool_v6, Operator::EQ),
                 match_meta(MetaKey::Oifname, wan, Operator::EQ),
                 Statement::Accept(None),
@@ -293,8 +338,9 @@ impl NatState {
         self.rule(
             FORWARD_CHAIN,
             vec![
-                match_addr("daddr", self.pool_v6, Operator::EQ),
                 match_meta(MetaKey::Iifname, wan, Operator::EQ),
+                match_interface_set(MetaKey::Oifname, SET_CELL_IFACES),
+                match_addr("daddr", self.pool_v6, Operator::EQ),
                 match_ct_state_established_or_related(),
                 Statement::Accept(None),
             ],
@@ -306,9 +352,30 @@ impl NatState {
         self.rule(
             POSTROUTING_CHAIN,
             vec![
+                match_interface_set(MetaKey::Iifname, SET_CELL_IFACES),
                 match_addr("saddr", self.pool_v6, Operator::EQ),
                 match_meta(MetaKey::Oifname, wan, Operator::EQ),
                 Statement::Masquerade(None),
+            ],
+        )
+    }
+
+    fn rule_drop_cell_egress(&self) -> Rule<'_> {
+        self.rule(
+            FORWARD_CHAIN,
+            vec![
+                match_interface_set(MetaKey::Iifname, SET_CELL_IFACES),
+                Statement::Drop(None),
+            ],
+        )
+    }
+
+    fn rule_drop_cell_ingress(&self) -> Rule<'_> {
+        self.rule(
+            FORWARD_CHAIN,
+            vec![
+                match_interface_set(MetaKey::Oifname, SET_CELL_IFACES),
+                Statement::Drop(None),
             ],
         )
     }
@@ -444,6 +511,68 @@ fn match_set<'a>(
     })
 }
 
+fn match_interface_set<'a>(key: MetaKey, set_name: &str) -> Statement<'a> {
+    match_set(
+        Expression::Named(NamedExpression::Meta(Meta { key })),
+        set_name,
+        Operator::EQ,
+    )
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum TableOwnership {
+    Absent,
+    Aurae,
+    Foreign,
+}
+
+fn table_ownership(ruleset: &Nftables<'_>) -> TableOwnership {
+    let mut table_exists = false;
+    let mut owner_marker_exists = false;
+
+    for object in ruleset.objects.iter() {
+        let list_object = match object {
+            NfObject::ListObject(object)
+            | NfObject::CmdObject(NfCmd::Add(object)) => object,
+            _ => continue,
+        };
+        match list_object {
+            NfListObject::Table(table)
+                if table.family == FAMILY && table.name == TABLE_NAME =>
+            {
+                table_exists = true;
+            }
+            NfListObject::Set(set)
+                if set.family == FAMILY
+                    && set.table == TABLE_NAME
+                    && set.name == OWNER_SET
+                    && set.comment.as_deref() == Some(OWNER_COMMENT) =>
+            {
+                owner_marker_exists = true;
+            }
+            _ => {}
+        }
+    }
+
+    match (table_exists, owner_marker_exists) {
+        (false, _) => TableOwnership::Absent,
+        (true, true) => TableOwnership::Aurae,
+        (true, false) => TableOwnership::Foreign,
+    }
+}
+
+fn ensure_table_owned_or_absent() -> io::Result<()> {
+    let ruleset = get_current_ruleset()
+        .map_err(|error| io_err("inspect existing ruleset", error))?;
+    match table_ownership(&ruleset) {
+        TableOwnership::Absent | TableOwnership::Aurae => Ok(()),
+        TableOwnership::Foreign => Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "refusing to replace unmarked nft table `inet aurae`",
+        )),
+    }
+}
+
 /// Match `ct state {established, related}`.
 fn match_ct_state_established_or_related<'a>() -> Statement<'a> {
     Statement::Match(Match {
@@ -464,11 +593,12 @@ fn match_ct_state_established_or_related<'a>() -> Statement<'a> {
 /// [`NatManager::new`] builds it. The manager starts in the uninstalled
 /// condition and records its own state.
 ///
-/// [`Self::install`] is idempotent. It deletes an existing `inet aurae`
-/// table before it installs the new one. Thus a second call with different
-/// parameters replaces the ruleset. [`Self::uninstall`] does nothing if no
-/// ruleset is installed. The internal `Mutex` serializes the install and
-/// uninstall operations. `is_installed` holds the lock for a short time.
+/// [`Self::install`] is idempotent. It deletes an existing Aurae-marked
+/// `inet aurae` table before it installs the new one. Thus a second call
+/// with different parameters replaces the ruleset, while an unmarked table
+/// is never removed. [`Self::uninstall`] does nothing if no ruleset is
+/// installed. The internal `Mutex` serializes the install and uninstall
+/// operations. `is_installed` holds the lock for a short time.
 ///
 /// [`Self::bind_cell_source`] and [`Self::unbind_cell_source`] add and
 /// remove the elements of one cell.
@@ -483,15 +613,16 @@ impl NatManager {
         Self { state: Mutex::new(None) }
     }
 
-    /// Install the ruleset. The function first deletes an existing `inet
-    /// aurae` table. Thus it is correct for a first install, for the
-    /// recovery of a table from a previous daemon, and for a reconfigure.
-    /// The delete also removes the set elements of the live cells, and the
-    /// caller must bind those cells again.
+    /// Install the ruleset. The function first deletes an existing
+    /// Aurae-marked `inet aurae` table. Thus it is correct for a first
+    /// install, for recovery from a previous daemon, and for reconfigure.
+    /// It refuses an unmarked table with the same name. The delete also
+    /// removes the set elements of live cells, and the caller must bind
+    /// those cells again.
     ///
     /// `wan_iface` is `None` if the host has no IPv6 default route. The
-    /// anti-spoof and cell-to-cell rules are still installed. Only the
-    /// egress and masquerade rules are absent.
+    /// anti-spoof and fail-closed isolation rules are still installed. Only
+    /// the egress and masquerade rules are absent.
     pub(crate) fn install(
         &self,
         pool_v6: Ipv6Net,
@@ -499,6 +630,8 @@ impl NatManager {
     ) -> io::Result<()> {
         let new_state = NatState::new(pool_v6, wan_iface)?;
         let mut guard = self.state.lock().expect("nat mutex poisoned");
+
+        ensure_table_owned_or_absent()?;
 
         // Delete an existing `inet aurae` table. The delete batch is
         // idempotent. It is successful also if no table exists. A
@@ -532,6 +665,7 @@ impl NatManager {
     pub(crate) fn uninstall(&self) -> io::Result<()> {
         let mut guard = self.state.lock().expect("nat mutex poisoned");
         let Some(state) = guard.as_ref() else { return Ok(()) };
+        ensure_table_owned_or_absent()?;
         apply_batch(state.build_delete())
             .map_err(|e| io_err("uninstall nft ruleset", e))?;
         *guard = None;
@@ -592,7 +726,6 @@ fn io_err(hint: &str, err: NftablesError) -> io::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use nftables::schema::{NfCmd, NfObject};
 
     fn test_pool_v6() -> Ipv6Net {
         "fd00:ae::/64".parse().expect("valid test v6 pool")
@@ -728,50 +861,42 @@ mod tests {
         assert!(matches!(rule.expr.last(), Some(Statement::Drop(None))));
     }
 
-    /// Cell-to-cell traffic needs an accept rule. Without it the traffic
-    /// matches no rule and leaves the chain at its end. The other base
-    /// chains on the forward hook then decide.
     #[test]
-    fn install_accepts_cell_to_cell_within_the_pool() {
+    fn install_drops_cell_to_cell_by_interface() {
         let state = test_state();
-        let nft = state.build_install().to_nftables();
-        let rule = nft
-            .objects
-            .iter()
-            .filter_map(|o| match o {
-                NfObject::CmdObject(NfCmd::Add(NfListObject::Rule(r))) => {
-                    Some(r)
-                }
-                _ => None,
-            })
-            .find(|r| {
-                r.expr.len() == 3
-                    && matches!(r.expr[2], Statement::Accept(None))
-                    && matches!(&r.expr[0], Statement::Match(m)
-                        if is_pool_match(m, "saddr"))
-                    && matches!(&r.expr[1], Statement::Match(m)
-                        if is_pool_match(m, "daddr"))
-            });
-        assert!(
-            rule.is_some(),
-            "no `saddr @pool && daddr @pool accept` rule found"
-        );
+        let rule = state.rule_drop_cell_to_cell();
+        assert!(is_interface_set_match(&rule.expr[0], MetaKey::Iifname));
+        assert!(is_interface_set_match(&rule.expr[1], MetaKey::Oifname));
+        assert!(matches!(rule.expr[2], Statement::Drop(None)));
     }
 
-    fn is_pool_match(m: &Match<'_>, field: &str) -> bool {
-        let Expression::Named(NamedExpression::Payload(Payload::PayloadField(
-            PayloadField { protocol, field: f },
-        ))) = &m.left
+    fn is_interface_set_match(statement: &Statement<'_>, key: MetaKey) -> bool {
+        let Statement::Match(Match {
+            left: Expression::Named(NamedExpression::Meta(Meta { key: actual })),
+            right: Expression::String(set),
+            op: Operator::EQ,
+        }) = statement
         else {
             return false;
         };
-        protocol.as_ref() == "ip6" && f.as_ref() == field
+        *actual == key && set == "@cell_ifaces"
     }
 
-    /// A host with no IPv6 default route still receives the anti-spoof and
-    /// cell-to-cell rules. Only the egress and masquerade rules are absent.
-    /// If not, a host without v6 egress would run cells with no source
-    /// binding.
+    #[test]
+    fn forwarding_and_nat_are_scoped_to_owned_cell_interfaces() {
+        let state = test_state();
+        let egress = state.rule_allow_egress(TEST_IFACE);
+        assert!(is_interface_set_match(&egress.expr[0], MetaKey::Iifname));
+
+        let returned = state.rule_allow_return(TEST_IFACE);
+        assert!(is_interface_set_match(&returned.expr[1], MetaKey::Oifname));
+
+        let masquerade = state.rule_masquerade(TEST_IFACE);
+        assert!(is_interface_set_match(&masquerade.expr[0], MetaKey::Iifname));
+    }
+
+    /// A host with no IPv6 default route still receives anti-spoof and
+    /// fail-closed isolation rules. Only egress and masquerade are absent.
     #[test]
     fn install_without_wan_keeps_antispoof_and_drops_egress() {
         let state =
@@ -798,7 +923,7 @@ mod tests {
     }
 
     #[test]
-    fn install_declares_both_sets_with_interval_on_the_pair() {
+    fn install_declares_owner_and_source_sets() {
         let state = test_state();
         let nft = state.build_install().to_nftables();
         let sets: Vec<&Set<'_>> = nft
@@ -811,7 +936,13 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert_eq!(sets.len(), 2, "cell_ifaces and cell_src");
+        assert_eq!(sets.len(), 3, "owner marker, cell_ifaces, and cell_src");
+
+        let owner = sets
+            .iter()
+            .find(|s| s.name == OWNER_SET)
+            .expect("owner marker set");
+        assert_eq!(owner.comment.as_deref(), Some(OWNER_COMMENT));
 
         let ifaces = sets
             .iter()
@@ -834,6 +965,25 @@ mod tests {
             src.flags,
             Some(HashSet::from([SetFlag::Interval])),
             "cell_src must be an interval set"
+        );
+    }
+
+    #[test]
+    fn table_ownership_requires_the_marker() {
+        let state = test_state();
+        let owned = state.build_install().to_nftables();
+        assert_eq!(table_ownership(&owned), TableOwnership::Aurae);
+
+        let mut foreign = Batch::new();
+        foreign.add(NfListObject::Table(state.table()));
+        assert_eq!(
+            table_ownership(&foreign.to_nftables()),
+            TableOwnership::Foreign
+        );
+
+        assert_eq!(
+            table_ownership(&Batch::new().to_nftables()),
+            TableOwnership::Absent
         );
     }
 

@@ -69,16 +69,12 @@ use crate::ebpf::{
     SignalSignalGenerateTracepointProgram, TaskstatsExitKProbeProgram,
 };
 pub use crate::init::network::endpoint::NetworkConfig;
+pub use crate::init::network::ipam::IpamConfig;
 use crate::{
-    cells::CellService,
-    cri::oci::AuraeOCIBuilder,
-    cri::runtime_service::RuntimeService,
-    discovery::DiscoveryService,
-    init::Context as AuraeContext,
-    init::SocketStream,
-    init::network::{Network, ipam::IpamConfig},
-    logging::log_channel::LogChannel,
-    observe::ObserveService,
+    cells::CellService, cri::oci::AuraeOCIBuilder,
+    cri::runtime_service::RuntimeService, discovery::DiscoveryService,
+    init::Context as AuraeContext, init::SocketStream, init::network::Network,
+    logging::log_channel::LogChannel, observe::ObserveService,
     spawn::spawn_auraed_oci_to,
 };
 use anyhow::{Context, anyhow};
@@ -166,18 +162,33 @@ impl Default for AuraedRuntime {
     }
 }
 
-/// Starts the runtime loop for the daemon.
+/// Starts the runtime loop for the daemon without cell networking.
+///
+/// Use [`run_with_network`] when the daemon needs endpoint configuration or
+/// should provide networking to isolated cells.
 pub async fn run(
     runtime: AuraedRuntime,
     socket: Option<String>,
     verbose: bool,
     nested: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    run_with_network(runtime, socket, verbose, nested, None, None).await
+}
+
+/// Starts the runtime loop with optional endpoint and host cell networking.
+pub async fn run_with_network(
+    runtime: AuraedRuntime,
+    socket: Option<String>,
+    verbose: bool,
+    nested: bool,
     net_config: Option<NetworkConfig>,
+    host_ipam_config: Option<IpamConfig>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     async fn inner<T, IO, IE>(
         runtime: &AuraedRuntime,
         context: AuraeContext,
         socket_stream: T,
+        host_ipam_config: Option<IpamConfig>,
     ) -> Result<(), Box<dyn std::error::Error>>
     where
         T: tokio_stream::Stream<Item = Result<IO, IE>> + Send + 'static,
@@ -265,25 +276,28 @@ pub async fn run(
         // `None`. `CellService` then refuses an allocation with
         // `isolate_network` set.
         let network: Option<Network> = if context == AuraeContext::Daemon {
-            match Network::connect(IpamConfig::default()) {
-                Ok(net) => match net.init_host_network().await {
-                    Ok(()) => Some(net),
+            match host_ipam_config {
+                Some(config) => match Network::connect(config) {
+                    Ok(net) => match net.init_host_network().await {
+                        Ok(()) => Some(net),
+                        Err(e) => {
+                            error!(
+                                "Cell networking unavailable: {e}. Cells with \
+                             isolate_network=true cannot be allocated."
+                            );
+                            None
+                        }
+                    },
                     Err(e) => {
                         error!(
-                            "Cell networking unavailable: {e}. Cells with \
-                             isolate_network=true cannot be allocated."
+                            "Failed to connect to netlink for cell networking: \
+                         {e}. Cells with isolate_network=true cannot start \
+                         without it."
                         );
                         None
                     }
                 },
-                Err(e) => {
-                    error!(
-                        "Failed to connect to netlink for cell networking: \
-                         {e}. Cells with isolate_network=true cannot start \
-                         without it."
-                    );
-                    None
-                }
+                None => None,
             }
         } else {
             None
@@ -380,8 +394,12 @@ pub async fn run(
     let (context, stream) =
         init::init(verbose, nested, socket, net_config).await;
     match stream {
-        SocketStream::Tcp(stream) => inner(runtime, context, stream).await,
-        SocketStream::Unix(stream) => inner(runtime, context, stream).await,
+        SocketStream::Tcp(stream) => {
+            inner(runtime, context, stream, host_ipam_config).await
+        }
+        SocketStream::Unix(stream) => {
+            inner(runtime, context, stream, host_ipam_config).await
+        }
     }
 }
 
