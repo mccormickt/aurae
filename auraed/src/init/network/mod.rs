@@ -108,10 +108,7 @@ pub enum NetworkError {
     ErrorRenamingLink { old: String, new: String, source: rtnetlink::Error },
     #[error("Failed to enable cell-net BPF guard for `{iface}`: {source}")]
     BpfGuardFailed { iface: String, source: Box<bpf::CellGuardError> },
-    #[error(
-        "cell-net BPF guard is not loaded; refusing to create an unguarded \
-         cell interface for `{iface}`"
-    )]
+    #[error("cell-net BPF state for `{iface}` exists without a loaded guard")]
     GuardNotLoaded { iface: String },
     #[error(transparent)]
     Other(#[from] rtnetlink::Error),
@@ -132,7 +129,8 @@ struct NetworkInner {
     nat: NatManager,
     /// The host interface state for each cell.
     cell_interfaces: Mutex<HashMap<CellName, CellInterfaceState>>,
-    /// The eBPF guard that enforces cell source addresses.
+    /// Optional eBPF source guard and cell-to-cell accelerator. nftables is
+    /// the mandatory enforcement and fallback path.
     cell_guard: OnceLock<CellNetGuard>,
     /// The IPAM allocator.
     ipam: Ipam,
@@ -145,6 +143,10 @@ impl fmt::Debug for Network {
             self.inner.cell_interfaces.lock().map(|g| g.len()).unwrap_or(0);
         f.debug_struct("Network")
             .field("nat_installed", &self.inner.nat.is_installed())
+            .field(
+                "cell_net_guard_loaded",
+                &self.inner.cell_guard.get().is_some(),
+            )
             .field("cell_interface_count", &cell_count)
             .finish()
     }

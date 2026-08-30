@@ -32,7 +32,7 @@ use ipnet::Ipv6Net;
 use netlink_packet_route::link::{NetkitMode, NetkitPolicy};
 use nix::libc;
 use rtnetlink::{LinkNetkit, LinkUnspec};
-use std::os::fd::{AsRawFd, BorrowedFd};
+use std::os::fd::{AsRawFd, OwnedFd};
 use std::sync::{Arc, Mutex};
 use tracing::{info, trace, warn};
 
@@ -47,9 +47,21 @@ pub(super) struct CellInterfaceState {
     delegated: Ipv6Net,
     /// Index used by the eBPF policy and redirect maps.
     ifindex: u32,
-    /// Owns the tcx attachment until cleanup succeeds.
-    bpf_link: Arc<Mutex<Option<SchedClassifierLink>>>,
-    source_bound: bool,
+    /// Keeps the target network namespace alive if the child exits. The
+    /// kernel-managed target map separately detects explicit link deletion.
+    _peer_netns: Arc<OwnedFd>,
+    /// Cleanup flags are shared by snapshots of this state so each successful
+    /// step remains complete across asynchronous teardown and retries.
+    enforcement: Arc<Mutex<CellEnforcementState>>,
+}
+
+struct CellEnforcementState {
+    /// Owns the tcx attachment until source cleanup begins.
+    bpf_link: Option<SchedClassifierLink>,
+    bpf_armed: bool,
+    nft_bound: bool,
+    /// Non-reused key in the kernel's identity-bearing target map.
+    redirect_id: Option<u32>,
 }
 
 impl Network {
@@ -99,7 +111,7 @@ impl Network {
         &self,
         cell_name: &CellName,
         allocation: &Allocation,
-        peer_netns_fd: BorrowedFd<'_>,
+        peer_netns_fd: OwnedFd,
         primary: &str,
         peer: &str,
     ) -> Result<(), NetworkError> {
@@ -133,33 +145,43 @@ impl Network {
                 }
             };
 
-        let Some(cell_guard) = self.inner.cell_guard.get() else {
-            self.delete_primary_best_effort(primary).await;
-            return Err(NetworkError::GuardNotLoaded {
-                iface: primary.to_string(),
-            });
-        };
-        let bpf_link = cell_guard
-            .arm_for_cell(primary, ifindex, allocation.delegated)
-            .map_err(|source| NetworkError::BpfGuardFailed {
-                iface: primary.to_string(),
-                source: Box::new(source),
-            });
-        let bpf_link = match bpf_link {
-            Ok(link) => link,
-            Err(error) => {
-                self.delete_primary_best_effort(primary).await;
-                return Err(error);
+        // The nft binding below is the mandatory source policy. Arm the BPF
+        // accelerator when it is available, but preserve the nft/host-stack
+        // path if loading or attachment is unsupported on this host.
+        let bpf_link = match self.inner.cell_guard.get() {
+            Some(cell_guard) => {
+                match cell_guard.arm_for_cell(
+                    primary,
+                    ifindex,
+                    allocation.delegated,
+                ) {
+                    Ok(link) => Some(link),
+                    Err(error) => {
+                        warn!(
+                            "Cell interface `{primary}`: cell-net BPF attach \
+                             failed: {error}. Using nft/host-stack mode."
+                        );
+                        None
+                    }
+                }
             }
+            None => None,
         };
 
+        let peer_netns = Arc::new(peer_netns_fd);
+        let bpf_armed = bpf_link.is_some();
         // Track the pair before a later operation can fail.
         let state = CellInterfaceState {
             primary: primary.to_string(),
             delegated: allocation.delegated,
             ifindex,
-            bpf_link: Arc::new(Mutex::new(Some(bpf_link))),
-            source_bound: false,
+            _peer_netns: peer_netns.clone(),
+            enforcement: Arc::new(Mutex::new(CellEnforcementState {
+                bpf_link,
+                bpf_armed,
+                nft_bound: false,
+                redirect_id: None,
+            })),
         };
         let tracked = match self.inner.cell_interfaces.lock() {
             Ok(mut guard) => {
@@ -169,12 +191,22 @@ impl Network {
             Err(_poisoned) => false,
         };
         if !tracked {
-            let link = state
-                .bpf_link
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .take();
-            cell_guard.disable_for_cell(ifindex, allocation.delegated, link);
+            {
+                let mut enforcement = state
+                    .enforcement
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                let link = enforcement.bpf_link.take();
+                if enforcement.bpf_armed
+                    && let Some(cell_guard) = self.inner.cell_guard.get()
+                    && let Err(error) = cell_guard.disarm_source(ifindex, link)
+                {
+                    warn!(
+                        "Rollback: failed to disarm cell-net BPF for \
+                         `{primary}` (ifindex {ifindex}): {error}"
+                    );
+                }
+            }
             self.delete_primary_best_effort(primary).await;
             return Err(NetworkError::CellInterfacesPoisoned);
         }
@@ -193,13 +225,17 @@ impl Network {
             };
         }
         {
-            let mut guard = self
+            let guard = self
                 .inner
                 .cell_interfaces
                 .lock()
                 .map_err(|_| NetworkError::CellInterfacesPoisoned)?;
-            if let Some(state) = guard.get_mut(cell_name) {
-                state.source_bound = true;
+            if let Some(state) = guard.get(cell_name) {
+                state
+                    .enforcement
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .nft_bound = true;
             }
         }
 
@@ -208,7 +244,7 @@ impl Network {
         // name in the host network namespace before the move.
         let setup_result: Result<(), NetworkError> = async {
             let peer_msg = LinkUnspec::new_with_name(peer)
-                .setns_by_fd(peer_netns_fd.as_raw_fd())
+                .setns_by_fd(peer_netns.as_raw_fd())
                 .build();
             self.inner.handle.link().set(peer_msg).execute().await.map_err(
                 |e| NetworkError::ErrorMovingLinkToNetns {
@@ -236,39 +272,73 @@ impl Network {
             };
         }
 
+        let guard_mode = if bpf_armed { "bpf" } else { "nft" };
         info!(
             "Created cell interface for {cell_name}: primary={primary} \
-             peer={peer}, host={}, guest={} (guard on)",
+             peer={peer}, host={}, guest={} (guard={guard_mode})",
             allocation.host_ip, allocation.guest_ip,
         );
         Ok(())
     }
 
-    /// Remove the nftables source binding of a cell. All rollback and
-    /// teardown paths use this function, so that a leftover element cannot
-    /// accept a recycled interface name.
-    ///
-    /// The function is synchronous and best-effort. The callers are already
-    /// on a failure or teardown path, and `Cell::kill` and `Drop` have no
-    /// runtime to await on.
-    fn unbind_cell_enforcement(
+    /// Remove both source-enforcement layers. Each successful step updates
+    /// shared state, all pending steps are attempted, and the first failure
+    /// is returned so a later teardown can retry only what remains.
+    fn cleanup_cell_enforcement(
         &self,
         state: &CellInterfaceState,
     ) -> Result<(), NetworkError> {
-        self.inner
-            .nat
-            .unbind_cell_source(&state.primary, state.delegated)
-            .map_err(NetworkError::FailedToConnect)?;
+        let mut enforcement =
+            state.enforcement.lock().unwrap_or_else(|poisoned| {
+                warn!(
+                    "Cell interface `{}` enforcement mutex poisoned; \
+                     recovering for cleanup",
+                    state.primary
+                );
+                poisoned.into_inner()
+            });
+        let mut first_error = None;
 
-        let link = state
-            .bpf_link
-            .lock()
-            .map_err(|_| NetworkError::CellInterfacesPoisoned)?
-            .take();
-        if let Some(cell_guard) = self.inner.cell_guard.get() {
-            cell_guard.disable_for_cell(state.ifindex, state.delegated, link);
+        if enforcement.nft_bound {
+            match self
+                .inner
+                .nat
+                .unbind_cell_source(&state.primary, state.delegated)
+            {
+                Ok(()) => enforcement.nft_bound = false,
+                Err(source) => {
+                    first_error = Some(NetworkError::FailedToConnect(source));
+                }
+            }
         }
-        Ok(())
+
+        if enforcement.bpf_armed {
+            let link = enforcement.bpf_link.take();
+            let result = match self.inner.cell_guard.get() {
+                Some(cell_guard) => cell_guard
+                    .disarm_source(state.ifindex, link)
+                    .map_err(|source| NetworkError::BpfGuardFailed {
+                        iface: state.primary.clone(),
+                        source: Box::new(source),
+                    }),
+                None => Err(NetworkError::GuardNotLoaded {
+                    iface: state.primary.clone(),
+                }),
+            };
+            match result {
+                Ok(()) => enforcement.bpf_armed = false,
+                Err(error) if first_error.is_none() => {
+                    first_error = Some(error);
+                }
+                Err(error) => warn!(
+                    "Additional cleanup failure for cell interface `{}`: \
+                     {error}",
+                    state.primary
+                ),
+            }
+        }
+
+        first_error.map_or(Ok(()), Err)
     }
 
     /// Publish a ready cell as a target of the eBPF redirect fast path.
@@ -285,15 +355,64 @@ impl Network {
             guard.get(cell_name).cloned()
         };
         let Some(state) = state else { return Ok(()) };
+        let mut enforcement = state
+            .enforcement
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if !enforcement.bpf_armed || enforcement.redirect_id.is_some() {
+            return Ok(());
+        }
         let Some(cell_guard) = self.inner.cell_guard.get() else {
             return Err(NetworkError::GuardNotLoaded { iface: state.primary });
         };
-        cell_guard.publish_redirect(state.ifindex, state.delegated).map_err(
+        let redirect_id = cell_guard
+            .publish_redirect(state.ifindex, state.delegated)
+            .map_err(|source| NetworkError::BpfGuardFailed {
+                iface: format!("ifindex {}", state.ifindex),
+                source: Box::new(source),
+            })?;
+        enforcement.redirect_id = Some(redirect_id);
+        info!(
+            "Published cell-to-cell BPF fast path for {cell_name}: \
+             primary={}, delegated={}, redirect_id={redirect_id}",
+            state.primary, state.delegated
+        );
+        Ok(())
+    }
+
+    /// Stop directing sibling traffic at a cell. This must succeed before
+    /// the child process is stopped or its netkit primary is deleted.
+    pub(crate) fn unpublish_cell_redirect(
+        &self,
+        cell_name: &CellName,
+    ) -> Result<(), NetworkError> {
+        let state = {
+            let guard = self
+                .inner
+                .cell_interfaces
+                .lock()
+                .map_err(|_| NetworkError::CellInterfacesPoisoned)?;
+            guard.get(cell_name).cloned()
+        };
+        let Some(state) = state else { return Ok(()) };
+        let mut enforcement = state
+            .enforcement
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let Some(redirect_id) = enforcement.redirect_id else {
+            return Ok(());
+        };
+        let Some(cell_guard) = self.inner.cell_guard.get() else {
+            return Err(NetworkError::GuardNotLoaded { iface: state.primary });
+        };
+        cell_guard.unpublish_redirect(state.delegated, redirect_id).map_err(
             |source| NetworkError::BpfGuardFailed {
                 iface: format!("ifindex {}", state.ifindex),
                 source: Box::new(source),
             },
-        )
+        )?;
+        enforcement.redirect_id = None;
+        Ok(())
     }
 
     /// Delete a host-side primary by name. The function is best-effort.
@@ -351,6 +470,10 @@ impl Network {
         let Some(state) = state else { return Ok(()) };
         let primary = &state.primary;
 
+        // Remove both publication maps before deleting the target. The
+        // target map also fails safely if the peer was explicitly deleted.
+        self.unpublish_cell_redirect(cell_name)?;
+
         let index = match get_link_index(&self.inner.handle, primary.clone())
             .await
         {
@@ -379,9 +502,7 @@ impl Network {
             }
         }
 
-        if state.source_bound {
-            self.unbind_cell_enforcement(&state)?;
-        }
+        self.cleanup_cell_enforcement(&state)?;
         let mut guard = self
             .inner
             .cell_interfaces

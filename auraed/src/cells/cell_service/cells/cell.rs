@@ -23,7 +23,6 @@ use crate::init::network::ipam::Allocation;
 use client::AuraeSocket;
 use std::fs::File;
 use std::io;
-use std::os::fd::AsFd;
 use std::time::{Duration, Instant};
 use tracing::{info, warn};
 
@@ -146,10 +145,30 @@ impl Cell {
         Ok(())
     }
 
+    /// Remove the cell from the BPF destination map while its process and
+    /// retained network namespace are still alive. The nft host-stack path
+    /// remains available after this operation.
+    fn unpublish_network(
+        cell_name: &CellName,
+        cell_network: &Option<CellNetwork>,
+    ) -> Result<()> {
+        let Some(resource) = cell_network.as_ref() else {
+            return Ok(());
+        };
+        resource.network.unpublish_cell_redirect(cell_name).map_err(|source| {
+            CellsError::NetworkSetupFailed {
+                cell_name: cell_name.clone(),
+                source: Box::new(source),
+            }
+        })
+    }
+
     async fn retry_pending_cleanup(&mut self) -> Result<()> {
         let CellState::CleanupPending(cleanup) = &mut self.state else {
             return Ok(());
         };
+
+        Self::unpublish_network(&self.cell_name, &cleanup.cell_network)?;
 
         let process_result =
             if let Some(auraed) = cleanup.nested_auraed.as_mut() {
@@ -344,7 +363,7 @@ impl Cell {
                 .create_cell_interface(
                     &self.cell_name,
                     &cell_network_ref.allocation,
-                    netns_file.as_fd(),
+                    netns_file.into(),
                     primary,
                     peer,
                 )
@@ -427,6 +446,10 @@ impl Cell {
             cell_network,
         } = &mut self.state
         {
+            // Unpublish before process exit can destroy the target network
+            // namespace. The kernel target map also handles explicit link
+            // deletion, but orderly teardown should not depend on it.
+            Self::unpublish_network(&self.cell_name, cell_network)?;
             let children_teardown = children.broadcast_free().await;
 
             let signal_result = nested_auraed.shutdown().await;
@@ -459,6 +482,7 @@ impl Cell {
             cell_network,
         } = &mut self.state
         {
+            Self::unpublish_network(&self.cell_name, cell_network)?;
             let children_teardown = children.broadcast_kill().await;
 
             let signal_result = nested_auraed.kill().await;
@@ -491,11 +515,37 @@ impl Cell {
     pub(super) fn signal_kill_for_drop(&mut self) {
         match &mut self.state {
             CellState::CleanupPending(cleanup) => {
+                if let Err(error) = Self::unpublish_network(
+                    &self.cell_name,
+                    &cleanup.cell_network,
+                ) {
+                    warn!(
+                        "Cell {}: failed to unpublish redirect during Drop: \
+                         {error}. Retaining the network namespace until the \
+                         host Network is dropped.",
+                        self.cell_name
+                    );
+                }
                 if let Some(auraed) = cleanup.nested_auraed.as_mut() {
                     let _best_effort = auraed.signal_kill_for_drop();
                 }
             }
-            CellState::Allocated { nested_auraed, children, .. } => {
+            CellState::Allocated {
+                nested_auraed,
+                children,
+                cell_network,
+                ..
+            } => {
+                if let Err(error) =
+                    Self::unpublish_network(&self.cell_name, cell_network)
+                {
+                    warn!(
+                        "Cell {}: failed to unpublish redirect during Drop: \
+                         {error}. Retaining the network namespace until the \
+                         host Network is dropped.",
+                        self.cell_name
+                    );
+                }
                 children.signal_kill_for_drop();
                 let _best_effort = nested_auraed.signal_kill_for_drop();
             }

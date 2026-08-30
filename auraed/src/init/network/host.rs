@@ -66,17 +66,22 @@ impl Network {
             NetworkError::FailedToConnect(e)
         })?;
 
-        // Load the guard before enabling forwarding. This keeps startup
-        // fail-closed if the eBPF program is unavailable.
-        let guard = CellNetGuard::load().map_err(|source| {
-            let error = NetworkError::BpfGuardFailed {
-                iface: "<host>".to_string(),
-                source: Box::new(source),
-            };
-            error!("{error}; refusing to start cells");
-            error
-        })?;
-        let _ = self.inner.cell_guard.set(guard);
+        // nftables is the mandatory source-enforcement layer. Load eBPF as
+        // an optional cell-to-cell accelerator; missing artifacts, kernel
+        // support, or BPF privileges must not regress nft-isolated cells.
+        let guard_mode = match CellNetGuard::load() {
+            Ok(guard) => {
+                let _ = self.inner.cell_guard.set(guard);
+                "bpf"
+            }
+            Err(error) => {
+                warn!(
+                    "Cell-net BPF guard unavailable: {error}. Isolated cells \
+                     will use nft/host-stack mode."
+                );
+                "nft"
+            }
+        };
 
         if let Err(e) = enable_forwarding_v6() {
             if let Err(cleanup_error) = self.inner.nat.uninstall() {
@@ -91,12 +96,12 @@ impl Network {
         match wan_iface {
             Some(wan) => info!(
                 "Host network ready for v6={pool_v6}: per-cell anti-spoof, \
-                 cell-to-cell, and NAT egress via '{wan}'"
+                 cell-to-cell, and NAT egress via '{wan}' (guard={guard_mode})"
             ),
             None => warn!(
                 "Host network ready for v6={pool_v6}, but there is no IPv6 \
                  default route — cells reach each other and the host, not \
-                 the internet."
+                 the internet (guard={guard_mode})."
             ),
         }
         Ok(())

@@ -72,7 +72,7 @@ pub struct CellNetConfig {
 
 /// The datapath counters of one cell. They are in the per-CPU
 /// `CELL_STATS` map, keyed by the ifindex of the host-side netkit primary.
-/// Userspace adds the values of all CPUs. The struct has 32 bytes and no
+/// Userspace adds the values of all CPUs. The struct has 40 bytes and no
 /// implicit padding.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -80,11 +80,14 @@ pub struct CellNetStats {
     /// The packets that the guard dropped, because the source address was
     /// outside the delegated prefix of the cell.
     pub spoof_dropped: u64,
-    /// The packets that the guard sent to the netns of a different cell
-    /// with `bpf_redirect_peer`. This counter holds the attempts. The
-    /// kernel finds the peer after the program returns and discards the
-    /// packet if the target device is absent or down.
-    pub redirected: u64,
+    /// Calls to `bpf_redirect_peer` for packets whose destination matched
+    /// another cell. The kernel resolves the peer after the program returns,
+    /// so this counter records attempts rather than confirmed deliveries.
+    pub redirect_attempted: u64,
+    /// Prefix matches whose identity-bearing target was absent. This can
+    /// indicate device unregister racing with userspace reconciliation.
+    /// The packet falls back to the nft/host-stack path.
+    pub redirect_missed: u64,
     /// The packets that the guard gave to the host stack for the
     /// gateway-local delivery or for the NAT egress.
     pub passed: u64,
@@ -128,26 +131,18 @@ pub fn ipv6_in_prefix(
         && (a_lo & mask64(lo_bits)) == (n_lo & mask64(lo_bits))
 }
 
-/// True if a cell can send a packet with this source and destination.
+/// True if a source address is in the delegated prefix of a cell.
 ///
-/// The source must be in the delegated prefix of the cell. There is one
-/// exception. An MLD report from an L3 netkit peer has the unspecified
-/// source `::`, because such a peer has no link-local address. The
-/// exception applies to a multicast destination only. Multicast must not
-/// skip the source check, because a cell could then forge the address of a
-/// sibling cell in a multicast frame. The host stack processes the ICMPv6
-/// traffic that arrives on the primary of the cell.
+/// This is deliberately identical to the nftables source policy that remains
+/// active when the BPF guard is absent. In particular, an unspecified source
+/// is rejected even for multicast traffic.
 #[inline(always)]
 pub fn cell_source_allowed(
     saddr: &[u8; 16],
-    daddr: &[u8; 16],
     allowed_net: &[u8; 16],
     prefix_len: u32,
 ) -> bool {
-    if ipv6_in_prefix(saddr, allowed_net, prefix_len) {
-        return true;
-    }
-    is_multicast(daddr) && *saddr == [0u8; 16]
+    ipv6_in_prefix(saddr, allowed_net, prefix_len)
 }
 
 /// True for an IPv6 multicast address in `ff00::/8`.
@@ -160,7 +155,7 @@ pub fn is_multicast(addr: &[u8; 16]) -> bool {
 mod user {
     // SAFETY: both types are #[repr(C)] and have no implicit padding.
     // `CellNetConfig` has 16+4 bytes with an alignment of 4, and
-    // `CellNetStats` has four 8-byte fields with an alignment of 8. Each
+    // `CellNetStats` has five 8-byte fields with an alignment of 8. Each
     // field is an integer, thus each bit pattern is a valid value.
     unsafe impl aya::Pod for super::CellNetConfig {}
     unsafe impl aya::Pod for super::CellNetStats {}
@@ -180,75 +175,36 @@ mod tests {
     const SIBLING: &str = "fd00:ae::3";
 
     #[test]
-    fn in_prefix_source_is_allowed_to_any_destination() {
-        let net = addr(SELF_NET);
-        assert!(cell_source_allowed(&net, &addr(SIBLING), &net, 128));
-        assert!(cell_source_allowed(&net, &addr("2001:db8::1"), &net, 128));
-        assert!(cell_source_allowed(&net, &addr("ff02::16"), &net, 128));
+    fn network_map_types_have_stable_abi_sizes() {
+        assert_eq!(core::mem::size_of::<super::CellNetConfig>(), 20);
+        assert_eq!(core::mem::size_of::<super::CellNetStats>(), 40);
     }
 
     #[test]
-    fn off_prefix_source_is_rejected_even_for_multicast() {
-        // A cell must not forge the address of a sibling cell with a
-        // packet to a multicast group.
+    fn in_prefix_source_is_allowed() {
         let net = addr(SELF_NET);
-        assert!(!cell_source_allowed(
-            &addr(SIBLING),
-            &addr("ff02::1"),
-            &net,
-            128
-        ));
-        assert!(!cell_source_allowed(
-            &addr(SIBLING),
-            &addr("ff02::16"),
-            &net,
-            128
-        ));
-        assert!(!cell_source_allowed(
-            &addr("fd00:ae::1"),
-            &addr("ff02::2"),
-            &net,
-            128
-        ));
-        assert!(!cell_source_allowed(
-            &addr(SIBLING),
-            &addr("2001:db8::1"),
-            &net,
-            128
-        ));
+        assert!(cell_source_allowed(&net, &net, 128));
     }
 
     #[test]
-    fn unspecified_source_is_allowed_only_for_multicast() {
-        // An MLD report from an L3 netkit peer has no source address.
+    fn off_prefix_source_is_rejected() {
         let net = addr(SELF_NET);
-        assert!(cell_source_allowed(&addr("::"), &addr("ff02::16"), &net, 128));
-        // An unspecified source on unicast is always incorrect.
-        assert!(!cell_source_allowed(&addr("::"), &addr(SIBLING), &net, 128));
-        assert!(!cell_source_allowed(
-            &addr("::"),
-            &addr("fd00:ae::1"),
-            &net,
-            128
-        ));
+        assert!(!cell_source_allowed(&addr(SIBLING), &net, 128));
+        assert!(!cell_source_allowed(&addr("fd00:ae::1"), &net, 128));
+    }
+
+    #[test]
+    fn unspecified_source_is_rejected() {
+        let net = addr(SELF_NET);
+        assert!(!cell_source_allowed(&addr("::"), &net, 128));
     }
 
     #[test]
     fn wider_delegation_admits_its_whole_prefix() {
         // A VM cell receives a prefix and not one address.
         let net = addr("fd00:ae:0:0:1::");
-        assert!(cell_source_allowed(
-            &addr("fd00:ae:0:0:1:dead::5"),
-            &addr(SIBLING),
-            &net,
-            80
-        ));
-        assert!(!cell_source_allowed(
-            &addr("fd00:ae:0:0:2::5"),
-            &addr(SIBLING),
-            &net,
-            80
-        ));
+        assert!(cell_source_allowed(&addr("fd00:ae:0:0:1:dead::5"), &net, 80));
+        assert!(!cell_source_allowed(&addr("fd00:ae:0:0:2::5"), &net, 80));
     }
 
     #[test]

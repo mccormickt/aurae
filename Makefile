@@ -83,13 +83,13 @@ lint: fmt auraed-lint not-auraed-lint ## Run all lints
 test: musl lint build auraed-test not-auraed-test ## Builds, lints, and tests (does not include ignored tests)
 
 .PHONY: test-all
-test-all: musl lint build auraed-test-all not-auraed-test-all ## Run lints and tests (includes ignored tests)
+test-all: musl lint build ebpf auraed-test-all not-auraed-test-all ## Run lints and tests (includes ignored tests)
 
 .PHONY: build
-build: musl auraed-build not-auraed-build ## Build
+build: musl auraed-build not-auraed-build ebpf-build ## Build
 
 .PHONY: install
-install: musl lint test auraed-debug auraescript-debug aer-debug ## Lint, test, and install (debug) 🎉
+install: musl lint test ebpf auraed-debug auraescript-debug aer-debug ## Lint, test, and install (debug) 🎉
 
 .PHONY: docs
 docs: docs-crates docs-stdlib docs-other ## Assemble all the /docs for the website locally.
@@ -231,6 +231,11 @@ MUSL_TARGET=--target $(uname_m)-unknown-linux-musl
 
 $(foreach p,$(PROGS),$(eval $(call AURAE_template,$(p),$(if $(findstring auraed,$(p)),$(MUSL_TARGET),))))
 
+# The host daemon owns the cell-net probe. Keep the focused auraed targets
+# used by CI in sync with the top-level build/install targets.
+auraed-build auraed-build-release auraed-test: ebpf-build
+auraed-test-all auraed-test-integration: ebpf
+
 #------------------------------------------------------------------------------#
 
 # auraed Commands
@@ -281,9 +286,13 @@ libs-test: $(GEN_RS) $(GEN_TS)
 libs-test-all: $(GEN_RS) $(GEN_TS)
 	$(cargo) test --workspace --locked --exclude auraed --exclude auraescript --exclude aer -- --include-ignored
 
+.PHONY: ebpf-build
+ebpf-build:
+	cd ebpf && make release
+
 .PHONY: ebpf
-ebpf:
-	cd ebpf && make release install
+ebpf: ebpf-build
+	cd ebpf && make install
 
 #------------------------------------------------------------------------------#
 
@@ -384,7 +393,7 @@ build-guest-kernel: hypervisor/guest-kernel/linux-cloud-hypervisor
 	cp hypervisor/guest-kernel/linux-cloud-hypervisor/arch/x86/boot/compressed/vmlinux.bin /var/lib/aurae/vm/kernel/vmlinux.bin
 
 .PHONY: prepare-image
-prepare-image:
+prepare-image: ebpf-build
 	mkdir -p /var/lib/aurae/vm/image
 	curl $(vm_image) -o /var/lib/aurae/vm/image/disk.img
 	qemu-img convert -p -f qcow2 -O raw /var/lib/aurae/vm/image/disk.img /var/lib/aurae/vm/image/disk.raw
@@ -409,7 +418,7 @@ e2e-vm-in-cell: aer-debug auraed-debug ## E2E test of VM-in-cell networking thro
 # CI Commands
 
 .PHONY: ci-release
-ci-release: test auraed-build-release auraescript-build-release aer-build-release # Preps release artifacts (for CI use)
+ci-release: test ebpf-build auraed-build-release auraescript-build-release aer-build-release # Preps release artifacts (for CI use)
 
 .PHONY: ci-stage-release-artifacts
 ci-stage-release-artifacts: ci-release ## Preps and stages release artifacts (for CI use)

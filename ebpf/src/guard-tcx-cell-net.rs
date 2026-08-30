@@ -42,11 +42,9 @@
 //!
 //! 1. fails closed. A device without a `CELL_CONFIG` entry gets a drop.
 //! 2. binds the source address to the cell with `cell_source_allowed`. The
-//!    source must be in the delegated prefix of the cell. There is one
-//!    exception for the unspecified source on multicast, which MLD needs.
-//!    This check is deliberately the same as the per-cell binding in
-//!    nftables. The nft rules still apply while this program is detached.
-//!    Refer to `init/network/bpf.rs`.
+//!    source must be in the delegated prefix of the cell. This check is the
+//!    same as the per-cell binding in nftables. The nft rules still apply
+//!    while this program is detached. Refer to `init/network/bpf.rs`.
 //! 3. sends cell-to-cell traffic directly into the netns of the
 //!    destination cell with `bpf_redirect_peer()`. The packet stays in the
 //!    same softirq and enters neither the host stack nor netfilter.
@@ -69,7 +67,7 @@ use aya_ebpf::bindings::{TC_ACT_OK, TC_ACT_REDIRECT, TC_ACT_SHOT};
 use aya_ebpf::helpers::{bpf_redirect_peer, bpf_skb_load_bytes_relative};
 use aya_ebpf::macros::{classifier, map};
 use aya_ebpf::maps::lpm_trie::Key;
-use aya_ebpf::maps::{HashMap, LpmTrie, PerCpuHashMap};
+use aya_ebpf::maps::{DevMapHash, HashMap, LpmTrie, PerCpuHashMap};
 use aya_ebpf::programs::TcContext;
 use core::ffi::c_void;
 
@@ -87,13 +85,21 @@ const ETH_P_IPV6_BE: u32 = (0x86DDu16).to_be() as u32;
 static CELL_CONFIG: HashMap<u32, CellNetConfig> =
     HashMap::with_max_entries(4096, 0);
 
-/// The map from a delegated prefix to the netkit primary ifindex of its
-/// cell. It is an LPM trie, thus a VM cell can later use a prefix shorter
-/// than /128. `with_max_entries` adds `BPF_F_NO_PREALLOC`, which the kernel
-/// needs for an LPM trie.
+/// The map from a delegated prefix to the non-reused publication ID of its
+/// cell. It is an LPM trie, thus a VM cell can use a prefix shorter than
+/// /128. `with_max_entries` adds `BPF_F_NO_PREALLOC`, which the kernel needs
+/// for an LPM trie.
 #[map(name = "CELL_REDIRECT")]
 static CELL_REDIRECT: LpmTrie<[u8; 16], u32> =
     LpmTrie::with_max_entries(8192, 0);
+
+/// The identity-bearing redirect targets. The kernel associates each entry
+/// with a specific net_device and removes it on NETDEV_UNREGISTER. A stale
+/// prefix therefore cannot redirect to a different device that later reuses
+/// the same numeric ifindex. Userspace never reuses a publication ID during
+/// the lifetime of these maps.
+#[map(name = "CELL_TARGETS")]
+static CELL_TARGETS: DevMapHash = DevMapHash::with_max_entries(4096, 0);
 
 /// The counters of each cell, keyed by the ifindex of its netkit primary.
 /// The host auraed inserts a zeroed entry before the attach.
@@ -155,7 +161,7 @@ fn try_cell_ingress(ctx: &TcContext) -> Result<i32, i32> {
     // The per-cell anti-spoof check. `cell_source_allowed` is in
     // `aurae-ebpf-shared`, thus a host-side unit test can call it. A root
     // integration test is not the only test of this decision.
-    if !cell_source_allowed(&saddr, &daddr, &cfg.allowed_net, cfg.prefix_len) {
+    if !cell_source_allowed(&saddr, &cfg.allowed_net, cfg.prefix_len) {
         count(ifindex, Field::SpoofDropped);
         return Err(TC_ACT_SHOT as i32);
     }
@@ -169,22 +175,26 @@ fn try_cell_ingress(ctx: &TcContext) -> Result<i32, i32> {
     }
 
     // The cell-to-cell fast path sends the packet directly into the netns
-    // of the destination cell. The kernel finds the peer after this program
-    // returns, in `skb_do_redirect`. It discards the packet if the target
-    // device is absent or down. Thus a failed redirect fails closed and
-    // does not continue to the host stack.
+    // of the destination cell. The identity-bearing target map misses after
+    // device unregister and then deliberately falls through to the nft/host
+    // stack. Once the helper accepts a live target, a later redirect failure
+    // drops the packet rather than bypassing policy.
     let key = Key::new(128, daddr);
-    if let Some(target) = CELL_REDIRECT.get(&key) {
-        count(ifindex, Field::Redirected);
-        // With the flags value 0 the helper must return TC_ACT_REDIRECT.
-        // Change each other result to a drop, so that an unexpected result
-        // fails closed. A negative error code must not enter the
-        // datapath.
-        let ret = unsafe { bpf_redirect_peer(*target, 0) } as i32;
-        if ret != TC_ACT_REDIRECT as i32 {
-            return Err(TC_ACT_SHOT as i32);
+    if let Some(redirect_id) = CELL_REDIRECT.get(&key) {
+        if let Some(target) = CELL_TARGETS.get(*redirect_id) {
+            count(ifindex, Field::RedirectAttempted);
+            // With the flags value 0 the helper must return TC_ACT_REDIRECT.
+            // Change each other result to a drop, so that an unexpected result
+            // fails closed. A negative error code must not enter the
+            // datapath.
+            let ret = unsafe { bpf_redirect_peer(target.if_index, 0) } as i32;
+            if ret != TC_ACT_REDIRECT as i32 {
+                return Err(TC_ACT_SHOT as i32);
+            }
+            return Ok(ret);
         }
-        return Ok(ret);
+        count(ifindex, Field::RedirectMissed);
+        return Ok(TC_ACT_OK as i32);
     }
 
     // The host stack processes all other traffic. It does the
@@ -195,7 +205,8 @@ fn try_cell_ingress(ctx: &TcContext) -> Result<i32, i32> {
 
 enum Field {
     SpoofDropped,
-    Redirected,
+    RedirectAttempted,
+    RedirectMissed,
     Passed,
     OtherDropped,
 }
@@ -210,7 +221,8 @@ fn count(ifindex: u32, field: Field) {
         let stats = unsafe { &mut *stats };
         match field {
             Field::SpoofDropped => stats.spoof_dropped += 1,
-            Field::Redirected => stats.redirected += 1,
+            Field::RedirectAttempted => stats.redirect_attempted += 1,
+            Field::RedirectMissed => stats.redirect_missed += 1,
             Field::Passed => stats.passed += 1,
             Field::OtherDropped => stats.other_dropped += 1,
         }
