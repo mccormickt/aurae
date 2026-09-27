@@ -165,88 +165,42 @@ impl fmt::Debug for Network {
     }
 }
 
-/// Builder for [`Network`]. It holds the configuration that the `Network`
-/// needs before the connection: the IPAM pool, and the request to enable
-/// IPv6 forwarding in the netns. Thus a `Network` starts with the correct
-/// state, and no caller reconfigures a default afterwards. [`Self::build`]
-/// opens the netlink connection and applies the forwarding sysctl in the
-/// netns of the caller. For a nested auraed that netns is the netns of its
-/// cell.
-#[derive(Default)]
-pub(crate) struct NetworkBuilder {
-    ipam: IpamConfig,
-    enable_forwarding: bool,
-    enable_source_filter: bool,
-}
-
-impl NetworkBuilder {
-    /// Set the pool and the device prefix that the allocator gives out
-    /// from. The host daemon uses the pool of the daemon. A nested auraed
-    /// uses the block that its cell received. Refer to
-    /// [`NetworkConfig::nested_ipam_config`](super::endpoint::NetworkConfig::nested_ipam_config).
-    pub(crate) fn ipam(mut self, config: IpamConfig) -> Self {
-        self.ipam = config;
-        self
-    }
-
-    /// Enable IPv6 forwarding in the netns where [`Self::build`] runs. A
-    /// nested auraed needs it to route between the TAP of each VM and
-    /// `eth0`. The host daemon enables forwarding in
-    /// [`Network::init_host_network`], together with the NAT rules, the
-    /// guard, and the WAN setup.
-    pub(crate) fn enable_forwarding(mut self) -> Self {
-        self.enable_forwarding = true;
-        self
-    }
-
-    /// Install the source-only nft ruleset in this network namespace.
-    /// Nested auraed uses it to bind each VM TAP to its `/128`.
-    pub(crate) fn enable_source_filter(mut self) -> Self {
-        self.enable_source_filter = true;
-        self
-    }
-
-    /// Open the netlink connection, apply the forwarding sysctl if the
-    /// caller requested it, and build the `Network` with the given IPAM.
-    pub(crate) fn build(self) -> Result<Network, NetworkError> {
+impl Network {
+    /// Open a netlink connection in the netns of the caller and build a
+    /// `Network` that allocates from `ipam_config`. The host daemon then
+    /// calls [`Self::init_host_network`].
+    pub(crate) fn connect(
+        ipam_config: IpamConfig,
+    ) -> Result<Network, NetworkError> {
         let (connection, handle, _) = rtnetlink::new_connection()?;
         let _ignored = tokio::spawn(connection);
-        if self.enable_forwarding {
-            enable_forwarding_v6()?;
-        }
-        let network = Network {
+        Ok(Network {
             inner: Arc::new(NetworkInner {
                 handle,
                 nat: NatManager::new(),
                 cell_interfaces: Mutex::new(HashMap::new()),
                 host_sysctls: Mutex::new(None),
                 tap_interfaces: Mutex::new(HashMap::new()),
-                ipam: Ipam::new(self.ipam),
+                ipam: Ipam::new(ipam_config),
             }),
-        };
-        if self.enable_source_filter {
-            network
-                .inner
-                .nat
-                .install_source_filter(network.inner.ipam.pool())?;
-        }
-        Ok(network)
+        })
     }
-}
 
-impl Network {
-    /// Open a netlink connection and build a `Network` with the given IPAM
-    /// and no forwarding. This is the short form of
-    /// `Network::builder().ipam(config).build()`.
-    pub(crate) fn connect(
+    /// Build the `Network` of a nested auraed in the netns of its cell.
+    /// `ipam_config` is the block that the host delegated to the cell.
+    /// Refer to
+    /// [`NetworkConfig::nested_ipam_config`](endpoint::NetworkConfig::nested_ipam_config).
+    /// The function enables IPv6 forwarding between the TAP of each VM and
+    /// `eth0`, and installs the source filter that binds each TAP to its
+    /// `/128`. Forwarding between the cell and the host stays under the
+    /// policy of the host.
+    pub(crate) fn connect_in_cell(
         ipam_config: IpamConfig,
     ) -> Result<Network, NetworkError> {
-        Self::builder().ipam(ipam_config).build()
-    }
-
-    /// Start building a `Network`. See [`NetworkBuilder`].
-    pub(crate) fn builder() -> NetworkBuilder {
-        NetworkBuilder::default()
+        let network = Self::connect(ipam_config)?;
+        enable_forwarding_v6()?;
+        network.inner.nat.install_source_filter(network.inner.ipam.pool())?;
+        Ok(network)
     }
 
     pub(crate) fn ipam(&self) -> &Ipam {

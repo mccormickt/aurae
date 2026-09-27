@@ -28,16 +28,11 @@ use super::virtual_machine::{NetSpec, VirtualMachine, VmID, VmSpec};
 
 type Cache = HashMap<VmID, VirtualMachine>;
 
-/// The host-side endpoint of a VM's routed TAP, extracted from its
-/// [`NetSpec`] after boot. The caller hands this to
-/// [`Network::configure_tap_endpoint`] *without* holding the
-/// [`VirtualMachines`] lock, so the multi-second link-up wait doesn't
-/// serialize unrelated VM operations.
-#[derive(Debug, Clone)]
-pub(crate) struct TapEndpoint {
-    pub tap: String,
-    pub host_ip: Ipv6Addr,
-    pub delegated: Ipv6Net,
+/// The host-side endpoint of the routed TAP of a VM, from its [`NetSpec`].
+struct TapEndpoint {
+    tap: String,
+    host_ip: Ipv6Addr,
+    delegated: Ipv6Net,
 }
 
 /// Build the two `aurae.*=` kernel cmdline args a guest's pid1 needs to
@@ -174,51 +169,45 @@ impl VirtualMachines {
         }
     }
 
-    /// Boot a virtual machine by its ID and return the host-side TAP endpoint
-    /// that still needs configuring, if any. The caller must retain the
-    /// [`VirtualMachines`] lock until endpoint configuration completes, so
-    /// Free cannot delete the VM and recycle its IPAM slot during Start.
-    ///
-    /// Returns `Ok(None)` when the VM has no TAP to configure (e.g. it was
-    /// created with an explicit `net` spec without one). On configuration
-    /// failure the caller is expected to call [`Self::rollback_failed_start`].
-    pub fn start_boot(
-        &mut self,
-        id: &VmID,
-    ) -> Result<Option<TapEndpoint>, anyhow::Error> {
-        if self.network.is_none() {
-            return Err(anyhow!(
-                "VM networking is unavailable on this daemon — refusing start"
-            ));
-        }
-
+    /// Boot a virtual machine, configure the host side of its TAP, and
+    /// return the address of its guest auraed. If the TAP configuration
+    /// fails, the VM is deleted again. The caller must hold the lock on
+    /// this cache for the whole call. Otherwise a concurrent `delete` can
+    /// recycle the address of this VM before its TAP is configured.
+    pub async fn start(&mut self, id: &VmID) -> Result<String, anyhow::Error> {
         let Some(vm) = self.cache.get_mut(id) else {
             return Err(anyhow!(
                 "Virtual machine with ID '{:?}' not found",
                 id
             ));
         };
-
         let endpoint = tap_endpoint(vm)?;
         vm.start()?;
-        Ok(endpoint)
-    }
+        let address = vm.auraed_address().map(|a| a.to_string());
 
-    /// Roll back a VM whose host-side TAP configuration failed after boot:
-    /// stop + delete it, drop it from the cache, and release its IPAM slot.
-    /// Cleanup errors are propagated and state remains cached so Free or
-    /// daemon shutdown can retry without recycling an address that may still
-    /// be in use.
-    pub fn rollback_failed_start(
-        &mut self,
-        id: &VmID,
-    ) -> Result<(), anyhow::Error> {
-        self.delete(id)
-    }
+        if let Some((network, endpoint)) = self.network.as_ref().zip(endpoint)
+            && let Err(e) = network
+                .configure_tap_endpoint(
+                    &endpoint.tap,
+                    endpoint.host_ip,
+                    endpoint.delegated,
+                )
+                .await
+        {
+            error!(
+                "Failed to configure TAP endpoint for VM {id}: {e}. \
+                 Tearing down."
+            );
+            return Err(match self.delete(id) {
+                Ok(()) => anyhow!("Failed to configure TAP endpoint: {e}"),
+                Err(cleanup) => anyhow!(
+                    "Failed to configure TAP endpoint: {e}; rollback also \
+                     failed and VM state was retained for retry: {cleanup}"
+                ),
+            });
+        }
 
-    /// Address of a VM's guest auraed socket, if the VM is in the cache.
-    pub fn guest_socket(&self, id: &VmID) -> Option<String> {
-        self.cache.get(id).and_then(|vm| vm.tap()).map(|s| s.to_string())
+        Ok(address.unwrap_or_default())
     }
 
     /// Delete a virtual machine by its ID

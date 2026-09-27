@@ -123,6 +123,7 @@ async fn run_auraed() -> Client {
             false,
             None,
             Some(auraed::IpamConfig::default()),
+            None,
         )
         .await
         .unwrap()

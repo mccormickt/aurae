@@ -46,6 +46,8 @@ pub(crate) enum VmServiceError {
          enabled or netlink failed); see daemon logs for details"
     )]
     NetworkingUnavailable,
+    #[error("VmService requires the parent cell-control capability")]
+    Unauthorized,
 
     /// `cell_name` field on the request was syntactically invalid.
     #[error("invalid cell_name: {source}")]
@@ -73,16 +75,10 @@ pub(crate) enum VmServiceError {
 
 impl From<VmServiceError> for Status {
     fn from(err: VmServiceError) -> Self {
-        // Proxied errors pass through unchanged. The source daemon already
-        // logged + assigned a Status code; re-wrapping it here would just
-        // double-log and lose the original code category.
-        if let VmServiceError::ProxiedStatus(status) = err {
-            return status;
-        }
-
         let msg = err.to_string();
-        error!("{msg}");
-        match err {
+        let status = match err {
+            // The nested daemon already logged and classified this error.
+            VmServiceError::ProxiedStatus(status) => return status,
             VmServiceError::FailedToAllocateError { .. }
             | VmServiceError::FailedToFreeError { .. }
             | VmServiceError::FailedToStartError { .. }
@@ -92,6 +88,7 @@ impl From<VmServiceError> for Status {
             | VmServiceError::NetworkingUnavailable => {
                 Status::failed_precondition(msg)
             }
+            VmServiceError::Unauthorized => Status::permission_denied(msg),
             VmServiceError::InvalidCellName { .. }
             | VmServiceError::InvalidArtifactPath { .. } => {
                 Status::invalid_argument(msg)
@@ -100,8 +97,8 @@ impl From<VmServiceError> for Status {
             VmServiceError::VmCellUnavailable { .. } => {
                 Status::unavailable(msg)
             }
-            // Already handled above; the early-return makes this unreachable.
-            VmServiceError::ProxiedStatus(_) => unreachable!(),
-        }
+        };
+        error!("{}", status.message());
+        status
     }
 }

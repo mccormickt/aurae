@@ -14,6 +14,7 @@
 \* -------------------------------------------------------------------------- */
 
 use anyhow::anyhow;
+use client::VM_CONTROL_TOKEN_HEADER;
 use client::vms::vm_service::VmServiceClient;
 use proto::vms::{
     VirtualMachineSummary, VmServiceAllocateRequest, VmServiceAllocateResponse,
@@ -28,7 +29,6 @@ use std::{
 };
 use tokio::sync::Mutex;
 use tonic::{Request, Response, Status};
-use tracing::error;
 use validation::ValidatedField;
 
 use crate::cells::cell_service::cells::{CellName, Cells};
@@ -42,8 +42,6 @@ use super::{
     virtual_machine::{MountSpec, VmID, VmSpec},
     virtual_machines::VirtualMachines,
 };
-
-const VM_CONTROL_TOKEN_HEADER: &str = "x-aurae-vm-control";
 
 #[derive(Debug, Clone)]
 enum VmServiceAccess {
@@ -59,12 +57,12 @@ enum VmServiceAccess {
 #[derive(Debug, Clone)]
 pub struct VmService {
     vms: Arc<Mutex<VirtualMachines>>,
-    /// Shared host networking. `None` when VM networking could not be
-    /// set up (non-daemon contexts, netlink failed). Allocation is
-    /// refused in that state.
+    /// `None` if this auraed cannot host VMs: a non-daemon context, a cell
+    /// without a delegated prefix, or a failed host network setup. Then
+    /// each local Allocate and Start is refused.
     network: Option<Network>,
-    /// Shared with `CellService` so `cell_name`-scoped requests can be
-    /// proxied into a nested auraed.
+    /// Shared with `CellService`. A `cell_name`-scoped request is proxied
+    /// to the nested auraed of that cell.
     cells: Arc<Mutex<Cells>>,
     access: VmServiceAccess,
     artifact_root: PathBuf,
@@ -72,16 +70,9 @@ pub struct VmService {
 }
 
 impl VmService {
-    /// Allocates a new instance of VmService.
-    ///
-    /// `network` is the daemon's `Network` handle (which owns the IPAM
-    /// allocator). Pass `None` from non-Daemon contexts and from hosts
-    /// where network setup failed; VM allocation is refused in that
-    /// state.
-    ///
-    /// `cells` is shared with [`crate::cells::CellService`] so that
-    /// `cell_name`-scoped VM RPCs can look up the target cell's client
-    /// socket and proxy the request.
+    /// Allocates a new instance of VmService. `control_token` is the
+    /// capability that a nested auraed inherited from its host; it is
+    /// ignored in the daemon context.
     pub fn new(
         network: Option<Network>,
         cells: Arc<Mutex<Cells>>,
@@ -116,9 +107,7 @@ impl VmService {
                 Ok(())
             }
             VmServiceAccess::Cell(_) | VmServiceAccess::Disabled => {
-                Err(VmServiceError::ProxiedStatus(Status::permission_denied(
-                    "VmService requires the parent cell-control capability",
-                )))
+                Err(VmServiceError::Unauthorized)
             }
         }
     }
@@ -129,26 +118,17 @@ impl VmService {
         request: VmServiceAllocateRequest,
     ) -> Result<VmServiceAllocateResponse> {
         if let Some(cell_name) = validated_cell_name(&request.cell_name)? {
-            let mut req = request;
-            req.cell_name = None;
+            let request =
+                VmServiceAllocateRequest { cell_name: None, ..request };
             return proxy_to_cell(
                 &self.cells,
                 &cell_name,
-                req,
-                |client, req| async move {
-                    VmServiceClient::allocate(&client, req)
-                        .await
-                        .map(|r| r.into_inner())
-                },
+                request,
+                async |client, request| client.allocate(request).await,
             )
             .await;
         }
 
-        // Refuse early if this auraed has no Network (a non-daemon context,
-        // a cell without `isolate_network`, or a host where netlink/
-        // forwarding setup failed). A nested auraed inside an isolated cell
-        // *does* have one — seeded from the cell's delegated prefix — so it
-        // hosts the proxied VM locally from here.
         if self.network.is_none() {
             return Err(VmServiceError::NetworkingUnavailable);
         }
@@ -210,17 +190,12 @@ impl VmService {
         request: VmServiceFreeRequest,
     ) -> Result<VmServiceFreeResponse> {
         if let Some(cell_name) = validated_cell_name(&request.cell_name)? {
-            let mut req = request;
-            req.cell_name = None;
+            let request = VmServiceFreeRequest { cell_name: None, ..request };
             return proxy_to_cell(
                 &self.cells,
                 &cell_name,
-                req,
-                |client, req| async move {
-                    VmServiceClient::free(&client, req)
-                        .await
-                        .map(|r| r.into_inner())
-                },
+                request,
+                async |client, request| client.free(request).await,
             )
             .await;
         }
@@ -240,61 +215,26 @@ impl VmService {
         request: VmServiceStartRequest,
     ) -> Result<VmServiceStartResponse> {
         if let Some(cell_name) = validated_cell_name(&request.cell_name)? {
-            let mut req = request;
-            req.cell_name = None;
+            let request = VmServiceStartRequest { cell_name: None, ..request };
             return proxy_to_cell(
                 &self.cells,
                 &cell_name,
-                req,
-                |client, req| async move {
-                    VmServiceClient::start(&client, req)
-                        .await
-                        .map(|r| r.into_inner())
-                },
+                request,
+                async |client, request| client.start(request).await,
             )
             .await;
         }
 
+        if self.network.is_none() {
+            return Err(VmServiceError::NetworkingUnavailable);
+        }
         let id = VmID::new(request.vm_id);
-        let network = self
-            .network
-            .as_ref()
-            .ok_or(VmServiceError::NetworkingUnavailable)?;
         let mut vms = self.vms.lock().await;
-
-        // Retain the VM lock through TAP setup. Otherwise a concurrent Free
-        // can delete this VM, recycle its address, and let Start configure
-        // the old TAP for a new allocation (an ABA race).
-        let tap_endpoint = vms.start_boot(&id).map_err(|e| {
-            VmServiceError::FailedToStartError { id: id.clone(), source: e }
+        let auraed_address = vms.start(&id).await.map_err(|e| {
+            VmServiceError::FailedToStartError { id, source: e }
         })?;
 
-        if let Some(endpoint) = tap_endpoint
-            && let Err(e) = network
-                .configure_tap_endpoint(
-                    &endpoint.tap,
-                    endpoint.host_ip,
-                    endpoint.delegated,
-                )
-                .await
-        {
-            error!(
-                "Failed to configure TAP endpoint for VM {id}: {e}. \
-                 Tearing down."
-            );
-            let source = match vms.rollback_failed_start(&id) {
-                Ok(()) => anyhow!("Failed to configure TAP endpoint: {e}"),
-                Err(cleanup) => anyhow!(
-                    "Failed to configure TAP endpoint: {e}; rollback also \
-                     failed and VM state was retained for retry: {cleanup}"
-                ),
-            };
-            return Err(VmServiceError::FailedToStartError { id, source });
-        }
-
-        let addr = vms.guest_socket(&id).unwrap_or_default();
-
-        Ok(VmServiceStartResponse { auraed_address: addr })
+        Ok(VmServiceStartResponse { auraed_address })
     }
 
     #[tracing::instrument(skip(self))]
@@ -303,17 +243,12 @@ impl VmService {
         request: VmServiceStopRequest,
     ) -> Result<VmServiceStopResponse> {
         if let Some(cell_name) = validated_cell_name(&request.cell_name)? {
-            let mut req = request;
-            req.cell_name = None;
+            let request = VmServiceStopRequest { cell_name: None, ..request };
             return proxy_to_cell(
                 &self.cells,
                 &cell_name,
-                req,
-                |client, req| async move {
-                    VmServiceClient::stop(&client, req)
-                        .await
-                        .map(|r| r.into_inner())
-                },
+                request,
+                async |client, request| client.stop(request).await,
             )
             .await;
         }
@@ -333,17 +268,12 @@ impl VmService {
         request: VmServiceListRequest,
     ) -> Result<VmServiceListResponse> {
         if let Some(cell_name) = validated_cell_name(&request.cell_name)? {
-            let mut req = request;
-            req.cell_name = None;
+            let request = VmServiceListRequest { cell_name: None };
             return proxy_to_cell(
                 &self.cells,
                 &cell_name,
-                req,
-                |client, req| async move {
-                    VmServiceClient::list(&client, req)
-                        .await
-                        .map(|r| r.into_inner())
-                },
+                request,
+                async |client, request| client.list(request).await,
             )
             .await;
         }
@@ -367,8 +297,8 @@ impl VmService {
                         .to_string_lossy()
                         .to_string(),
                     auraed_address: m
-                        .tap()
-                        .map(|t| t.to_string())
+                        .auraed_address()
+                        .map(|a| a.to_string())
                         .unwrap_or_default(),
                     status: m.status.to_string(),
                 })
@@ -520,6 +450,39 @@ mod tests {
             token.expose_secret().parse().expect("metadata token"),
         );
         assert!(service.authorize(&matching).is_ok());
+    }
+
+    /// A nested auraed without an inherited capability fails closed, also
+    /// for a request that carries a token. The host daemon needs no token.
+    #[test]
+    fn access_without_capability_is_disabled_and_host_is_open() {
+        let cells = Arc::new(Mutex::new(Cells::new_root(None)));
+        let mut request = Request::new(());
+        let _ = request.metadata_mut().insert(
+            VM_CONTROL_TOKEN_HEADER,
+            "any".parse().expect("metadata token"),
+        );
+
+        let disabled = VmService::new(
+            None,
+            cells.clone(),
+            Context::Cell,
+            None,
+            "/var/lib/aurae/vm".into(),
+        );
+        assert!(matches!(
+            disabled.authorize(&request),
+            Err(VmServiceError::Unauthorized)
+        ));
+
+        let host = VmService::new(
+            None,
+            cells,
+            Context::Daemon,
+            None,
+            "/var/lib/aurae/vm".into(),
+        );
+        assert!(host.authorize(&Request::new(())).is_ok());
     }
 
     #[test]

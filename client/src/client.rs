@@ -30,7 +30,9 @@ use tower::service_fn;
 
 const KNOWN_IGNORED_SOCKET_ADDR: &str = "hxxp://null";
 const KNOWN_IGNORED_TLS_SOCKET_ADDR: &str = "https://null";
-pub(crate) const VM_CONTROL_TOKEN_HEADER: &str = "x-aurae-vm-control";
+/// The gRPC metadata key of the VM control capability. A host auraed sends
+/// it with each proxied `VmService` request to the nested auraed of a cell.
+pub const VM_CONTROL_TOKEN_HEADER: &str = "x-aurae-vm-control";
 
 type Result<T> = std::result::Result<T, ClientError>;
 

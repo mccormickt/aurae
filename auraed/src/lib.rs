@@ -166,33 +166,9 @@ impl Default for AuraedRuntime {
 ///
 /// `net_config` configures the endpoint of a daemon that runs in its own
 /// network namespace. `host_ipam_config` enables host networking for
-/// isolated cells.
+/// isolated cells. `vm_control_token` authorizes a nested auraed to proxy VM
+/// requests to its host; a host daemon passes `None`.
 pub async fn run(
-    runtime: AuraedRuntime,
-    socket: Option<String>,
-    verbose: bool,
-    nested: bool,
-    net_config: Option<NetworkConfig>,
-    host_ipam_config: Option<IpamConfig>,
-) -> Result<(), Box<dyn std::error::Error>> {
-    run_with_vm_control(
-        runtime,
-        socket,
-        verbose,
-        nested,
-        net_config,
-        host_ipam_config,
-        None,
-    )
-    .await
-}
-
-/// Starts the runtime loop with a capability inherited by a nested auraed.
-///
-/// This is public only for the `auraed` binary; ordinary embedders should use
-/// [`run`]. A host daemon passes the capability through an anonymous pipe.
-#[doc(hidden)]
-pub async fn run_with_vm_control(
     runtime: AuraedRuntime,
     socket: Option<String>,
     verbose: bool,
@@ -477,23 +453,10 @@ pub async fn run_with_vm_control(
     }
 }
 
-/// Build the seeded service `Network` for a nested auraed running inside an
-/// isolated cell, so it can host VMs out of the prefix the host delegated.
-/// Returns `None` — VM hosting disabled — when the cell carries no networking
-/// (`net_config` absent), has only a single-address (`/128`) delegation with
-/// no room to sub-delegate, or netlink/forwarding setup fails. The last is
-/// logged so an operator can tell a deliberately unnetworked cell from a
-/// setup failure.
-///
-/// This nested `Network` does not load the cell-net BPF guard (only the host
-/// daemon's [`Network::init_host_network`] does). The host eBPF guard pins the
-/// outer cell to its delegated block, while an nftables source filter in the
-/// cell netns pins each VM TAP or nested-cell interface to its `/128`.
+/// Build the `Network` of a nested auraed from the prefix delegated to its
+/// cell. Return `None` if the cell has no network, the prefix has no room for
+/// VM addresses, or setup fails.
 fn build_nested_network(net_config: Option<&NetworkConfig>) -> Option<Network> {
-    // No `--net-*` flags means a non-isolated cell with no networking — not
-    // an error, so return quietly. A delegated prefix too narrow to
-    // sub-delegate is worth a line, so an operator can tell it apart from a
-    // netlink/forwarding failure (logged below).
     let net_config = net_config?;
     let Some(ipam_config) = net_config.nested_ipam_config() else {
         warn!(
@@ -503,12 +466,7 @@ fn build_nested_network(net_config: Option<&NetworkConfig>) -> Option<Network> {
         );
         return None;
     };
-    match Network::builder()
-        .ipam(ipam_config)
-        .enable_forwarding()
-        .enable_source_filter()
-        .build()
-    {
+    match Network::connect_in_cell(ipam_config) {
         Ok(net) => Some(net),
         Err(e) => {
             error!(

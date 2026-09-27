@@ -38,8 +38,7 @@
 #![warn(clippy::all, clippy::pedantic, clippy::unwrap_used)]
 
 use auraed::{
-    AuraedRuntime, IpamConfig, NetworkConfig, prep_oci_spec_for_spawn,
-    run_with_vm_control,
+    AuraedRuntime, IpamConfig, NetworkConfig, prep_oci_spec_for_spawn, run,
 };
 use clap::{Parser, Subcommand};
 use ipnet::Ipv6Net;
@@ -269,7 +268,7 @@ async fn handle_default(
     };
 
     // Run the auraed daemon with the configured runtime
-    run_with_vm_control(
+    run(
         runtime,
         socket,
         verbose,

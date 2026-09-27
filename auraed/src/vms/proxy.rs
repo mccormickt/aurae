@@ -13,17 +13,14 @@
  * SPDX-License-Identifier: Apache-2.0                                        *
 \* -------------------------------------------------------------------------- */
 
-//! Generic proxy of a `VmService` RPC into a nested auraed running inside a
-//! cell. The body that used to be `do_in_vm_cell!` lives here as a regular
-//! async fn — the per-RPC client method comes in as a closure rather than
-//! being spliced via macro substitution.
+//! Proxy of a `VmService` RPC into the nested auraed of a cell.
 
-use std::future::Future;
 use std::time::Duration;
 
 use backoff::backoff::Backoff;
 use client::{Client, ClientError};
 use tokio::sync::Mutex;
+use tonic::{Response, Status};
 use tracing::trace;
 
 use crate::cells::cell_service::cells::{CellName, Cells};
@@ -37,23 +34,19 @@ use super::error::{Result, VmServiceError};
 ///    awaits.
 /// 2. Open a unix-socket [`Client`] with exponential-backoff retry on
 ///    connection errors. Gives the nested auraed up to ~20s to come up.
-/// 3. Call `call(client, request)` exactly once. A mutation may have reached
-///    the nested daemon even when its response is lost, so retrying after
-///    dispatch would make Allocate/Start/Stop/Free observably non-idempotent.
+/// 3. Call `call(&client, request)` exactly once. A mutation may have
+///    reached the nested daemon even when its response is lost, so retrying
+///    after dispatch would make Allocate/Start/Stop/Free observably
+///    non-idempotent.
 ///
-/// `request` should already have any cell-routing field cleared by the
-/// caller — typically `request.cell_name = None` — so the receiving daemon
-/// executes locally rather than re-proxying.
-pub(crate) async fn proxy_to_cell<Req, Resp, Fut, F>(
+/// The caller must clear `cell_name` in `request`. Then the receiving
+/// daemon executes the request locally and does not proxy it again.
+pub(crate) async fn proxy_to_cell<Req, Resp>(
     cells: &Mutex<Cells>,
     cell_name: &CellName,
     request: Req,
-    call: F,
-) -> Result<Resp>
-where
-    F: Fn(Client, Req) -> Fut,
-    Fut: Future<Output = std::result::Result<Resp, tonic::Status>>,
-{
+    call: impl AsyncFn(&Client, Req) -> std::result::Result<Response<Resp>, Status>,
+) -> Result<Resp> {
     let (client_socket, control_token) = {
         let mut cells = cells.lock().await;
         cells.get(cell_name, |cell| cell.vm_control()).map_err(|e| {
@@ -97,7 +90,10 @@ where
         source: e,
     })?;
 
-    call(client, request).await.map_err(VmServiceError::ProxiedStatus)
+    call(&client, request)
+        .await
+        .map(Response::into_inner)
+        .map_err(VmServiceError::ProxiedStatus)
 }
 
 #[cfg(test)]
@@ -118,7 +114,7 @@ mod tests {
             .expect("valid cell name");
 
         let result: Result<()> =
-            proxy_to_cell(&cells, &cell_name, (), |_client, _req| async move {
+            proxy_to_cell(&cells, &cell_name, (), async |_client, _req| {
                 panic!("call must not be invoked when cell lookup fails")
             })
             .await;

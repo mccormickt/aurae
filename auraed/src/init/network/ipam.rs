@@ -504,7 +504,7 @@ mod tests {
         );
 
         // The nested auraed builds a fresh allocator over its delegated block
-        // (this is what `Network::builder().ipam(..)` does at construction).
+        // (this is what `Network::connect` does at construction).
         let nested = Ipam::new(IpamConfig::new(cell.delegated, 128).unwrap());
 
         let vm = nested.allocate("vm:one").unwrap();

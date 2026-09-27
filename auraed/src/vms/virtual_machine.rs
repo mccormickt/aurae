@@ -338,9 +338,9 @@ impl VirtualMachine {
         Err(anyhow!("Virtual machine manager not initialized"))
     }
 
-    /// Socket address for connecting to the auraed instance in this VM.
-    /// Returns the VM's IPv6 address (ULA) on the well-known auraed port.
-    pub fn tap(&self) -> Option<SocketAddr> {
+    /// The socket address of the auraed in this VM: the guest IPv6 address
+    /// on the well-known auraed port.
+    pub fn auraed_address(&self) -> Option<SocketAddr> {
         let net = self.vm.net.first()?;
         Some(SocketAddr::V6(SocketAddrV6::new(net.guest_ip_v6, 8080, 0, 0)))
     }
