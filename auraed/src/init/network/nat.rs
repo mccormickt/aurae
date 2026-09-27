@@ -120,6 +120,8 @@ impl NatState {
 
         batch.add(NfListObject::Chain(self.input_chain()));
         batch.add(NfListObject::Chain(self.forward_chain()));
+        batch.add(NfListObject::Rule(self.rule_allow_host_initiated_input()));
+        batch.add(NfListObject::Rule(self.rule_allow_neighbor_discovery()));
         batch.add(NfListObject::Rule(self.rule_drop_cell_input()));
         batch.add(NfListObject::Rule(self.rule_drop_cell_to_cell()));
 
@@ -301,6 +303,35 @@ impl NatState {
                     Operator::NEQ,
                 ),
                 Statement::Drop(None),
+            ],
+        )
+    }
+
+    /// Accept the replies of a flow that the host started, for example the
+    /// gRPC connection from the host auraed to the auraed of a VM. A cell
+    /// cannot open a flow to the host, thus a new connection still drops.
+    fn rule_allow_host_initiated_input(&self) -> Rule<'_> {
+        self.rule(
+            INPUT_CHAIN,
+            vec![
+                match_interface_set(MetaKey::Iifname, SET_CELL_IFACES),
+                match_ct_state_established_or_related(),
+                Statement::Accept(None),
+            ],
+        )
+    }
+
+    /// Accept IPv6 neighbor discovery from a cell interface. A VM TAP is an
+    /// Ethernet link, thus the host and the guest must resolve the MAC
+    /// address of each other. Conntrack does not track these messages, and
+    /// the prerouting anti-spoof rule already binds their source address.
+    fn rule_allow_neighbor_discovery(&self) -> Rule<'_> {
+        self.rule(
+            INPUT_CHAIN,
+            vec![
+                match_interface_set(MetaKey::Iifname, SET_CELL_IFACES),
+                match_icmpv6_neighbor_discovery(),
+                Statement::Accept(None),
             ],
         )
     }
@@ -581,6 +612,23 @@ fn ensure_table_owned_or_absent() -> io::Result<()> {
             "refusing to replace unmarked nft table `inet aurae`",
         )),
     }
+}
+
+/// Match `icmpv6 type {nd-neighbor-solicit, nd-neighbor-advert}`.
+fn match_icmpv6_neighbor_discovery<'a>() -> Statement<'a> {
+    Statement::Match(Match {
+        left: Expression::Named(NamedExpression::Payload(
+            Payload::PayloadField(PayloadField {
+                protocol: "icmpv6".into(),
+                field: "type".into(),
+            }),
+        )),
+        right: Expression::Named(NamedExpression::Set(vec![
+            SetItem::Element(Expression::String("nd-neighbor-solicit".into())),
+            SetItem::Element(Expression::String("nd-neighbor-advert".into())),
+        ])),
+        op: Operator::IN,
+    })
 }
 
 /// Match `ct state {established, related}`.
@@ -888,6 +936,55 @@ mod tests {
         });
         let rule = rule.expect("non-IPv6 drop rule");
         assert!(matches!(rule.expr.last(), Some(Statement::Drop(None))));
+    }
+
+    /// The host auraed connects to the auraed of a VM. The replies and the
+    /// neighbor discovery of the guest arrive on a cell interface and must
+    /// pass `input_filter`. The accepts are limited to established and
+    /// related flows and to neighbor discovery, and they precede the drop.
+    #[test]
+    fn input_accepts_replies_and_neighbor_discovery_before_the_cell_drop() {
+        let state = test_state();
+        let ruleset = state.build_install().to_nftables();
+        let input_rules: Vec<&Rule<'_>> =
+            ruleset
+                .objects
+                .iter()
+                .filter_map(|object| match object {
+                    NfObject::CmdObject(NfCmd::Add(NfListObject::Rule(
+                        rule,
+                    ))) if rule.chain == INPUT_CHAIN => Some(rule),
+                    _ => None,
+                })
+                .collect();
+        let [replies, neighbor_discovery, drop] = input_rules[..] else {
+            panic!("expected three input rules, got {}", input_rules.len());
+        };
+        assert!(is_interface_set_match(&replies.expr[0], MetaKey::Iifname));
+        assert!(matches!(
+            &replies.expr[1],
+            Statement::Match(Match {
+                left: Expression::Named(NamedExpression::CT(CT { key, .. })),
+                ..
+            }) if key == "state"
+        ));
+        assert!(matches!(replies.expr[2], Statement::Accept(None)));
+        assert!(is_interface_set_match(
+            &neighbor_discovery.expr[0],
+            MetaKey::Iifname
+        ));
+        assert!(matches!(
+            &neighbor_discovery.expr[1],
+            Statement::Match(Match {
+                left: Expression::Named(NamedExpression::Payload(
+                    Payload::PayloadField(PayloadField { protocol, field }),
+                )),
+                ..
+            }) if protocol == "icmpv6" && field == "type"
+        ));
+        assert!(matches!(neighbor_discovery.expr[2], Statement::Accept(None)));
+        assert!(is_interface_set_match(&drop.expr[0], MetaKey::Iifname));
+        assert!(matches!(drop.expr[1], Statement::Drop(None)));
     }
 
     #[test]
