@@ -204,6 +204,7 @@ impl VmService {
 
         let mut vms = self.vms.lock().await;
         vms.delete(&id)
+            .await
             .map_err(|e| VmServiceError::FailedToFreeError { id, source: e })?;
 
         Ok(VmServiceFreeResponse {})

@@ -307,7 +307,9 @@ pub async fn run(
             // the value stays `None`, and the daemon refuses each VM RPC.
             // `build_nested_network` also installs the per-child source
             // filter inside this cell's network namespace.
-            AuraeContext::Cell => build_nested_network(net_config.as_ref()),
+            AuraeContext::Cell => {
+                build_nested_network(net_config.as_ref()).await
+            }
             _ => None,
         };
 
@@ -456,7 +458,9 @@ pub async fn run(
 /// Build the `Network` of a nested auraed from the prefix delegated to its
 /// cell. Return `None` if the cell has no network, the prefix has no room for
 /// VM addresses, or setup fails.
-fn build_nested_network(net_config: Option<&NetworkConfig>) -> Option<Network> {
+async fn build_nested_network(
+    net_config: Option<&NetworkConfig>,
+) -> Option<Network> {
     let net_config = net_config?;
     let Some(ipam_config) = net_config.nested_ipam_config() else {
         warn!(
@@ -466,7 +470,7 @@ fn build_nested_network(net_config: Option<&NetworkConfig>) -> Option<Network> {
         );
         return None;
     };
-    match Network::connect_in_cell(ipam_config) {
+    match Network::connect_in_cell(ipam_config).await {
         Ok(net) => Some(net),
         Err(e) => {
             error!(

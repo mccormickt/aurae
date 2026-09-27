@@ -198,7 +198,7 @@ impl VirtualMachines {
                 "Failed to configure TAP endpoint for VM {id}: {e}. \
                  Tearing down."
             );
-            return Err(match self.delete(id) {
+            return Err(match self.delete(id).await {
                 Ok(()) => anyhow!("Failed to configure TAP endpoint: {e}"),
                 Err(cleanup) => anyhow!(
                     "Failed to configure TAP endpoint: {e}; rollback also \
@@ -211,7 +211,7 @@ impl VirtualMachines {
     }
 
     /// Delete a virtual machine by its ID
-    pub fn delete(&mut self, id: &VmID) -> Result<(), anyhow::Error> {
+    pub async fn delete(&mut self, id: &VmID) -> Result<(), anyhow::Error> {
         let (endpoint, leaked_ip) = {
             let Some(vm) = self.cache.get_mut(id) else {
                 return Err(anyhow!(
@@ -229,7 +229,7 @@ impl VirtualMachines {
         // exists and its nftables source binding can be removed safely.
         if let Some(network) = self.network.as_ref() {
             if let Some(endpoint) = endpoint {
-                network.destroy_tap_endpoint(&endpoint.tap)?;
+                network.destroy_tap_endpoint(&endpoint.tap).await?;
             }
 
             // Release only after VM deletion and source-filter cleanup.

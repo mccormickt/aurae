@@ -194,12 +194,13 @@ impl Network {
     /// `eth0`, and installs the source filter that binds each TAP to its
     /// `/128`. Forwarding between the cell and the host stays under the
     /// policy of the host.
-    pub(crate) fn connect_in_cell(
+    pub(crate) async fn connect_in_cell(
         ipam_config: IpamConfig,
     ) -> Result<Network, NetworkError> {
         let network = Self::connect(ipam_config)?;
         enable_forwarding_v6()?;
-        network.inner.nat.install_source_filter(network.inner.ipam.pool())?;
+        let pool = network.inner.ipam.pool();
+        network.nft(move |nat| nat.install_source_filter(pool)).await?;
         Ok(network)
     }
 
@@ -275,11 +276,15 @@ impl Network {
             );
         }
 
-        if let Err(source) = self.inner.nat.bind_cell_source(tap, delegated) {
+        let bind = {
+            let tap = tap.to_string();
+            self.nft(move |nat| nat.bind_cell_source(&tap, delegated)).await
+        };
+        if let Err(source) = bind {
             if let Ok(mut guard) = self.inner.tap_interfaces.lock() {
                 let _ = guard.remove(tap);
             }
-            return Err(NetworkError::FailedToConnect(source));
+            return Err(source);
         }
         {
             let mut guard = self
@@ -307,7 +312,7 @@ impl Network {
     /// Remove a VM TAP's source binding after Cloud Hypervisor confirms that
     /// the VM (and therefore the TAP) has been deleted. State is retained on
     /// failure so a later Free or shutdown can retry cleanup.
-    pub(crate) fn destroy_tap_endpoint(
+    pub(crate) async fn destroy_tap_endpoint(
         &self,
         tap: &str,
     ) -> Result<(), NetworkError> {
@@ -322,10 +327,10 @@ impl Network {
         let Some(state) = state else { return Ok(()) };
 
         if state.source_bound {
-            self.inner
-                .nat
-                .unbind_cell_source(tap, state.delegated)
-                .map_err(NetworkError::FailedToConnect)?;
+            let tap = tap.to_string();
+            let delegated = state.delegated;
+            self.nft(move |nat| nat.unbind_cell_source(&tap, delegated))
+                .await?;
         }
         let mut guard = self
             .inner
