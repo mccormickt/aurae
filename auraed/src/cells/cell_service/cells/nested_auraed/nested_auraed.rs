@@ -19,6 +19,7 @@ use crate::init::network::endpoint::NetworkConfig;
 use crate::vms::VmControlToken;
 use client::AuraeSocket;
 use clone3::Flags;
+use nix::fcntl::{FcntlArg, FdFlag, OFlag, fcntl};
 use nix::{
     errno::Errno,
     libc::{self, SIGCHLD},
@@ -26,7 +27,7 @@ use nix::{
         signal::{Signal, Signal::SIGKILL, Signal::SIGTERM},
         wait::{Id, WaitPidFlag, WaitStatus, waitid},
     },
-    unistd::{Pid, pipe},
+    unistd::{Pid, pipe2},
 };
 use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd};
 use std::path::PathBuf;
@@ -85,14 +86,17 @@ impl NestedAuraed {
         );
 
         let client_socket = AuraeSocket::Path(socket_path.clone().into());
+        // Only this child may inherit the capability. `O_CLOEXEC` keeps the
+        // pipe out of other processes spawned at the same time; `pre_exec`
+        // clears the flag for this child only.
         let vm_control_token = VmControlToken::generate();
         let (control_reader, control_writer) =
-            pipe().map_err(io::Error::from)?;
+            pipe2(OFlag::O_CLOEXEC).map_err(io::Error::from)?;
         let mut control_writer = File::from(control_writer);
         control_writer
             .write_all(vm_control_token.expose_secret().as_bytes())?;
         drop(control_writer);
-        let control_fd = control_reader.as_raw_fd().to_string();
+        let control_fd = control_reader.as_raw_fd();
 
         let auraed_path: PathBuf =
             auraed_runtime.auraed.clone().try_into().expect("path to auraed");
@@ -113,7 +117,7 @@ impl NestedAuraed {
             "--library-dir",
             &auraed_runtime.library_dir.to_string_lossy(),
             "--vm-control-fd",
-            &control_fd,
+            &control_fd.to_string(),
         ]);
 
         // We have a concern that the "command" API make change/break in the future and this
@@ -193,6 +197,10 @@ impl NestedAuraed {
                         command.pre_exec(move || {
                             isolation.isolate_process(&iso_ctl)?;
                             isolation.isolate_network(&iso_ctl)?;
+                            let _ = fcntl(
+                                control_fd,
+                                FcntlArg::F_SETFD(FdFlag::empty()),
+                            )?;
                             Ok(())
                         })
                     }

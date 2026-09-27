@@ -48,7 +48,7 @@ libcontainer = { version = "0.5.7", default-features = false, features = [
 log = "0.4.21"
 netlink-packet-route = "0.28.0"
 nftables = "0.6.3"
-nix = { workspace = true, features = ["sched", "mount", "signal", "net", "dir", "user", "process", "hostname"] }
+nix = { workspace = true, features = ["sched", "mount", "signal", "net", "dir", "user", "process", "hostname", "fs"] }
 oci-spec = "0.8.4"
 once_cell = "1"
 procfs = "0.17.0"
