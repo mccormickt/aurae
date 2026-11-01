@@ -57,6 +57,7 @@ pub struct VmSpec {
     pub kernel_image_path: PathBuf,
     pub kernel_args: Vec<String>,
     pub mounts: Vec<MountSpec>,
+    pub network: proto::vms::VmNetwork,
     pub net: Vec<NetSpec>,
 }
 
@@ -138,6 +139,8 @@ impl From<VmSpec> for vmm::vm_config::VmConfig {
 /// is just one address. Networking is IPv6-only.
 #[derive(Debug, Clone)]
 pub struct NetSpec {
+    /// Stable logical NIC ID used by Cloud Hypervisor.
+    pub id: String,
     /// TAP device name (CH creates it if it doesn't exist).
     pub tap: Option<String>,
     /// MAC address for the VM's virtual NIC.
@@ -166,7 +169,10 @@ impl From<NetSpec> for vmm::vm_config::NetConfig {
         // guest learns its own addressing from the `aurae.*` kernel args,
         // not from this field.
         vmm::vm_config::NetConfig {
-            pci_common: PciDeviceCommonConfig::default(),
+            pci_common: PciDeviceCommonConfig {
+                id: Some(spec.id),
+                ..PciDeviceCommonConfig::default()
+            },
             tap: spec.tap,
             ip: None,
             mask: None,
@@ -364,7 +370,9 @@ mod tests {
             kernel_image_path: PathBuf::from("/vmlinux.bin"),
             kernel_args: vec!["console=hvc0".to_string()],
             mounts: vec![],
+            network: sample_network(),
             net: vec![NetSpec {
+                id: "net0".into(),
                 tap: Some("tap0".to_string()),
                 mac: MacAddr::local_random(),
                 host_mac: None,
@@ -409,7 +417,9 @@ mod tests {
                 host_path: PathBuf::from("/var/lib/aurae/vm/image/disk.raw"),
                 read_only: false,
             }],
+            network: sample_network(),
             net: vec![NetSpec {
+                id: "net0".into(),
                 tap: Some("tap0".to_string()),
                 mac: MacAddr::local_random(),
                 host_mac: None,
@@ -431,8 +441,16 @@ mod tests {
         assert!(vm.delete().is_ok(), "{:?}", vm);
     }
 
+    fn sample_network() -> proto::vms::VmNetwork {
+        proto::vms::VmNetwork {
+            id: "net0".into(),
+            backend: proto::vms::VmNetworkBackend::Tap.into(),
+        }
+    }
+
     fn sample_net_spec() -> NetSpec {
         NetSpec {
+            id: "guest:primary".into(),
             tap: Some("vm-7".to_string()),
             mac: MacAddr::local_random(),
             host_mac: None,
@@ -458,6 +476,7 @@ mod tests {
                     read_only: false,
                 },
             ],
+            network: sample_network(),
             net: vec![sample_net_spec()],
         }
     }
@@ -475,6 +494,7 @@ mod tests {
         assert_eq!(cfg.ip, None);
         assert_eq!(cfg.mask, None);
         assert_eq!(cfg.tap.as_deref(), Some("vm-7"));
+        assert_eq!(cfg.pci_common.id.as_deref(), Some("guest:primary"));
     }
 
     /// `MountSpec` → `DiskConfig` carries the host path and `read_only`

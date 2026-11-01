@@ -125,6 +125,7 @@ impl VirtualMachines {
             let tap_name = network.reserve_tap_name();
 
             spec.net.push(NetSpec {
+                id: spec.network.id.clone(),
                 tap: Some(tap_name),
                 mac: MacAddr::local_random(),
                 host_mac: None,

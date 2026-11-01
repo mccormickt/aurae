@@ -41,6 +41,12 @@ pub(crate) enum VmServiceError {
     MissingRootDrive { id: VmID },
     #[error("VM artifact path '{path}' is not allowed: {source}")]
     InvalidArtifactPath { path: String, source: anyhow::Error },
+    #[error("invalid VM network configuration: {0}")]
+    InvalidNetwork(String),
+    #[error(
+        "AF_XDP on the cell's paired netkit is not available; no TAP fallback"
+    )]
+    AfXdpUnavailable,
     #[error(
         "vm networking is unavailable on this host (forwarding could not be \
          enabled or netlink failed); see daemon logs for details"
@@ -89,7 +95,9 @@ impl From<VmServiceError> for Status {
                 Status::failed_precondition(msg)
             }
             VmServiceError::Unauthorized => Status::permission_denied(msg),
+            VmServiceError::AfXdpUnavailable => Status::unimplemented(msg),
             VmServiceError::InvalidCellName { .. }
+            | VmServiceError::InvalidNetwork(_)
             | VmServiceError::InvalidArtifactPath { .. } => {
                 Status::invalid_argument(msg)
             }

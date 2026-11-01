@@ -17,7 +17,9 @@ use anyhow::anyhow;
 use client::VM_CONTROL_TOKEN_HEADER;
 use client::vms::vm_service::VmServiceClient;
 use proto::vms::{
-    VirtualMachineSummary, VmServiceAllocateRequest, VmServiceAllocateResponse,
+    VirtualMachine, VirtualMachineSummary, VmNetwork, VmNetworkBackend,
+    VmServiceAllocateRequest, VmServiceAllocateResponse,
+    VmServiceAllocateWithNetworkRequest, VmServiceAllocateWithNetworkResponse,
     VmServiceFreeRequest, VmServiceFreeResponse, VmServiceListRequest,
     VmServiceListResponse, VmServiceStartRequest, VmServiceStartResponse,
     VmServiceStopRequest, VmServiceStopResponse, vm_service_server,
@@ -129,13 +131,52 @@ impl VmService {
             .await;
         }
 
+        self.allocate_local(
+            request.machine,
+            VmNetwork {
+                id: "net0".into(),
+                backend: VmNetworkBackend::Tap.into(),
+            },
+        )
+        .await
+    }
+
+    #[tracing::instrument(skip(self))]
+    async fn allocate_with_network(
+        &self,
+        request: VmServiceAllocateWithNetworkRequest,
+    ) -> Result<VmServiceAllocateWithNetworkResponse> {
+        let network = validated_network(request.network.clone())?;
+        if let Some(cell_name) = validated_cell_name(&request.cell_name)? {
+            let request = VmServiceAllocateWithNetworkRequest {
+                cell_name: None,
+                ..request
+            };
+            return proxy_to_cell(
+                &self.cells,
+                &cell_name,
+                request,
+                async |client, request| {
+                    client.allocate_with_network(request).await
+                },
+            )
+            .await;
+        }
+        let allocated = self.allocate_local(request.machine, network).await?;
+        Ok(VmServiceAllocateWithNetworkResponse { vm_id: allocated.vm_id })
+    }
+
+    async fn allocate_local(
+        &self,
+        machine: Option<VirtualMachine>,
+        network: VmNetwork,
+    ) -> Result<VmServiceAllocateResponse> {
+        let Some(vm) = machine else {
+            return Err(VmServiceError::MissingMachineConfig {});
+        };
         if self.network.is_none() {
             return Err(VmServiceError::NetworkingUnavailable);
         }
-
-        let Some(vm) = request.machine else {
-            return Err(VmServiceError::MissingMachineConfig {});
-        };
 
         let id = VmID::new(vm.id);
         let Some(root_drive) = vm.root_drive else {
@@ -173,6 +214,7 @@ impl VmService {
             )?,
             kernel_args: vm.kernel_args,
             mounts,
+            network,
             net: vec![],
         };
 
@@ -330,6 +372,26 @@ impl VmService {
     }
 }
 
+/// Validate explicit intent before allocating addresses or starting a VMM.
+fn validated_network(network: Option<VmNetwork>) -> Result<VmNetwork> {
+    let network = network.ok_or_else(|| {
+        VmServiceError::InvalidNetwork("network is required".into())
+    })?;
+    // Cloud Hypervisor reserves identifiers starting with "__".
+    if network.id.is_empty() || network.id.starts_with("__") {
+        return Err(VmServiceError::InvalidNetwork(
+            "NIC ID must be non-empty and must not start with '__'".into(),
+        ));
+    }
+    match VmNetworkBackend::try_from(network.backend) {
+        Ok(VmNetworkBackend::Tap) => Ok(network),
+        Ok(VmNetworkBackend::AfXdp) => Err(VmServiceError::AfXdpUnavailable),
+        _ => Err(VmServiceError::InvalidNetwork(
+            "an explicit network requires a known, explicit backend".into(),
+        )),
+    }
+}
+
 /// Validate the optional `cell_name` field on every VmService request.
 /// `None`/empty string → `None` (local execution). Non-empty → validated
 /// `CellName`. Invalid syntax → `Err`.
@@ -382,6 +444,19 @@ impl vm_service_server::VmService for VmService {
         Ok(Response::new(self.allocate(req).await?))
     }
 
+    async fn allocate_with_network(
+        &self,
+        request: Request<VmServiceAllocateWithNetworkRequest>,
+    ) -> std::result::Result<
+        Response<VmServiceAllocateWithNetworkResponse>,
+        Status,
+    > {
+        self.authorize(&request)?;
+        Ok(Response::new(
+            self.allocate_with_network(request.into_inner()).await?,
+        ))
+    }
+
     async fn free(
         &self,
         request: Request<VmServiceFreeRequest>,
@@ -423,6 +498,245 @@ impl vm_service_server::VmService for VmService {
 mod tests {
     use super::*;
     use std::os::unix::fs::symlink;
+
+    #[tokio::test]
+    async fn explicit_network_rejects_invalid_intent_before_allocation() {
+        let service = VmService::new(
+            None,
+            Arc::new(Mutex::new(Cells::new_root(None))),
+            Context::Daemon,
+            None,
+            "/does-not-exist".into(),
+        );
+        for (network, code) in [
+            (None, tonic::Code::InvalidArgument),
+            (
+                Some(VmNetwork { id: String::new(), backend: 1 }),
+                tonic::Code::InvalidArgument,
+            ),
+            (
+                Some(VmNetwork { id: "__reserved".into(), backend: 1 }),
+                tonic::Code::InvalidArgument,
+            ),
+            (
+                Some(VmNetwork { id: "nic".into(), backend: 0 }),
+                tonic::Code::InvalidArgument,
+            ),
+            (
+                Some(VmNetwork { id: "nic".into(), backend: 999 }),
+                tonic::Code::InvalidArgument,
+            ),
+            (
+                Some(VmNetwork { id: "nic".into(), backend: 2 }),
+                tonic::Code::Unimplemented,
+            ),
+        ] {
+            let error = vm_service_server::VmService::allocate_with_network(
+                &service,
+                Request::new(VmServiceAllocateWithNetworkRequest {
+                    machine: None,
+                    cell_name: Some("missing-cell".into()),
+                    network,
+                }),
+            )
+            .await
+            .expect_err("invalid intent must not reach proxy or allocation");
+            assert_eq!(error.code(), code, "{error}");
+        }
+        assert!(
+            service
+                .list(VmServiceListRequest::default())
+                .await
+                .unwrap()
+                .machines
+                .is_empty()
+        );
+        assert_eq!(
+            validated_network(Some(VmNetwork {
+                id: "guest:primary/α".into(),
+                backend: 1
+            }))
+            .unwrap()
+            .id,
+            "guest:primary/α"
+        );
+    }
+
+    /// Model an older server that has Allocate but no AllocateWithNetwork route.
+    #[derive(Clone, Default)]
+    struct LegacyVmService(Arc<std::sync::atomic::AtomicUsize>);
+
+    impl tonic::server::NamedService for LegacyVmService {
+        const NAME: &'static str = "aurae.vms.v0.VmService";
+    }
+
+    impl
+        tonic::codegen::Service<
+            tonic::codegen::http::Request<tonic::body::Body>,
+        > for LegacyVmService
+    {
+        type Response = tonic::codegen::http::Response<tonic::body::Body>;
+        type Error = std::convert::Infallible;
+        type Future = std::future::Ready<
+            std::result::Result<Self::Response, Self::Error>,
+        >;
+
+        fn poll_ready(
+            &mut self,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::result::Result<(), Self::Error>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+
+        fn call(
+            &mut self,
+            request: tonic::codegen::http::Request<tonic::body::Body>,
+        ) -> Self::Future {
+            if request.uri().path() == "/aurae.vms.v0.VmService/Allocate" {
+                let _ =
+                    self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+            std::future::ready(Ok(
+                Status::unimplemented("unknown route").into_http()
+            ))
+        }
+    }
+
+    #[tokio::test]
+    async fn explicit_network_never_retries_legacy_allocate() {
+        let legacy = LegacyVmService::default();
+        let allocations = legacy.0.clone();
+        let listener =
+            tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(
+            tonic::transport::Server::builder()
+                .add_service(legacy)
+                .serve_with_incoming(
+                    tokio_stream::wrappers::TcpListenerStream::new(listener),
+                ),
+        );
+        let client =
+            client::Client::new_no_tls(client::AuraeSocket::Addr(address))
+                .await
+                .unwrap();
+        let error = client
+            .allocate_with_network(VmServiceAllocateWithNetworkRequest {
+                machine: Some(VirtualMachine::default()),
+                cell_name: None,
+                network: Some(VmNetwork {
+                    id: "nic".into(),
+                    backend: VmNetworkBackend::AfXdp.into(),
+                }),
+            })
+            .await
+            .expect_err("old server must reject the explicit route");
+        assert_eq!(error.code(), tonic::Code::Unimplemented);
+        assert_eq!(allocations.load(std::sync::atomic::Ordering::SeqCst), 0);
+        let _ = client.allocate(VmServiceAllocateRequest::default()).await;
+        assert_eq!(allocations.load(std::sync::atomic::Ordering::SeqCst), 1);
+        server.abort();
+        let _ = server.await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn explicit_network_proxy_never_retries_legacy_allocate() {
+        use crate::cells::cell_service::cells::{
+            CellSpec, cgroups::CgroupSpec,
+        };
+        use test_helpers::skip;
+
+        test_helpers::skip_if_not_root!(
+            "explicit_network_proxy_never_retries_legacy_allocate"
+        );
+        test_helpers::skip_if_seccomp!(
+            "explicit_network_proxy_never_retries_legacy_allocate"
+        );
+        let _ = crate::AURAED_RUNTIME.set(crate::AuraedRuntime::default());
+        let cell_name = CellName::random_for_tests();
+        let mut cells = Cells::new_root(None);
+        let cell = cells
+            .allocate(
+                cell_name.clone(),
+                CellSpec {
+                    cgroup_spec: CgroupSpec {
+                        cpu: None,
+                        cpuset: None,
+                        memory: None,
+                    },
+                    iso_ctl:
+                        crate::cells::cell_service::cells::IsolationControls {
+                            isolate_network: false,
+                            isolate_process: false,
+                        },
+                },
+            )
+            .await
+            .expect("allocate proxy cell");
+        let client::AuraeSocket::Path(socket) = cell.client_socket().unwrap()
+        else {
+            panic!("nested daemon must use a Unix socket");
+        };
+        let original = socket.with_extension("original");
+        fs::rename(&socket, &original).expect("preserve nested socket");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let legacy = LegacyVmService::default();
+        let allocations = legacy.0.clone();
+        let server = tokio::spawn(
+            tonic::transport::Server::builder()
+                .add_service(legacy)
+                .serve_with_incoming(
+                    tokio_stream::wrappers::UnixListenerStream::new(listener),
+                ),
+        );
+        let service = VmService::new(
+            None,
+            Arc::new(Mutex::new(cells)),
+            Context::Daemon,
+            None,
+            "/does-not-exist".into(),
+        );
+        let explicit = vm_service_server::VmService::allocate_with_network(
+            &service,
+            Request::new(VmServiceAllocateWithNetworkRequest {
+                machine: Some(VirtualMachine::default()),
+                cell_name: Some(cell_name.to_string()),
+                network: Some(VmNetwork {
+                    id: "guest:primary".into(),
+                    backend: VmNetworkBackend::Tap.into(),
+                }),
+            }),
+        )
+        .await
+        .expect_err("nested legacy server must reject explicit intent");
+        let explicit_count =
+            allocations.load(std::sync::atomic::Ordering::SeqCst);
+        let _ = vm_service_server::VmService::allocate(
+            &service,
+            Request::new(VmServiceAllocateRequest {
+                machine: Some(VirtualMachine::default()),
+                cell_name: Some(cell_name.to_string()),
+            }),
+        )
+        .await;
+        let legacy_count =
+            allocations.load(std::sync::atomic::Ordering::SeqCst);
+
+        server.abort();
+        let _ = server.await;
+        fs::remove_file(&socket).unwrap();
+        fs::rename(&original, &socket).unwrap();
+        service
+            .cells
+            .lock()
+            .await
+            .free(&cell_name)
+            .await
+            .expect("free proxy cell");
+        assert_eq!(explicit.code(), tonic::Code::Unimplemented);
+        assert_eq!(explicit_count, 0, "explicit proxy must not downgrade");
+        assert_eq!(legacy_count, 1, "legacy proxy positive control");
+    }
 
     #[test]
     fn nested_vm_service_requires_matching_control_capability() {

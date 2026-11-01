@@ -38,6 +38,11 @@ service VmService {
   // Reserve requested system resources for a new VM.
   rpc Allocate(VmServiceAllocateRequest) returns (VmServiceAllocateResponse) {}
 
+  // Allocate with explicit NIC intent. This separate route is the version gate:
+  // older servers return Unimplemented instead of ignoring backend intent.
+  // Clients and proxies must not retry this request through Allocate.
+  rpc AllocateWithNetwork(VmServiceAllocateWithNetworkRequest) returns (VmServiceAllocateWithNetworkResponse) {}
+
   // Free up previously requested resources for an existing VM
   rpc Free(VmServiceFreeRequest) returns (VmServiceFreeResponse) {}
 
@@ -93,6 +98,16 @@ message VmServiceAllocateResponse {
   string vm_id = 1;
 }
 
+message VmServiceAllocateWithNetworkRequest {
+  VirtualMachine machine = 1;
+  optional string cell_name = 2;
+  // Required. TAP and AF_XDP requests both require a stable logical NIC ID.
+  VmNetwork network = 3;
+}
+message VmServiceAllocateWithNetworkResponse {
+  string vm_id = 1;
+}
+
 message VmServiceFreeRequest {
   string vm_id = 1;
   // When set, the request is proxied to the auraed running inside the
@@ -145,6 +160,21 @@ message VirtualMachine {
 
   // Auraed server address of the VM
   string auraed_address = 8;
+}
+
+// Desired configuration only. Socket, queue and policy leases are daemon-owned.
+message VmNetwork {
+  // Stable logical NIC ID, independent of interface names and queue indices.
+  string id = 1;
+
+  // An explicit backend request never falls back to another backend.
+  VmNetworkBackend backend = 2;
+}
+
+enum VmNetworkBackend {
+  VM_NETWORK_BACKEND_UNSPECIFIED = 0;
+  VM_NETWORK_BACKEND_TAP = 1;
+  VM_NETWORK_BACKEND_AF_XDP = 2;
 }
 
 // Message to specify the root filesystem config for a  VM
