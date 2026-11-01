@@ -35,6 +35,8 @@ pub(crate) enum VmServiceError {
     FailedToStartError { id: VmID, source: anyhow::Error },
     #[error("vm '{id}' could not be stopped: {source}")]
     FailedToStopError { id: VmID, source: anyhow::Error },
+    #[error("VM lifecycle worker failed: {0}")]
+    LifecycleWorker(anyhow::Error),
     #[error("vm config has no machine specified")]
     MissingMachineConfig,
     #[error("vm '{id}' config has no root drive specified")]
@@ -88,7 +90,8 @@ impl From<VmServiceError> for Status {
             VmServiceError::FailedToAllocateError { .. }
             | VmServiceError::FailedToFreeError { .. }
             | VmServiceError::FailedToStartError { .. }
-            | VmServiceError::FailedToStopError { .. } => Status::internal(msg),
+            | VmServiceError::FailedToStopError { .. }
+            | VmServiceError::LifecycleWorker(_) => Status::internal(msg),
             VmServiceError::MissingMachineConfig
             | VmServiceError::MissingRootDrive { .. }
             | VmServiceError::NetworkingUnavailable => {

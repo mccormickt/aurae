@@ -96,6 +96,32 @@ impl VmService {
         }
     }
 
+    /// Keep a complete mutation and its cache lock on one OS thread. Dropping
+    /// the RPC future does not interrupt setup, rollback or allocation release.
+    /// This thread is separate from the VMM and from Tokio's shared workers.
+    async fn mutate<T: Send + 'static>(
+        &self,
+        operation: impl AsyncFnOnce(&mut VirtualMachines) -> Result<T>
+        + Send
+        + 'static,
+    ) -> Result<T> {
+        let mut vms = self.vms.clone().lock_owned().await;
+        let runtime = tokio::runtime::Handle::current();
+        let (reply, result) = tokio::sync::oneshot::channel();
+        let _ = std::thread::Builder::new()
+            .name("aurae-vm-control".into())
+            .spawn(move || {
+                let outcome = runtime.block_on(operation(&mut vms));
+                if let Err(Err(error)) = reply.send(outcome) {
+                    tracing::error!(%error, "VM operation failed after requester left");
+                }
+            })
+            .map_err(|error| VmServiceError::LifecycleWorker(error.into()))?;
+        result
+            .await
+            .map_err(|error| VmServiceError::LifecycleWorker(error.into()))?
+    }
+
     fn authorize<T>(&self, request: &Request<T>) -> Result<()> {
         match &self.access {
             VmServiceAccess::Host => Ok(()),
@@ -218,12 +244,13 @@ impl VmService {
             net: vec![],
         };
 
-        let mut vms = self.vms.lock().await;
-        let vm = vms.create(id.clone(), spec).map_err(|e| {
-            VmServiceError::FailedToAllocateError { id, source: e }
-        })?;
-
-        Ok(VmServiceAllocateResponse { vm_id: vm.id.to_string() })
+        self.mutate(async move |vms| {
+            let vm = vms.create(id.clone(), spec).map_err(|e| {
+                VmServiceError::FailedToAllocateError { id, source: e }
+            })?;
+            Ok(VmServiceAllocateResponse { vm_id: vm.id.to_string() })
+        })
+        .await
     }
 
     #[tracing::instrument(skip(self))]
@@ -244,12 +271,13 @@ impl VmService {
 
         let id = VmID::new(request.vm_id);
 
-        let mut vms = self.vms.lock().await;
-        vms.delete(&id)
-            .await
-            .map_err(|e| VmServiceError::FailedToFreeError { id, source: e })?;
-
-        Ok(VmServiceFreeResponse {})
+        self.mutate(async move |vms| {
+            vms.delete(&id).await.map_err(|e| {
+                VmServiceError::FailedToFreeError { id, source: e }
+            })?;
+            Ok(VmServiceFreeResponse {})
+        })
+        .await
     }
 
     #[tracing::instrument(skip(self))]
@@ -272,12 +300,13 @@ impl VmService {
             return Err(VmServiceError::NetworkingUnavailable);
         }
         let id = VmID::new(request.vm_id);
-        let mut vms = self.vms.lock().await;
-        let auraed_address = vms.start(&id).await.map_err(|e| {
-            VmServiceError::FailedToStartError { id, source: e }
-        })?;
-
-        Ok(VmServiceStartResponse { auraed_address })
+        self.mutate(async move |vms| {
+            let auraed_address = vms.start(&id).await.map_err(|e| {
+                VmServiceError::FailedToStartError { id, source: e }
+            })?;
+            Ok(VmServiceStartResponse { auraed_address })
+        })
+        .await
     }
 
     #[tracing::instrument(skip(self))]
@@ -298,11 +327,14 @@ impl VmService {
 
         let id = VmID::new(request.vm_id);
 
-        let mut vms = self.vms.lock().await;
-        vms.stop(&id)
-            .map_err(|e| VmServiceError::FailedToStopError { id, source: e })?;
-
-        Ok(VmServiceStopResponse {})
+        self.mutate(async move |vms| {
+            vms.stop(&id).map_err(|e| VmServiceError::FailedToStopError {
+                id,
+                source: e,
+            })?;
+            Ok(VmServiceStopResponse {})
+        })
+        .await
     }
 
     #[tracing::instrument(skip(self))]
