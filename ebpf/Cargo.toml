@@ -39,6 +39,10 @@ path = "src/probe-kprobe-taskstats-exit.rs"
 name = "guard-tcx-cell-net"
 path = "src/guard-tcx-cell-net.rs"
 
+[[bin]]
+name = "guard-xdp-vm-net"
+path = "src/guard-xdp-vm-net.rs"
+
 [profile.dev]
 opt-level = 3
 debug = false
