@@ -74,6 +74,22 @@ impl Manager {
         self.vmm_thread = Some(vmm_thread);
         Ok(())
     }
+
+    /// Wake the VMM exit path and join it, including queued boot requests.
+    /// The caller retains external leases until the join and release fences.
+    pub(crate) fn shutdown(&mut self) -> Result<(), anyhow::Error> {
+        if self.vmm_thread.is_some() {
+            self.debug.write(1).context("signal VMM exit")?;
+            let thread = self.vmm_thread.take().expect("VMM thread");
+            self.sender = None;
+            thread
+                .thread_handle
+                .join()
+                .map_err(|_| anyhow!("VMM thread panicked"))?
+                .map_err(|error| anyhow!("VMM exit failed: {error}"))?;
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]

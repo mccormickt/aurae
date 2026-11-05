@@ -262,16 +262,25 @@ impl VirtualMachine {
         let mut manager = Manager::new()?;
         manager.start()?;
 
-        if let Some(sender) = &manager.sender {
+        let created = (|| {
+            let sender = manager.sender.as_ref().ok_or_else(|| {
+                anyhow!("Virtual machine manager not initialized")
+            })?;
             vmm::api::VmCreate
                 .send(
                     manager.events.try_clone()?,
                     sender.clone(),
                     Box::new(spec.clone().into()),
                 )
-                .map_err(|e| anyhow!("Failed to send create request: {e}"))?;
-        } else {
-            return Err(anyhow!("Virtual machine manager not initialized"));
+                .map_err(|e| anyhow!("Failed to send create request: {e:?}"))
+        })();
+        if let Err(error) = created {
+            return Err(match manager.shutdown() {
+                Ok(()) => error,
+                Err(cleanup) => anyhow!(
+                    "{error:#}; VMM creation rollback failed: {cleanup:#}"
+                ),
+            });
         }
 
         Ok(VirtualMachine {
