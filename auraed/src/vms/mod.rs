@@ -22,6 +22,8 @@ mod vm_service;
 
 use std::fmt;
 
+#[cfg(feature = "af-xdp")]
+pub(crate) use virtual_machine::NetSpec;
 pub(crate) use vm_service::VmService;
 
 /// Unforgeable capability carried only by the host-to-cell VM control path.

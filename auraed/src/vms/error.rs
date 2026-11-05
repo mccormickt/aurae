@@ -45,9 +45,8 @@ pub(crate) enum VmServiceError {
     InvalidArtifactPath { path: String, source: anyhow::Error },
     #[error("invalid VM network configuration: {0}")]
     InvalidNetwork(String),
-    #[error(
-        "AF_XDP on the cell's paired netkit is not available; no TAP fallback"
-    )]
+    #[cfg(not(feature = "af-xdp"))]
+    #[error("AF_XDP support is not compiled into this daemon; no TAP fallback")]
     AfXdpUnavailable,
     #[error(
         "vm networking is unavailable on this host (forwarding could not be \
@@ -98,6 +97,7 @@ impl From<VmServiceError> for Status {
                 Status::failed_precondition(msg)
             }
             VmServiceError::Unauthorized => Status::permission_denied(msg),
+            #[cfg(not(feature = "af-xdp"))]
             VmServiceError::AfXdpUnavailable => Status::unimplemented(msg),
             VmServiceError::InvalidCellName { .. }
             | VmServiceError::InvalidNetwork(_)

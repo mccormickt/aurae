@@ -270,6 +270,14 @@ impl SystemRuntime for Pid1SystemRuntime {
 
         let network = network::Network::connect(IpamConfig::default())?;
         network.init_endpoint(&net_config).await?;
+        if let Some(mac) = parse_kernel_cmdline().get("gw_mac") {
+            network
+                .set_guest_gateway_mac(
+                    net_config.host_v6,
+                    net_util::MacAddr::parse_str(mac)?,
+                )
+                .await?;
+        }
 
         // TODO: do we need to create an interface and address for socket_address?
 

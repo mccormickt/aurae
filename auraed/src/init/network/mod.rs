@@ -52,6 +52,8 @@ pub(crate) mod ipam;
 pub(crate) mod nat;
 mod netlink;
 mod sriov;
+#[cfg(feature = "af-xdp")]
+pub(crate) mod xdp;
 
 use bpf::CellNetGuard;
 use cell::CellInterfaceState;
@@ -220,6 +222,26 @@ impl Network {
 
     pub(crate) fn ipam(&self) -> &Ipam {
         &self.inner.ipam
+    }
+
+    /// Supply the Ethernet gateway for a guest on a routed L3 netkit endpoint.
+    /// A permanent entry avoids ND on the MAC-less transport.
+    pub(crate) async fn set_guest_gateway_mac(
+        &self,
+        gateway: Ipv6Addr,
+        mac: net_util::MacAddr,
+    ) -> Result<(), NetworkError> {
+        let index =
+            netlink::get_link_index(&self.inner.handle, "eth0".into()).await?;
+        self.inner
+            .handle
+            .neighbours()
+            .add(index, gateway.into())
+            .link_local_address(mac.get_bytes())
+            .replace()
+            .execute()
+            .await?;
+        Ok(())
     }
 
     fn cell_interfaces(

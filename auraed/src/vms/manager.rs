@@ -50,7 +50,10 @@ impl Manager {
         })
     }
 
-    pub fn start(&mut self) -> Result<(), anyhow::Error> {
+    pub fn start(
+        &mut self,
+        external_network: bool,
+    ) -> Result<(), anyhow::Error> {
         let (sender, receiver) = channel();
 
         let version =
@@ -66,7 +69,11 @@ impl Manager {
             &seccompiler::SeccompAction::Allow,
             self.hypervisor.clone(),
             vmm::GuestShutdownAction::ExitVmm,
-            vmm::GuestResetAction::ResetVm,
+            if external_network {
+                vmm::GuestResetAction::ShutdownVm
+            } else {
+                vmm::GuestResetAction::ResetVm
+            },
             true, // landlock_enable
         )
         .map_err(|e| anyhow!("Failed to start VMM thread: {e}"))?;

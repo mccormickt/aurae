@@ -145,6 +145,8 @@ pub struct NetSpec {
     pub id: String,
     /// TAP device name (CH creates it if it doesn't exist).
     pub tap: Option<String>,
+    /// Aurae-owned L3 netkit peer for an external AF_XDP endpoint.
+    pub xdp_iface: Option<String>,
     /// MAC address for the VM's virtual NIC.
     pub mac: MacAddr,
     /// Optional host MAC address.
@@ -175,9 +177,13 @@ impl From<NetSpec> for vmm::vm_config::NetConfig {
                 id: Some(spec.id),
                 ..PciDeviceCommonConfig::default()
             },
-            backend: vmm::vm_config::NetBackend::Tap,
-            xdp_external: false,
-            xdp_iface: None,
+            backend: if spec.xdp_iface.is_some() {
+                vmm::vm_config::NetBackend::AfXdp
+            } else {
+                vmm::vm_config::NetBackend::Tap
+            },
+            xdp_external: spec.xdp_iface.is_some(),
+            xdp_iface: spec.xdp_iface,
             xdp_peer: None,
             xdp_skb: false,
             xdp_zerocopy: false,
@@ -260,7 +266,7 @@ impl Display for VmStatus {
 impl VirtualMachine {
     pub fn new(id: VmID, spec: VmSpec) -> Result<Self, anyhow::Error> {
         let mut manager = Manager::new()?;
-        manager.start()?;
+        manager.start(spec.net.iter().any(|net| net.xdp_iface.is_some()))?;
 
         let created = (|| {
             let sender = manager.sender.as_ref().ok_or_else(|| {
@@ -292,13 +298,18 @@ impl VirtualMachine {
         })
     }
 
-    pub fn start(&mut self) -> Result<(), anyhow::Error> {
+    pub(crate) fn ensure_startable(&self) -> Result<(), anyhow::Error> {
         if self.deleted {
             return Err(anyhow!("Virtual machine has been deleted"));
         }
         if let VmState::Running = self.status.0 {
             return Err(anyhow!("Virtual machine already running"));
         }
+        Ok(())
+    }
+
+    pub fn start(&mut self) -> Result<(), anyhow::Error> {
+        self.ensure_startable()?;
         let manager = self
             .manager
             .lock()
@@ -313,6 +324,40 @@ impl VirtualMachine {
             return Err(anyhow!("Virtual machine manager not initialized"))?;
         }
 
+        Ok(())
+    }
+
+    #[cfg(feature = "af-xdp")]
+    pub(crate) fn start_with_resources(
+        &mut self,
+        resources: vmm::XdpBootResources,
+    ) -> Result<(), anyhow::Error> {
+        self.ensure_startable()?;
+        let manager = self
+            .manager
+            .lock()
+            .map_err(|_| anyhow!("VM manager lock poisoned"))?;
+        let sender = manager
+            .sender
+            .as_ref()
+            .ok_or_else(|| anyhow!("VMM is not initialized"))?;
+        let _ = vmm::api::VmBootWithResources
+            .send(manager.events.try_clone()?, sender.clone(), resources)
+            .map_err(|error| anyhow!("Prepared VM boot failed: {error:?}"))?;
+        self.status = VmStatus(VmState::Running);
+        Ok(())
+    }
+
+    /// Terminate and join even when the outcome of a boot request is unknown.
+    /// Steering must already be revoked; release fences are checked afterwards.
+    #[cfg(feature = "af-xdp")]
+    pub(crate) fn terminate(&mut self) -> Result<(), anyhow::Error> {
+        self.manager
+            .lock()
+            .map_err(|_| anyhow!("VM manager lock poisoned"))?
+            .shutdown()?;
+        self.status = VmStatus(VmState::Shutdown);
+        self.deleted = true;
         Ok(())
     }
 
@@ -392,6 +437,7 @@ mod tests {
             net: vec![NetSpec {
                 id: "net0".into(),
                 tap: Some("tap0".to_string()),
+                xdp_iface: None,
                 mac: MacAddr::local_random(),
                 host_mac: None,
                 host_ip_v6,
@@ -439,6 +485,7 @@ mod tests {
             net: vec![NetSpec {
                 id: "net0".into(),
                 tap: Some("tap0".to_string()),
+                xdp_iface: None,
                 mac: MacAddr::local_random(),
                 host_mac: None,
                 host_ip_v6: host_v6,
@@ -470,6 +517,7 @@ mod tests {
         NetSpec {
             id: "guest:primary".into(),
             tap: Some("vm-7".to_string()),
+            xdp_iface: None,
             mac: MacAddr::local_random(),
             host_mac: None,
             host_ip_v6: Ipv6Addr::new(0xfd00, 0xae, 0, 0, 0, 0, 0, 0),
@@ -515,6 +563,23 @@ mod tests {
         assert_eq!(cfg.pci_common.id.as_deref(), Some("guest:primary"));
         assert_eq!(cfg.backend, vmm::vm_config::NetBackend::Tap);
         assert!(!cfg.xdp_external);
+    }
+
+    #[test]
+    fn xdp_config_requires_external_resource_and_preserves_guest_mac() {
+        let mut spec = sample_net_spec();
+        spec.tap = None;
+        spec.xdp_iface = Some("nk-12345678-p".into());
+        let mac = spec.mac;
+        let cfg: vmm::vm_config::NetConfig = spec.into();
+        assert_eq!(cfg.backend, vmm::vm_config::NetBackend::AfXdp);
+        assert!(cfg.xdp_external);
+        assert_eq!(cfg.xdp_iface.as_deref(), Some("nk-12345678-p"));
+        assert_eq!(cfg.pci_common.id.as_deref(), Some("guest:primary"));
+        assert_eq!(cfg.mac, Some(mac));
+        assert!(cfg.tap.is_none() && cfg.fds.is_none());
+        assert!(cfg.xdp_peer.is_none() && !cfg.xdp_skb && !cfg.xdp_zerocopy);
+        assert!(!cfg.offload_tso && !cfg.offload_ufo && !cfg.offload_csum);
     }
 
     /// `MountSpec` → `DiskConfig` carries the host path and `read_only`

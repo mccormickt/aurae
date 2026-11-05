@@ -328,9 +328,8 @@ impl VmService {
         let id = VmID::new(request.vm_id);
 
         self.mutate(async move |vms| {
-            vms.stop(&id).map_err(|e| VmServiceError::FailedToStopError {
-                id,
-                source: e,
+            vms.stop(&id).await.map_err(|e| {
+                VmServiceError::FailedToStopError { id, source: e }
             })?;
             Ok(VmServiceStopResponse {})
         })
@@ -417,6 +416,9 @@ fn validated_network(network: Option<VmNetwork>) -> Result<VmNetwork> {
     }
     match VmNetworkBackend::try_from(network.backend) {
         Ok(VmNetworkBackend::Tap) => Ok(network),
+        #[cfg(feature = "af-xdp")]
+        Ok(VmNetworkBackend::AfXdp) => Ok(network),
+        #[cfg(not(feature = "af-xdp"))]
         Ok(VmNetworkBackend::AfXdp) => Err(VmServiceError::AfXdpUnavailable),
         _ => Err(VmServiceError::InvalidNetwork(
             "an explicit network requires a known, explicit backend".into(),
@@ -558,6 +560,7 @@ mod tests {
                 Some(VmNetwork { id: "nic".into(), backend: 999 }),
                 tonic::Code::InvalidArgument,
             ),
+            #[cfg(not(feature = "af-xdp"))]
             (
                 Some(VmNetwork { id: "nic".into(), backend: 2 }),
                 tonic::Code::Unimplemented,

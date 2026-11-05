@@ -23,6 +23,8 @@ use vmm_sys_util::signal::block_signal;
 
 use crate::init::network::Network;
 use crate::init::network::ipam::{Allocation, IpamError, vm_key};
+#[cfg(feature = "af-xdp")]
+use crate::init::network::xdp::XdpEndpoint;
 
 use super::virtual_machine::{NetSpec, VirtualMachine, VmID, VmSpec};
 
@@ -60,6 +62,8 @@ fn tap_endpoint(
 #[derive(Debug)]
 pub struct VirtualMachines {
     cache: Cache,
+    #[cfg(feature = "af-xdp")]
+    xdp: HashMap<VmID, XdpEndpoint>,
     /// Shared host networking (which owns the IPAM allocator). `None`
     /// outside the Daemon context and on hosts where networking setup
     /// failed; `create()` returns an error in that case.
@@ -89,7 +93,12 @@ impl VirtualMachines {
             }
         }
 
-        Self { cache: Cache::new(), network }
+        Self {
+            cache: Cache::new(),
+            network,
+            #[cfg(feature = "af-xdp")]
+            xdp: HashMap::new(),
+        }
     }
 
     /// Create a new virtual machine
@@ -120,13 +129,19 @@ impl VirtualMachines {
                 .allocate(&vm_key(&id))
                 .map_err(|e| anyhow!("Failed to allocate IP address: {e}"))?;
 
-            // Reserve a unique TAP name. Cloud Hypervisor creates it on
-            // VM start; we just hand it the name.
-            let tap_name = network.reserve_tap_name();
+            let af_xdp = spec.network.backend
+                == proto::vms::VmNetworkBackend::AfXdp as i32;
+            let (tap, xdp_iface) = if af_xdp {
+                let (_, peer) = network.reserve_interface_names();
+                (None, Some(peer))
+            } else {
+                (Some(network.reserve_tap_name()), None)
+            };
 
             spec.net.push(NetSpec {
                 id: spec.network.id.clone(),
-                tap: Some(tap_name),
+                tap,
+                xdp_iface,
                 mac: MacAddr::local_random(),
                 host_mac: None,
                 host_ip_v6: allocation.host_ip,
@@ -135,6 +150,11 @@ impl VirtualMachines {
             });
 
             spec.kernel_args.extend(aurae_kernel_args(&allocation));
+            if af_xdp {
+                // The L3 netkit gateway has no Ethernet address. A permanent
+                // neighbor avoids ND and emits the device's zero destination.
+                spec.kernel_args.push("aurae.gw_mac=00:00:00:00:00:00".into());
+            }
         }
 
         let vm = match VirtualMachine::new(id.clone(), spec) {
@@ -161,9 +181,19 @@ impl VirtualMachines {
     }
 
     /// Stop a virtual machine by its ID
-    pub fn stop(&mut self, id: &VmID) -> Result<(), anyhow::Error> {
+    pub async fn stop(&mut self, id: &VmID) -> Result<(), anyhow::Error> {
         if let Some(vm) = self.cache.get_mut(id) {
+            #[cfg(feature = "af-xdp")]
+            if let Some(endpoint) = self.xdp.get_mut(id) {
+                endpoint
+                    .revoke(self.network.as_ref().expect("VM network"))
+                    .await?;
+            }
             vm.stop()?;
+            #[cfg(feature = "af-xdp")]
+            if let Some(endpoint) = self.xdp.get_mut(id) {
+                endpoint.wait_released();
+            }
             Ok(())
         } else {
             Err(anyhow!("Virtual machine with ID '{:?}' not found", id))
@@ -176,6 +206,15 @@ impl VirtualMachines {
     /// this cache for the whole call. Otherwise a concurrent `delete` can
     /// recycle the address of this VM before its TAP is configured.
     pub async fn start(&mut self, id: &VmID) -> Result<String, anyhow::Error> {
+        #[cfg(feature = "af-xdp")]
+        if self
+            .cache
+            .get(id)
+            .and_then(|vm| vm.vm.net.first())
+            .is_some_and(|net| net.xdp_iface.is_some())
+        {
+            return self.start_xdp(id).await;
+        }
         let Some(vm) = self.cache.get_mut(id) else {
             return Err(anyhow!(
                 "Virtual machine with ID '{:?}' not found",
@@ -211,6 +250,49 @@ impl VirtualMachines {
         Ok(address.unwrap_or_default())
     }
 
+    #[cfg(feature = "af-xdp")]
+    async fn start_xdp(&mut self, id: &VmID) -> Result<String, anyhow::Error> {
+        let vm = self.cache.get_mut(id).expect("VM exists");
+        vm.ensure_startable()?;
+        let net = vm.vm.net.first().expect("AF_XDP NIC").clone();
+        let network = self
+            .network
+            .as_ref()
+            .ok_or_else(|| anyhow!("VM networking unavailable"))?;
+        if !self.xdp.contains_key(id) {
+            let _ = self.xdp.insert(id.clone(), XdpEndpoint::new(&net)?);
+        }
+        let endpoint = self.xdp.get_mut(id).expect("AF_XDP lease");
+        let resource = match endpoint.prepare(network, &net).await {
+            Ok(resource) => resource,
+            Err(error) => {
+                // No boot request owns this generation. Keep the down pair
+                // and address for a retry, including deferred-kernel EBUSY.
+                endpoint.revoke(network).await.map_err(|cleanup| anyhow!(
+                    "{error:#}; AF_XDP preparation rollback retained state: {cleanup:#}"
+                ))?;
+                endpoint.wait_released();
+                return Err(error);
+            }
+        };
+        match vm.start_with_resources([(net.id, resource)].into()) {
+            Ok(()) => Ok(vm
+                .auraed_address()
+                .map(|address| address.to_string())
+                .unwrap_or_default()),
+            Err(error) => {
+                // Every boot error, including a lost response, takes the same
+                // revoke → VMM exit/join → fence → lease release path.
+                match self.delete(id).await {
+                    Ok(()) => Err(error),
+                    Err(cleanup) => Err(anyhow!(
+                        "{error:#}; AF_XDP rollback retained state for retry: {cleanup:#}"
+                    )),
+                }
+            }
+        }
+    }
+
     /// Delete a virtual machine by its ID
     pub async fn delete(&mut self, id: &VmID) -> Result<(), anyhow::Error> {
         let (endpoint, leaked_ip) = {
@@ -222,6 +304,22 @@ impl VirtualMachines {
             };
             let endpoint = tap_endpoint(vm)?;
             let leaked_ip = vm.vm.net.first().map(|n| n.guest_ip_v6);
+            #[cfg(feature = "af-xdp")]
+            if vm.vm.net.first().is_some_and(|net| net.xdp_iface.is_some()) {
+                if let Some(xdp) = self.xdp.get_mut(id) {
+                    xdp.revoke(self.network.as_ref().expect("VM network"))
+                        .await?;
+                }
+                vm.terminate()?;
+                if let Some(xdp) = self.xdp.get_mut(id) {
+                    xdp.wait_released();
+                    xdp.destroy(self.network.as_ref().expect("VM network"))
+                        .await?;
+                }
+            } else {
+                vm.delete()?;
+            }
+            #[cfg(not(feature = "af-xdp"))]
             vm.delete()?;
             (endpoint, leaked_ip)
         };
@@ -250,6 +348,8 @@ impl VirtualMachines {
         }
 
         let _ = self.cache.remove(id);
+        #[cfg(feature = "af-xdp")]
+        let _ = self.xdp.remove(id);
         Ok(())
     }
 
