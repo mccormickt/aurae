@@ -4,6 +4,8 @@ The Aurae Daemon (auraed) is the main daemon that powers Aurae.
 
 The Aurae Daemon runs as a gRPC server which listens over a Unix domain socket by default.
 
+For the optional VM network adapter, see [AF_XDP VM networking](af-xdp.md).
+
 ```
 /var/run/aurae/aurae.sock
 ```
