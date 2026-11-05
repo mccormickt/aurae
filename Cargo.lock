@@ -164,20 +164,22 @@ dependencies = [
 [[package]]
 name = "arch"
 version = "0.1.0"
-source = "git+https://github.com/cloud-hypervisor/cloud-hypervisor?tag=v53.0#9ed824d6d08df3e96f7d5f50795d9449ac99f431"
+source = "git+https://github.com/mccormickt/cloud-hypervisor?rev=adb285f2e0c84eacd5cb952ae4de16911ddaad0a#adb285f2e0c84eacd5cb952ae4de16911ddaad0a"
 dependencies = [
  "anyhow",
  "byteorder",
+ "crc-any",
  "fdt",
  "hypervisor",
  "libc",
  "linux-loader",
  "log",
  "serde",
+ "serde_json",
  "thiserror 2.0.18",
  "uuid",
  "vm-fdt",
- "vm-memory",
+ "vm-memory 0.18.0",
  "vmm-sys-util",
 ]
 
@@ -231,7 +233,7 @@ checksum = "1505bd5d3d116872e7271a6d4e16d81d0c8570876c8de68093a09ac269d8aac0"
 name = "aurae-ebpf-shared"
 version = "0.0.0"
 dependencies = [
- "aya",
+ "aya 0.13.1",
 ]
 
 [[package]]
@@ -240,8 +242,9 @@ version = "0.0.0"
 dependencies = [
  "anyhow",
  "aurae-ebpf-shared",
- "aya",
+ "aya 0.13.1",
  "backoff",
+ "block",
  "bytes",
  "chrono",
  "clap",
@@ -376,14 +379,42 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d18bc4e506fbb85ab7392ed993a7db4d1a452c71b75a246af4a80ab8c9d2dd50"
 dependencies = [
  "assert_matches",
- "aya-obj",
+ "aya-obj 0.2.1",
  "bitflags 2.13.2",
  "bytes",
  "libc",
  "log",
- "object",
+ "object 0.36.7",
  "once_cell",
  "thiserror 1.0.69",
+]
+
+[[package]]
+name = "aya"
+version = "0.16.0"
+source = "git+https://github.com/mccormickt/aya?rev=f0471a9bec8d297d6962e8f604dbaf21d4036701#f0471a9bec8d297d6962e8f604dbaf21d4036701"
+dependencies = [
+ "assert_matches",
+ "aya-obj 0.6.0",
+ "bitflags 2.13.2",
+ "hashbrown 0.17.1",
+ "libc",
+ "log",
+ "object 0.40.0",
+ "once_cell",
+ "scopeguard",
+ "thiserror 2.0.18",
+]
+
+[[package]]
+name = "aya-build"
+version = "0.2.1"
+source = "git+https://github.com/mccormickt/aya?rev=f0471a9bec8d297d6962e8f604dbaf21d4036701#f0471a9bec8d297d6962e8f604dbaf21d4036701"
+dependencies = [
+ "anyhow",
+ "cargo_metadata",
+ "rustc_version",
+ "which 8.0.6",
 ]
 
 [[package]]
@@ -396,8 +427,19 @@ dependencies = [
  "core-error",
  "hashbrown 0.15.2",
  "log",
- "object",
+ "object 0.36.7",
  "thiserror 1.0.69",
+]
+
+[[package]]
+name = "aya-obj"
+version = "0.6.0"
+source = "git+https://github.com/mccormickt/aya?rev=f0471a9bec8d297d6962e8f604dbaf21d4036701#f0471a9bec8d297d6962e8f604dbaf21d4036701"
+dependencies = [
+ "bytes",
+ "log",
+ "object 0.40.0",
+ "thiserror 2.0.18",
 ]
 
 [[package]]
@@ -430,7 +472,7 @@ dependencies = [
  "cfg-if",
  "libc",
  "miniz_oxide",
- "object",
+ "object 0.36.7",
  "rustc-demangle",
  "windows-targets 0.52.6",
 ]
@@ -440,6 +482,12 @@ name = "base64"
 version = "0.22.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "72b3254f16251a8381aa12e40e3c4d2f0199f8c6508fbecb9d91f575e0fbb8c6"
+
+[[package]]
+name = "base64"
+version = "0.23.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ac07cdecf99051d9a5238b80f35af32cdeba5b336e55d957b318b50137e18da5"
 
 [[package]]
 name = "base64-simd"
@@ -558,7 +606,7 @@ dependencies = [
 [[package]]
 name = "block"
 version = "0.1.0"
-source = "git+https://github.com/cloud-hypervisor/cloud-hypervisor?tag=v53.0#9ed824d6d08df3e96f7d5f50795d9449ac99f431"
+source = "git+https://github.com/mccormickt/cloud-hypervisor?rev=adb285f2e0c84eacd5cb952ae4de16911ddaad0a#adb285f2e0c84eacd5cb952ae4de16911ddaad0a"
 dependencies = [
  "bitflags 2.13.2",
  "byteorder",
@@ -573,7 +621,7 @@ dependencies = [
  "uuid",
  "virtio-bindings",
  "virtio-queue",
- "vm-memory",
+ "vm-memory 0.18.0",
  "vm-virtio",
  "vmm-sys-util",
  "zerocopy 0.8.59",
@@ -587,15 +635,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3078c7629b62d3f0439517fa394996acacc5cbc91c5a20d8c658e77abd503a71"
 dependencies = [
  "generic-array",
-]
-
-[[package]]
-name = "block-buffer"
-version = "0.12.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d2f6c7dbe95a6ed67ad9f18e57daf93a2f034c524b99fd2b76d18fdfeb6660aa"
-dependencies = [
- "hybrid-array",
 ]
 
 [[package]]
@@ -650,6 +689,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "camino"
+version = "1.2.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bbbad30e4b4c14a39e3cc8aed085a12a327257c316619c93581e017bc52be591"
+dependencies = [
+ "serde_core",
+]
+
+[[package]]
 name = "capacity_builder"
 version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -676,6 +724,30 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "fd1ddba47aba30b6a889298ad0109c3b8dcb0e8fc993b459daa7067d46f865e0"
 dependencies = [
  "libc",
+]
+
+[[package]]
+name = "cargo-platform"
+version = "0.3.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "dd0061da739915fae12ea00e16397555ed4371a6bb285431aab930f61b0aa4ba"
+dependencies = [
+ "serde",
+ "serde_core",
+]
+
+[[package]]
+name = "cargo_metadata"
+version = "0.23.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ef987d17b0a113becdd19d3d0022d04d7ef41f9efe4f3fb63ac44ba61df3ade9"
+dependencies = [
+ "camino",
+ "cargo-platform",
+ "semver",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
 ]
 
 [[package]]
@@ -877,12 +949,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2459377285ad874054d797f3ccebf984978aa39129f6eafde5cdc8315b612f8"
 
 [[package]]
-name = "const-oid"
-version = "0.10.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a6ef517f0926dd24a1582492c791b6a4818a4d94e789a334894aa15b0d12f55c"
-
-[[package]]
 name = "const_format"
 version = "0.2.35"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -976,15 +1042,6 @@ checksum = "1bfb12502f3fc46cca1bb51ac28df9d618d813cdc3d2f25b9fe775a34af26bb3"
 dependencies = [
  "generic-array",
  "typenum",
-]
-
-[[package]]
-name = "crypto-common"
-version = "0.2.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ce6e4c961d6cd6c9a86db418387425e8bdeaf05b3c8bc1411e6dca4c252f1453"
-dependencies = [
- "hybrid-array",
 ]
 
 [[package]]
@@ -1090,7 +1147,7 @@ version = "0.51.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c72e0409b3dbd60a5bf296cbc273a8e36bb3a3aab6abac389f1891e187d5ce14"
 dependencies = [
- "base64",
+ "base64 0.22.1",
  "capacity_builder",
  "deno_error",
  "deno_media_type",
@@ -1147,7 +1204,7 @@ dependencies = [
  "deno_path_util",
  "deno_unsync",
  "futures",
- "indexmap 2.8.0",
+ "indexmap 2.14.2",
  "libc",
  "parking_lot",
  "percent-encoding",
@@ -1213,7 +1270,7 @@ version = "0.245.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0373bb5320faa6c64279ade8334ecc58968ab5fc2e5a39a2d6abd5071ed16e72"
 dependencies = [
- "indexmap 2.8.0",
+ "indexmap 2.14.2",
  "proc-macro2",
  "quote",
  "stringcase",
@@ -1264,7 +1321,7 @@ version = "0.7.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f55bf8e7b65898637379c1b74eb1551107c8294ed26d855ceb9fd1a09cfc9bc0"
 dependencies = [
- "const-oid 0.9.6",
+ "const-oid",
  "zeroize",
 ]
 
@@ -1302,7 +1359,7 @@ dependencies = [
 [[package]]
 name = "devices"
 version = "0.1.0"
-source = "git+https://github.com/cloud-hypervisor/cloud-hypervisor?tag=v53.0#9ed824d6d08df3e96f7d5f50795d9449ac99f431"
+source = "git+https://github.com/mccormickt/cloud-hypervisor?rev=adb285f2e0c84eacd5cb952ae4de16911ddaad0a#adb285f2e0c84eacd5cb952ae4de16911ddaad0a"
 dependencies = [
  "acpi_tables",
  "anyhow",
@@ -1310,17 +1367,19 @@ dependencies = [
  "bitflags 2.13.2",
  "byteorder",
  "event_monitor",
+ "getrandom 0.4.3",
  "hypervisor",
+ "iommufd-bindings",
+ "iommufd-ioctls",
  "libc",
  "log",
- "num_enum",
  "pci",
  "serde",
  "thiserror 2.0.18",
  "tpm",
  "vm-allocator",
  "vm-device",
- "vm-memory",
+ "vm-memory 0.18.0",
  "vm-migration",
  "vmm-sys-util",
 ]
@@ -1337,19 +1396,8 @@ version = "0.10.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9ed9a281f7bc9b7576e61468ba615a66a5c8cfdff42420a70aa82701a3b1e292"
 dependencies = [
- "block-buffer 0.10.4",
- "crypto-common 0.1.6",
-]
-
-[[package]]
-name = "digest"
-version = "0.11.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f1dd6dbb5841937940781866fa1281a1ff7bd3bf827091440879f9994983d5c2"
-dependencies = [
- "block-buffer 0.12.1",
- "const-oid 0.10.2",
- "crypto-common 0.2.2",
+ "block-buffer",
+ "crypto-common",
 ]
 
 [[package]]
@@ -1483,7 +1531,7 @@ dependencies = [
 [[package]]
 name = "event_monitor"
 version = "0.1.0"
-source = "git+https://github.com/cloud-hypervisor/cloud-hypervisor?tag=v53.0#9ed824d6d08df3e96f7d5f50795d9449ac99f431"
+source = "git+https://github.com/mccormickt/cloud-hypervisor?rev=adb285f2e0c84eacd5cb952ae4de16911ddaad0a#adb285f2e0c84eacd5cb952ae4de16911ddaad0a"
 dependencies = [
  "flume",
  "libc",
@@ -1563,6 +1611,12 @@ name = "foldhash"
 version = "0.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d9c4f5dac5e15c24eb999c26181a6ca40b39fe946cbe4c263c7209467bc83af2"
+
+[[package]]
+name = "foldhash"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "77ce24cb58228fbb8aa041425bb1050850ac19177686ea6e0f41a70416f56fdb"
 
 [[package]]
 name = "form_urlencoded"
@@ -1780,7 +1834,7 @@ dependencies = [
  "futures-core",
  "futures-sink",
  "http",
- "indexmap 2.8.0",
+ "indexmap 2.14.2",
  "slab",
  "tokio",
  "tokio-util",
@@ -1811,7 +1865,17 @@ checksum = "bf151400ff0baff5465007dd2f3e717f3fe502074ca563069ce3a6629d07b289"
 dependencies = [
  "allocator-api2",
  "equivalent",
- "foldhash",
+ "foldhash 0.1.5",
+]
+
+[[package]]
+name = "hashbrown"
+version = "0.17.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ed5909b6e89a2db4456e54cd5f673791d7eca6732202bbf2a9cc504fe2f9b84a"
+dependencies = [
+ "equivalent",
+ "foldhash 0.2.0",
 ]
 
 [[package]]
@@ -1901,15 +1965,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "df3b46402a9d5adb4c86a0cf463f42e19994e3ee891101b1841f30a545cb49a9"
 
 [[package]]
-name = "hybrid-array"
-version = "0.4.10"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3944cf8cf766b40e2a1a333ee5e9b563f854d5fa49d6a8ca2764e97c6eddb214"
-dependencies = [
- "typenum",
-]
-
-[[package]]
 name = "hyper"
 version = "1.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1965,13 +2020,11 @@ dependencies = [
 [[package]]
 name = "hypervisor"
 version = "0.1.0"
-source = "git+https://github.com/cloud-hypervisor/cloud-hypervisor?tag=v53.0#9ed824d6d08df3e96f7d5f50795d9449ac99f431"
+source = "git+https://github.com/mccormickt/cloud-hypervisor?rev=adb285f2e0c84eacd5cb952ae4de16911ddaad0a#adb285f2e0c84eacd5cb952ae4de16911ddaad0a"
 dependencies = [
  "anyhow",
  "arc-swap",
  "bitfield-struct",
- "byteorder",
- "cfg-if",
  "concat-idents",
  "kvm-bindings",
  "kvm-ioctls",
@@ -1983,7 +2036,7 @@ dependencies = [
  "serde_with",
  "thiserror 2.0.18",
  "vfio-ioctls",
- "vm-memory",
+ "vm-memory 0.18.0",
  "vmm-sys-util",
  "zerocopy 0.8.59",
 ]
@@ -2271,12 +2324,12 @@ dependencies = [
 
 [[package]]
 name = "indexmap"
-version = "2.8.0"
+version = "2.14.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3954d50fe15b02142bf25d3b8bdadb634ec3948f103d04ffe3031bc8fe9d7058"
+checksum = "cc4e190f5d26ca7051642629da2c52fc03bde85a03197c99408dcd291734c855"
 dependencies = [
  "equivalent",
- "hashbrown 0.15.2",
+ "hashbrown 0.17.1",
 ]
 
 [[package]]
@@ -2290,17 +2343,19 @@ dependencies = [
 
 [[package]]
 name = "iommufd-bindings"
-version = "0.1.0"
+version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fd7de3a04f6fd55f171a6682852f7aa360bb848a85e0c610513349e006b3c139"
+checksum = "ccb1839dadf7e92244d8ae02a6b60f8d120c5674341dc18d401b715809641667"
 
 [[package]]
 name = "iommufd-ioctls"
-version = "0.2.0"
+version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8050f03ef0c6979597140b6d20da076931fb7a06389b8b0eb971b8f65b271748"
+checksum = "848d491b399f8551129347bb949870eb3eee2b390e435dc29570a902e166f353"
 dependencies = [
  "iommufd-bindings",
+ "libc",
+ "log",
  "thiserror 2.0.18",
  "vmm-sys-util",
 ]
@@ -2409,9 +2464,9 @@ dependencies = [
 
 [[package]]
 name = "kvm-bindings"
-version = "0.14.1"
+version = "0.14.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "11cf0ca75d59e9d298647c59cf6c5286fa048120caa77972a7a504a0824d234f"
+checksum = "e3819cba3d5b448587dbed4b186fb61b0a8d02c5eb88846c9463aa514afe61a8"
 dependencies = [
  "serde",
  "vmm-sys-util",
@@ -2420,9 +2475,9 @@ dependencies = [
 
 [[package]]
 name = "kvm-ioctls"
-version = "0.25.0"
+version = "0.25.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "06ac372c120eb893b086d1a12027669cf2b478d1f71204021ffa7adf57948d63"
+checksum = "d7a59b7ac62625a405112180b56a99acb4498e1d18f5a7c0cd0916c79a076b0a"
 dependencies = [
  "bitflags 2.13.2",
  "kvm-bindings",
@@ -2449,9 +2504,9 @@ checksum = "bbd2bcb4c963f2ddae06a2efc7e9f3591312473c50c6685e1f298068316e66fe"
 
 [[package]]
 name = "libc"
-version = "0.2.186"
+version = "0.2.191"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "68ab91017fe16c622486840e4c83c9a37afeff978bd239b5293d61ece587de66"
+checksum = "65cd87c9a6d60536580b316ad985726104730a5151c99845f2490428ef91240a"
 
 [[package]]
 name = "libcgroups"
@@ -2515,11 +2570,11 @@ checksum = "f9fbbcab51052fe104eb5e5d351cf728d30a5be1fe14d9be8a3b097481fb97de"
 
 [[package]]
 name = "linux-loader"
-version = "0.13.2"
+version = "0.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "de72cb02c55ecffcf75fe78295926f872eb6eb0a58d629c58a8c324dc26380f6"
+checksum = "d54207cb617cd75b10c57ad20235c914ab62b180ceeff2ef3111983670d3b321"
 dependencies = [
- "vm-memory",
+ "vm-memory 0.18.0",
 ]
 
 [[package]]
@@ -2645,18 +2700,21 @@ dependencies = [
 [[package]]
 name = "net_util"
 version = "0.1.0"
-source = "git+https://github.com/cloud-hypervisor/cloud-hypervisor?tag=v53.0#9ed824d6d08df3e96f7d5f50795d9449ac99f431"
+source = "git+https://github.com/mccormickt/cloud-hypervisor?rev=adb285f2e0c84eacd5cb952ae4de16911ddaad0a#adb285f2e0c84eacd5cb952ae4de16911ddaad0a"
 dependencies = [
+ "aya 0.16.0",
+ "aya-build",
  "epoll",
  "getrandom 0.4.3",
  "libc",
  "log",
  "rate_limiter",
  "serde",
+ "smallvec",
  "thiserror 2.0.18",
  "virtio-bindings",
  "virtio-queue",
- "vm-memory",
+ "vm-memory 0.18.0",
  "vm-virtio",
  "vmm-sys-util",
 ]
@@ -2857,7 +2915,19 @@ checksum = "62948e14d923ea95ea2c7c86c71013138b66525b86bdc08d2dcc262bdb497b87"
 dependencies = [
  "crc32fast",
  "hashbrown 0.15.2",
- "indexmap 2.8.0",
+ "indexmap 2.14.2",
+ "memchr",
+]
+
+[[package]]
+name = "object"
+version = "0.40.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "dd229a0361b9d0d4396176e02d65897f487eebeab7caa6d443855ee152ca0b9c"
+dependencies = [
+ "crc32fast",
+ "hashbrown 0.17.1",
+ "indexmap 2.14.2",
  "memchr",
 ]
 
@@ -2907,7 +2977,7 @@ dependencies = [
 [[package]]
 name = "option_parser"
 version = "0.1.0"
-source = "git+https://github.com/cloud-hypervisor/cloud-hypervisor?tag=v53.0#9ed824d6d08df3e96f7d5f50795d9449ac99f431"
+source = "git+https://github.com/mccormickt/cloud-hypervisor?rev=adb285f2e0c84eacd5cb952ae4de16911ddaad0a#adb285f2e0c84eacd5cb952ae4de16911ddaad0a"
 dependencies = [
  "thiserror 2.0.18",
 ]
@@ -2992,19 +3062,20 @@ version = "0.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e8edd1efdd8ab23ba9cb9ace3d9987a72663d5d7c9f74fa00b51d6213645cf6c"
 dependencies = [
- "base64",
+ "base64 0.22.1",
  "serde",
 ]
 
 [[package]]
 name = "pci"
 version = "0.1.0"
-source = "git+https://github.com/cloud-hypervisor/cloud-hypervisor?tag=v53.0#9ed824d6d08df3e96f7d5f50795d9449ac99f431"
+source = "git+https://github.com/mccormickt/cloud-hypervisor?rev=adb285f2e0c84eacd5cb952ae4de16911ddaad0a#adb285f2e0c84eacd5cb952ae4de16911ddaad0a"
 dependencies = [
  "anyhow",
- "base64",
+ "base64 0.23.1",
  "byteorder",
  "hypervisor",
+ "iommufd-ioctls",
  "libc",
  "log",
  "serde",
@@ -3014,7 +3085,7 @@ dependencies = [
  "vfio_user",
  "vm-allocator",
  "vm-device",
- "vm-memory",
+ "vm-memory 0.18.0",
  "vm-migration",
  "vmm-sys-util",
 ]
@@ -3025,7 +3096,7 @@ version = "3.0.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "38af38e8470ac9dee3ce1bae1af9c1671fffc44ddfd8bd1d0a3445bf349a8ef3"
 dependencies = [
- "base64",
+ "base64 0.22.1",
  "serde",
 ]
 
@@ -3406,7 +3477,7 @@ checksum = "63b8176103e19a2643978565ca18b50549f6101881c443590420e4dc998a3c69"
 [[package]]
 name = "rate_limiter"
 version = "0.1.0"
-source = "git+https://github.com/cloud-hypervisor/cloud-hypervisor?tag=v53.0#9ed824d6d08df3e96f7d5f50795d9449ac99f431"
+source = "git+https://github.com/mccormickt/cloud-hypervisor?rev=adb285f2e0c84eacd5cb952ae4de16911ddaad0a#adb285f2e0c84eacd5cb952ae4de16911ddaad0a"
 dependencies = [
  "epoll",
  "libc",
@@ -3566,6 +3637,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "357703d41365b4b27c590e3ed91eabb1b663f07c4c084095e60cbed4362dff0d"
 
 [[package]]
+name = "rustc_version"
+version = "0.4.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cfcb3a22ef46e85b45de6ee7e79d063319ebb6594faafcf1c225ea92ab6e9b92"
+dependencies = [
+ "semver",
+]
+
+[[package]]
 name = "rustix"
 version = "0.38.44"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3588,14 +3668,14 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys 0.11.0",
- "windows-sys 0.60.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
 name = "rustls"
-version = "0.23.45"
+version = "0.23.46"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0d41d731c7d2f962d1ccc364cec258de3c0e93b38c2fb3ba97ac74513048d634"
+checksum = "48e13bd8c0e9365c43cfa5c9e8f9ad49d3c8444926c9aac819e0e4dc503c8fdf"
 dependencies = [
  "log",
  "once_cell",
@@ -3733,6 +3813,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "semver"
+version = "1.0.28"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8a7852d02fc848982e0c167ef163aaff9cd91dc640ba85e263cb1ce46fae51cd"
+dependencies = [
+ "serde",
+ "serde_core",
+]
+
+[[package]]
 name = "seq-macro"
 version = "0.3.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3785,7 +3875,7 @@ version = "1.0.151"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c841b55ecdae098c80dcae9cf767f6f8a0c2cdb3416bbef72181df4d0fe73f14"
 dependencies = [
- "indexmap 2.8.0",
+ "indexmap 2.14.2",
  "itoa",
  "memchr",
  "serde",
@@ -3852,7 +3942,7 @@ dependencies = [
 [[package]]
 name = "serial_buffer"
 version = "0.1.0"
-source = "git+https://github.com/cloud-hypervisor/cloud-hypervisor?tag=v53.0#9ed824d6d08df3e96f7d5f50795d9449ac99f431"
+source = "git+https://github.com/mccormickt/cloud-hypervisor?rev=adb285f2e0c84eacd5cb952ae4de16911ddaad0a#adb285f2e0c84eacd5cb952ae4de16911ddaad0a"
 
 [[package]]
 name = "serial_test"
@@ -3887,18 +3977,7 @@ checksum = "e3bf829a2d51ab4a5ddf1352d8470c140cadc8301b2ae1789db023f01cedd6ba"
 dependencies = [
  "cfg-if",
  "cpufeatures 0.2.17",
- "digest 0.10.7",
-]
-
-[[package]]
-name = "sha2"
-version = "0.11.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "446ba717509524cb3f22f17ecc096f10f4822d76ab5c0b9822c5f9c284e825f4"
-dependencies = [
- "cfg-if",
- "cpufeatures 0.3.1",
- "digest 0.11.3",
+ "digest",
 ]
 
 [[package]]
@@ -4005,9 +4084,9 @@ dependencies = [
 
 [[package]]
 name = "socket2"
-version = "0.6.1"
+version = "0.6.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "17129e116933cf371d018bb80ae557e889637989d8638274fb25622827b03881"
+checksum = "c3d1e2c7f27f8d4cb10542a02c49005dbd6e93095799d6f3be745fae9f8fedd4"
 dependencies = [
  "libc",
  "windows-sys 0.60.2",
@@ -4192,7 +4271,7 @@ checksum = "72e90b52ee734ded867104612218101722ad87ff4cf74fe30383bd244a533f97"
 dependencies = [
  "anyhow",
  "bytes-str",
- "indexmap 2.8.0",
+ "indexmap 2.14.2",
  "serde",
  "serde_json",
  "swc_config_macro",
@@ -4326,7 +4405,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6c6f1b8f4232e7a7f614ff7c0f6ccb89c2d028cdf7629f79ad710cff5b28b62c"
 dependencies = [
  "better_scoped_tls",
- "indexmap 2.8.0",
+ "indexmap 2.14.2",
  "once_cell",
  "par-core",
  "phf",
@@ -4390,9 +4469,9 @@ version = "30.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "69ea0052ac23b5b9fbc85bbdb1791b36b918f9d55f594b0ed8e25babb4c32d16"
 dependencies = [
- "base64",
+ "base64 0.22.1",
  "bytes-str",
- "indexmap 2.8.0",
+ "indexmap 2.14.2",
  "once_cell",
  "rustc-hash",
  "serde",
@@ -4432,7 +4511,7 @@ version = "21.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "83259addd99ed4022aa9fc4d39428c008d3d42533769e1a005529da18cde4568"
 dependencies = [
- "indexmap 2.8.0",
+ "indexmap 2.14.2",
  "num_cpus",
  "once_cell",
  "par-core",
@@ -4880,7 +4959,7 @@ version = "0.22.24"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "17b4795ff5edd201c7cd6dca065ae59972ce77d1b80fa0a84d94950ece7d1474"
 dependencies = [
- "indexmap 2.8.0",
+ "indexmap 2.14.2",
  "serde",
  "serde_spanned",
  "toml_datetime",
@@ -4895,7 +4974,7 @@ checksum = "eb7613188ce9f7df5bfe185db26c5814347d110db17920415cf2fbcad85e7203"
 dependencies = [
  "async-trait",
  "axum",
- "base64",
+ "base64 0.22.1",
  "bytes",
  "h2",
  "http",
@@ -4906,7 +4985,7 @@ dependencies = [
  "hyper-util",
  "percent-encoding",
  "pin-project",
- "socket2 0.6.1",
+ "socket2 0.6.5",
  "sync_wrapper",
  "tokio",
  "tokio-rustls",
@@ -4963,7 +5042,7 @@ checksum = "d039ad9159c98b70ecfd540b2573b97f7f52c3e8d9f8ad57a24b916a536975f9"
 dependencies = [
  "futures-core",
  "futures-util",
- "indexmap 2.8.0",
+ "indexmap 2.14.2",
  "pin-project-lite",
  "slab",
  "sync_wrapper",
@@ -4989,10 +5068,9 @@ checksum = "8df9b6e13f2d32c91b9bd719c00d1958837bc7dec474d94952798cc8e69eeec3"
 [[package]]
 name = "tpm"
 version = "0.1.0"
-source = "git+https://github.com/cloud-hypervisor/cloud-hypervisor?tag=v53.0#9ed824d6d08df3e96f7d5f50795d9449ac99f431"
+source = "git+https://github.com/mccormickt/cloud-hypervisor?rev=adb285f2e0c84eacd5cb952ae4de16911ddaad0a#adb285f2e0c84eacd5cb952ae4de16911ddaad0a"
 dependencies = [
  "anyhow",
- "libc",
  "log",
  "thiserror 2.0.18",
  "vmm-sys-util",
@@ -5001,13 +5079,7 @@ dependencies = [
 [[package]]
 name = "tracer"
 version = "0.1.0"
-source = "git+https://github.com/cloud-hypervisor/cloud-hypervisor?tag=v53.0#9ed824d6d08df3e96f7d5f50795d9449ac99f431"
-dependencies = [
- "libc",
- "log",
- "serde",
- "serde_json",
-]
+source = "git+https://github.com/mccormickt/cloud-hypervisor?rev=adb285f2e0c84eacd5cb952ae4de16911ddaad0a#adb285f2e0c84eacd5cb952ae4de16911ddaad0a"
 
 [[package]]
 name = "tracing"
@@ -5298,18 +5370,18 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 
 [[package]]
 name = "vfio-bindings"
-version = "0.6.2"
+version = "0.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "188dac3057a0cbc94470085204c84b82ff7ec5dac629a514323cd133d1f9abe0"
+checksum = "01ac6d51577178c2d364280bba14d43efaa948ff5557182c0fa0757207642af2"
 dependencies = [
  "vmm-sys-util",
 ]
 
 [[package]]
 name = "vfio-ioctls"
-version = "0.7.0"
+version = "0.10.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f2b1110f3ab5703a0f788d569b1b4a2436e8cc434f384b3ef5d77283f8ee03d8"
+checksum = "8a80f9cf326a62dc7f86795775ecb33ee077e40c8d5b80396c4b82f51958a348"
 dependencies = [
  "byteorder",
  "iommufd-bindings",
@@ -5320,15 +5392,15 @@ dependencies = [
  "log",
  "thiserror 2.0.18",
  "vfio-bindings",
- "vm-memory",
+ "vm-memory 0.18.0",
  "vmm-sys-util",
 ]
 
 [[package]]
 name = "vfio_user"
-version = "0.1.5"
+version = "0.1.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "785d6f8ae8a88643cdd66f1ff82110292f1192f4b5e9549dff3e3410f3d3d8b2"
+checksum = "7a64e7c1e41fd8574ace87ded52ff64752e821e2769077d150a0a60399b6733e"
 dependencies = [
  "bitflags 2.13.2",
  "enumn",
@@ -5339,20 +5411,20 @@ dependencies = [
  "serde_json",
  "thiserror 2.0.18",
  "vfio-bindings",
- "vm-memory",
+ "vm-memory 0.17.1",
  "vmm-sys-util",
 ]
 
 [[package]]
 name = "vhost"
-version = "0.16.0"
+version = "0.17.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ee90657203a8644e9a0860a0db6a7887d8ef0c7bc09fc22dfa4ae75df65bac86"
+checksum = "1c63c14485260662b4257bd929d5fd4aaf96bbecbe61d2224bad8807849f5f8f"
 dependencies = [
  "bitflags 2.13.2",
  "libc",
  "uuid",
- "vm-memory",
+ "vm-memory 0.18.0",
  "vmm-sys-util",
 ]
 
@@ -5365,7 +5437,7 @@ checksum = "091f1f09cfbf2a78563b562e7a949465cce1aef63b6065645188d995162f8868"
 [[package]]
 name = "virtio-devices"
 version = "0.1.0"
-source = "git+https://github.com/cloud-hypervisor/cloud-hypervisor?tag=v53.0#9ed824d6d08df3e96f7d5f50795d9449ac99f431"
+source = "git+https://github.com/mccormickt/cloud-hypervisor?rev=adb285f2e0c84eacd5cb952ae4de16911ddaad0a#adb285f2e0c84eacd5cb952ae4de16911ddaad0a"
 dependencies = [
  "anyhow",
  "block",
@@ -5389,46 +5461,48 @@ dependencies = [
  "virtio-queue",
  "vm-allocator",
  "vm-device",
- "vm-memory",
+ "vm-memory 0.18.0",
  "vm-migration",
  "vm-virtio",
  "vmm-sys-util",
+ "zerocopy 0.8.59",
 ]
 
 [[package]]
 name = "virtio-queue"
-version = "0.17.0"
+version = "0.18.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e358084f32ed165fddb41d98ff1b7ff3c08b9611d8d6114a1b422e2e85688baf"
+checksum = "f631bfd09362a9b17f0cfd5ca3b0a1b179d153fa276f9ce86919d560891e61d6"
 dependencies = [
  "libc",
  "log",
  "virtio-bindings",
- "vm-memory",
+ "vm-memory 0.18.0",
  "vmm-sys-util",
 ]
 
 [[package]]
 name = "vm-allocator"
 version = "0.1.0"
-source = "git+https://github.com/cloud-hypervisor/cloud-hypervisor?tag=v53.0#9ed824d6d08df3e96f7d5f50795d9449ac99f431"
+source = "git+https://github.com/mccormickt/cloud-hypervisor?rev=adb285f2e0c84eacd5cb952ae4de16911ddaad0a#adb285f2e0c84eacd5cb952ae4de16911ddaad0a"
 dependencies = [
  "arch",
  "libc",
+ "log",
  "thiserror 2.0.18",
- "vm-memory",
+ "vm-memory 0.18.0",
 ]
 
 [[package]]
 name = "vm-device"
 version = "0.1.0"
-source = "git+https://github.com/cloud-hypervisor/cloud-hypervisor?tag=v53.0#9ed824d6d08df3e96f7d5f50795d9449ac99f431"
+source = "git+https://github.com/mccormickt/cloud-hypervisor?rev=adb285f2e0c84eacd5cb952ae4de16911ddaad0a#adb285f2e0c84eacd5cb952ae4de16911ddaad0a"
 dependencies = [
  "hypervisor",
  "serde",
  "thiserror 2.0.18",
  "vfio-ioctls",
- "vm-memory",
+ "vm-memory 0.18.0",
  "vmm-sys-util",
 ]
 
@@ -5451,9 +5525,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "vm-memory"
+version = "0.18.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9b55e753c7725603745cb32b2287ef7ef3da05c03c7702cda3fa8abe25ae0465"
+dependencies = [
+ "arc-swap",
+ "libc",
+ "thiserror 2.0.18",
+ "winapi",
+]
+
+[[package]]
 name = "vm-migration"
 version = "0.1.0"
-source = "git+https://github.com/cloud-hypervisor/cloud-hypervisor?tag=v53.0#9ed824d6d08df3e96f7d5f50795d9449ac99f431"
+source = "git+https://github.com/mccormickt/cloud-hypervisor?rev=adb285f2e0c84eacd5cb952ae4de16911ddaad0a#adb285f2e0c84eacd5cb952ae4de16911ddaad0a"
 dependencies = [
  "anyhow",
  "itertools 0.15.0",
@@ -5462,24 +5548,24 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror 2.0.18",
- "vm-memory",
+ "vm-memory 0.18.0",
  "zerocopy 0.8.59",
 ]
 
 [[package]]
 name = "vm-virtio"
 version = "0.1.0"
-source = "git+https://github.com/cloud-hypervisor/cloud-hypervisor?tag=v53.0#9ed824d6d08df3e96f7d5f50795d9449ac99f431"
+source = "git+https://github.com/mccormickt/cloud-hypervisor?rev=adb285f2e0c84eacd5cb952ae4de16911ddaad0a#adb285f2e0c84eacd5cb952ae4de16911ddaad0a"
 dependencies = [
  "log",
  "virtio-queue",
- "vm-memory",
+ "vm-memory 0.18.0",
 ]
 
 [[package]]
 name = "vmm"
 version = "0.1.0"
-source = "git+https://github.com/cloud-hypervisor/cloud-hypervisor?tag=v53.0#9ed824d6d08df3e96f7d5f50795d9449ac99f431"
+source = "git+https://github.com/mccormickt/cloud-hypervisor?rev=adb285f2e0c84eacd5cb952ae4de16911ddaad0a#adb285f2e0c84eacd5cb952ae4de16911ddaad0a"
 dependencies = [
  "acpi_tables",
  "anyhow",
@@ -5493,6 +5579,7 @@ dependencies = [
  "event_monitor",
  "flume",
  "hypervisor",
+ "iommufd-bindings",
  "iommufd-ioctls",
  "landlock",
  "libc",
@@ -5508,8 +5595,8 @@ dependencies = [
  "serde_json",
  "serde_with",
  "serial_buffer",
- "sha2",
  "signal-hook",
+ "socket2 0.6.5",
  "thiserror 2.0.18",
  "tracer",
  "uuid",
@@ -5520,7 +5607,7 @@ dependencies = [
  "virtio-devices",
  "vm-allocator",
  "vm-device",
- "vm-memory",
+ "vm-memory 0.18.0",
  "vm-migration",
  "vm-virtio",
  "vmm-sys-util",
@@ -5669,6 +5756,15 @@ dependencies = [
  "home",
  "rustix 0.38.44",
  "winsafe",
+]
+
+[[package]]
+name = "which"
+version = "8.0.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bae2f2b2b816647a1cab1acc91f5bd20812d53cb344382635ec2181940c8034f"
+dependencies = [
+ "libc",
 ]
 
 [[package]]
@@ -6158,27 +6254,27 @@ dependencies = [
 
 [[package]]
 name = "zstd"
-version = "0.13.3"
+version = "0.14.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e91ee311a569c327171651566e07972200e76fcfe2242a4fa446149a3881c08a"
+checksum = "db3ae9bf90af6e40197bef767eeefc46ad6397420fe873830bd85e5fbbfb3c70"
 dependencies = [
  "zstd-safe",
 ]
 
 [[package]]
 name = "zstd-safe"
-version = "7.3.0"
+version = "8.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "64d80649ab6db9d9f6f9c80a40becd948eda4714a0a5ac8c4d157a32231c7882"
+checksum = "ded520f16b29e1a9b771c722221b2b0a0398c2316d9bb3c42b458a5414d7434b"
 dependencies = [
  "zstd-sys",
 ]
 
 [[package]]
 name = "zstd-sys"
-version = "2.1.0+zstd.1.5.7"
+version = "2.1.2+zstd.1.5.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0ef0a8027ec3ee71300ab3bcbcd0393f434aa72b91ca6d635a39941deae8eea0"
+checksum = "481ada9c543b2323cbb7bbdbb5249177fbf0188ed959ed2c15e4b22421c84ed3"
 dependencies = [
  "cc",
  "pkg-config",

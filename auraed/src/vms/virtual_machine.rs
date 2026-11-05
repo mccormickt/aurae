@@ -75,6 +75,8 @@ impl From<VmSpec> for vmm::vm_config::VmConfig {
                 nested: true,
                 core_scheduling: CoreScheduling::default(),
                 profile: Default::default(),
+                #[cfg(target_arch = "x86_64")]
+                cpuid_overrides: Vec::new(),
             },
             memory: MemoryConfig {
                 size: u64::from(spec.memory_size) << 20,
@@ -86,7 +88,7 @@ impl From<VmSpec> for vmm::vm_config::VmConfig {
                 hugepages: false,
                 hugepage_size: None,
                 prefault: false,
-                reserve: false,
+                reserve: Some(false),
                 zones: None,
                 thp: false,
             },
@@ -173,10 +175,16 @@ impl From<NetSpec> for vmm::vm_config::NetConfig {
                 id: Some(spec.id),
                 ..PciDeviceCommonConfig::default()
             },
+            backend: vmm::vm_config::NetBackend::Tap,
+            xdp_external: false,
+            xdp_iface: None,
+            xdp_peer: None,
+            xdp_skb: false,
+            xdp_zerocopy: false,
             tap: spec.tap,
             ip: None,
             mask: None,
-            mac: spec.mac,
+            mac: Some(spec.mac),
             host_mac: spec.host_mac,
             mtu: None,
             num_queues: DEFAULT_NET_NUM_QUEUES,
@@ -218,8 +226,9 @@ impl From<MountSpec> for vmm::vm_config::DiskConfig {
             queue_affinity: None,
             backing_files: false,
             sparse: true,
-            image_type: Default::default(),
+            image_type: block::ImageType::Raw,
             lock_granularity: Default::default(),
+            guest_block_size: None,
         }
     }
 }
@@ -495,6 +504,8 @@ mod tests {
         assert_eq!(cfg.mask, None);
         assert_eq!(cfg.tap.as_deref(), Some("vm-7"));
         assert_eq!(cfg.pci_common.id.as_deref(), Some("guest:primary"));
+        assert_eq!(cfg.backend, vmm::vm_config::NetBackend::Tap);
+        assert!(!cfg.xdp_external);
     }
 
     /// `MountSpec` → `DiskConfig` carries the host path and `read_only`
@@ -506,6 +517,7 @@ mod tests {
         let cfg: vmm::vm_config::DiskConfig = spec.into();
         assert_eq!(cfg.path.as_deref(), Some(std::path::Path::new("/x/y.raw")));
         assert!(cfg.readonly);
+        assert_eq!(cfg.image_type, block::ImageType::Raw);
     }
 
     /// `VmSpec` → `VmConfig` round-trips CPU, memory, kernel, payload,
@@ -513,7 +525,7 @@ mod tests {
     #[test]
     fn vm_spec_to_vm_config_round_trip_preserves_core_fields() {
         let spec = sample_vm_spec();
-        let cfg: vmm::vm_config::VmConfig = spec.into();
+        let mut cfg: vmm::vm_config::VmConfig = spec.into();
 
         assert_eq!(cfg.cpus.boot_vcpus, 2);
         assert_eq!(cfg.cpus.max_vcpus, 2);
@@ -536,6 +548,8 @@ mod tests {
         let nets = cfg.net.as_ref().expect("net");
         assert_eq!(nets.len(), 1);
         assert!(cfg.landlock_enable);
+        let _ =
+            cfg.validate().expect("generated VM configuration must be valid");
     }
 
     #[test]

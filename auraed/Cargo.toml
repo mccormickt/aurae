@@ -24,6 +24,9 @@ license = "Apache-2.0"
 name = "auraed"
 path = "src/bin/main.rs"
 
+[features]
+af-xdp = ["vmm/net_backend_af_xdp", "net_util/net_backend_af_xdp"]
+
 [dependencies]
 anyhow = { workspace = true }
 client = { workspace = true }
@@ -77,13 +80,14 @@ uuid = { workspace = true }
 validation = { workspace = true, features = ["regex", "tonic"] }
 validation_macros = { path = "../crates/validation/macros" }
 walkdir = "2"
-vmm = { git = "https://github.com/cloud-hypervisor/cloud-hypervisor", tag = "v53.0", default-features = false, features = [
+vmm = { git = "https://github.com/mccormickt/cloud-hypervisor", rev = "adb285f2e0c84eacd5cb952ae4de16911ddaad0a", default-features = false, features = [
     "kvm",
 ] }
-hypervisor = { git = "https://github.com/cloud-hypervisor/cloud-hypervisor", tag = "v53.0", features = [
+hypervisor = { git = "https://github.com/mccormickt/cloud-hypervisor", rev = "adb285f2e0c84eacd5cb952ae4de16911ddaad0a", features = [
     "kvm",
 ] }
-net_util = { git = "https://github.com/cloud-hypervisor/cloud-hypervisor", tag = "v53.0" }
+net_util = { git = "https://github.com/mccormickt/cloud-hypervisor", rev = "adb285f2e0c84eacd5cb952ae4de16911ddaad0a" }
+block = { git = "https://github.com/mccormickt/cloud-hypervisor", rev = "adb285f2e0c84eacd5cb952ae4de16911ddaad0a" }
 vmm-sys-util = "0.15.0"
 seccompiler = "0.5.0"
 

@@ -65,8 +65,9 @@ impl Manager {
             self.debug.try_clone()?,
             &seccompiler::SeccompAction::Allow,
             self.hypervisor.clone(),
-            false, // no_shutdown
-            true,  // landlock_enable
+            vmm::GuestShutdownAction::ExitVmm,
+            vmm::GuestResetAction::ResetVm,
+            true, // landlock_enable
         )
         .map_err(|e| anyhow!("Failed to start VMM thread: {e}"))?;
         self.sender = Some(sender);
